@@ -219,7 +219,8 @@ written down).
   `-- rollback: compatible`).
 - AC-4 Given any attempt to store a `whatsapp` binding whose `chat_id` is not of an
   accepted WhatsApp shape, a `telegram` binding whose id contains `@`, a
-  `transport_address` on anything but a WhatsApp private binding, or a WhatsApp person
+  `transport_address` on anything but an open WhatsApp binding, an open WhatsApp binding
+  without one, a `phone_last4` on anything but an open WhatsApp private binding, or a WhatsApp person
   link whose stored role is not `participant`, then the database refuses it.
 - AC-5 Given `resolveChatRoute`, then a `companion` route carries `platform` from the
   binding row, and no caller passes a platform in: the chat id alone selects the row.
@@ -429,21 +430,24 @@ identify one chat on one platform:
 | Chat | `chat_id`, as stored and as sent on the wire |
 |---|---|
 | Telegram | `^-?[0-9]{1,20}$`, as today |
-| WhatsApp group | the group's id, `^[0-9]{5,40}@g\.us$`, suffix never stripped |
+| WhatsApp group | an alias, `^wa_[0-9a-f]{32}@g$`: `wa_` + the first 32 hex characters of HMAC-SHA256(key, the group's real id), plus `@g` |
 | WhatsApp private chat | an alias, `^wa_[0-9a-f]{32}@p$`: the person's opaque id (below) plus `@p` |
 
 - The shapes cannot overlap, so `telegram_chat_bindings_active_chat_idx` (unique on
   `chat_id` where open) stays as it is, name included (`group-binding.ts:410` matches the
   name).
-- A private chat's real WhatsApp address is kept only in `transport_address` on its open
-  binding row. The relay maps alias to address when it sends and address to alias when it
-  receives; a gateway, a log line and the monitor see only the alias.
-- Older WhatsApp groups carry their creator's phone number in the id
-  (`<phone>-<timestamp>@g.us`). Those are not accepted in this slice: a code there gets
-  one fixed line (AC-11), adding the number binds nothing, and nothing is stored. AC-0
-  confirmed both shapes on 2026-11-22; a group made in 2016 has the old one, so a
-  long-standing family group is likely to be refused. Whether to accept them (behind an
-  alias, as private chats are) is an open question at the end of this file.
+- A chat's real WhatsApp address, group or private, is kept only in `transport_address`
+  on its open binding row. The relay computes the alias from the address when it receives
+  (the same key as the sender ids, so no lookup is needed) and reads the address off the
+  open binding when it sends; a gateway, a log line and the monitor see only the alias.
+- **Every group is behind an alias, old or new (Dror, 2026-11-23: support old groups).**
+  Older WhatsApp groups carry their creator's phone number in the id
+  (`<phone>-<timestamp>@g.us`); AC-0 confirmed both shapes on 2026-11-22, and a group made
+  in 2016 has the old one, so a long-standing family group is likely to. One alias shape
+  for all groups keeps that number out of `chat_id`, and keeps one rule instead of two.
+  The real id the relay accepts from the bridge is `^[0-9]{5,40}(-[0-9]{5,20})?@g\.us$`;
+  anything else is "not of an accepted shape" (AC-11). Until 2026-11-23 this contract
+  stored a new group's real id and refused old groups.
 
 ### Migration, S2 (one file, `YYYYMMDDHHMMSS_chat_binding_platform.sql`)
 
@@ -453,17 +457,19 @@ identify one chat on one platform:
 
 - `platform text NOT NULL DEFAULT 'telegram'`, CHECK in (`'telegram'`, `'whatsapp'`).
 - `transport_address text` and `chat_title text`, both nullable.
-- CHECK: `platform = 'whatsapp'` implies `chat_id` matches the group shape or the alias
-  shape; `platform = 'telegram'` implies `chat_id !~ '@'`. The second also stops a legacy
+- CHECK: `platform = 'whatsapp'` implies `chat_id` matches the group alias shape or the
+  private alias shape; `platform = 'telegram'` implies `chat_id !~ '@'`. The second also stops a legacy
   writer that re-inserts a row without a platform from turning a WhatsApp id into a
   Telegram row. Staging holds no row that fails either (checked 2026-11-21: 125 rows,
   none); the production count is read before the release that carries the migration.
-- CHECK: `transport_address` is NULL unless the row is a WhatsApp private binding, and is
-  NULL on every closed row. It holds the address the bridge reports for the chat, as an
-  opaque string; since AC-0 that is normally a linked-identity address, not a number.
+- CHECK: `transport_address` is set on every open WhatsApp binding, group or private,
+  and is NULL on every other row and on every closed row. It holds the address the bridge
+  reports for the chat, as an opaque string: for a person normally a linked-identity
+  address (AC-0), for a group its real id, which for an old group contains its creator's
+  number.
 - `phone_last4 text`, nullable: the last four digits of the person's number when the
-  bridge reported a phone id at binding time, else NULL. CHECK `^[0-9]{4}$`, and NULL
-  under the same conditions as `transport_address`. It is what AC-16 shows; nothing
+  bridge reported a phone id at binding time, else NULL. CHECK `^[0-9]{4}$`; only on an
+  open WhatsApp private binding. It is what AC-16 shows; nothing
   derives digits from `transport_address`. Not granted to the monitor.
 - New close reasons: `dashboard_removed`, `rebound_by_code`, `left_group`,
   `membership_ended`. `closed_reason` has no enum (`0029`), and no existing reader
@@ -522,8 +528,8 @@ is an emailed invitation (AC-37). Its lifetime is the site invite's own (seven d
 ### Chat kind: one predicate instead of the sign of the id
 
 `chatKind(chatId): "private" | "group" | "unknown"` in `identity.ts`, beside
-`isPrivateChatId` (Telegram: digits private, minus-digits group; WhatsApp: `@g.us` group,
-`@p` private; anything else `unknown`, which every caller treats as the most restrictive
+`isPrivateChatId` (Telegram: digits private, minus-digits group; WhatsApp: `wa_…@g` group,
+`wa_…@p` private; anything else `unknown`, which every caller treats as the most restrictive
 answer). It reads the id's shape only, so no reader needs the new column.
 `isPrivateChatId` itself keeps meaning "a Telegram private chat": a WhatsApp private chat
 is never an `interview_handover` and never a Mini App chat, and the digits-only readers
@@ -626,7 +632,8 @@ HMAC-SHA256(key, canonical id).
 
 - The opaque id is `source.user_id` for every sender, the key of the person link
   (AC-13), of the conversation window (`conversation_user_ids`) and of held attachments.
-  With `@p` appended it is the `chat_id` of that person's private chat.
+  With `@p` appended it is the `chat_id` of that person's private chat. A group's alias is
+  made the same way from the group's real id, with `@g`.
 - The key is its own secret (`relay.whatsapp.sender_id_secret_ref`). It is not rotated in
   place: a new key orphans every WhatsApp private binding and person link, so rotation
   means everyone connects again. The runbook says so.
@@ -835,7 +842,8 @@ pairing.
   organizer-gated action from WhatsApp is allowed exactly when AC-13 gives the sender
   the role that action needs on Telegram.
 - **Phone numbers** rest in the bridge's session directory (AC-27) and, in the database,
-  only as the four digits of `phone_last4` and in `transport_address` on the rare open
+  only as the four digits of `phone_last4` and in `transport_address`: on an open binding
+  of an old group (its real id contains its creator's number), and on the rare open
   private binding whose address is a phone id (since AC-0 it is normally a
   linked-identity address, which is still a personal identifier and is handled the same
   way). An @mention writes an id into message text, so text is rewritten before use.
@@ -936,13 +944,11 @@ Tests are written first, from the criteria.
 6. **Dependence on member sign-in.** Agreed: if WhatsApp is built first, S3 builds the
    traveller list to that spec's contract.
 
-**Still open, none blocks the build on staging:**
+7. **Old groups are supported (2026-11-23).** Raised by AC-0: a group made before WhatsApp
+   changed its id format carries its creator's number in its id. Every group chat id is
+   now an alias, with the real id in `transport_address` (Chat ids, AC-4, AC-11).
 
-- **Old groups (raised by AC-0, 2026-11-22).** A group made before WhatsApp changed its
-  id format carries its creator's phone number in its id and is refused in this slice. A
-  family group that has existed for years is likely to be one. Accepting them means an
-  alias for group chat ids too, with the real id in `transport_address`: a change to the
-  Chat ids contract, AC-4 and AC-11. The owner decides whether that joins this track.
+**Still open, none blocks the build on staging:**
 
 - **Privacy wording.** The exact introduction line, and whether the published privacy
   policy needs a WhatsApp paragraph before a group outside the owner's family is bound.
