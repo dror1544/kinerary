@@ -341,11 +341,35 @@ export class SiteRouteMissingError extends Error {
   constructor() { super("RUNTIME_PARTICIPANT_LIST_FAILED"); this.name = "SiteRouteMissingError"; }
 }
 
+/**
+ * What the adapter's own fetch throws when the gateway answered with a redirect. Every call here carries the control-plane key in
+ * `x-api-key`, and Node's fetch forwards that header to wherever a redirect points (it drops only `authorization` and `cookie` across
+ * origins), after which the adapter would have believed the foreign answer. A redirect is therefore never followed and never an answer:
+ * the same failure as a site that cannot be reached, which every caller already treats as the safe one (retry, or "not ready").
+ */
+export class RuntimeRedirectRefusedError extends Error {
+  constructor(readonly status: number) { super("RUNTIME_GATEWAY_REDIRECT"); this.name = "RuntimeRedirectRefusedError"; }
+}
+
 export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
   constructor(private readonly runtimeOrigin: string, private readonly apiKey: string, private readonly timeoutMs: number = RUNTIME_CALL_TIMEOUT_MS) {}
 
+  /**
+   * The only way this class calls the gateway. `redirect: "manual"`, then any 3xx is refused here, by status range: Node 20 and 22
+   * hand back the 3xx itself, a browser-style runtime would hand back an opaque redirect (type "opaqueredirect", status 0), and the
+   * range check does not depend on which. Nothing past this point sees a redirect as an answer.
+   */
+  private async call(path: string, init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string; signal?: AbortSignal }): Promise<Response> {
+    const response = await fetch(`${this.runtimeOrigin}${path}`, { ...init, redirect: "manual" });
+    if ((response.status >= 300 && response.status < 400) || response.type === "opaqueredirect") {
+      await response.body?.cancel().catch(() => {});
+      throw new RuntimeRedirectRefusedError(response.status);
+    }
+    return response;
+  }
+
   async participantExists(input: { tripId: string; runtimeUsername: string }): Promise<boolean> {
-    const response = await fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants/${encodeURIComponent(input.runtimeUsername)}`, {
+    const response = await this.call(`/internal/t/${encodeURIComponent(input.tripId)}/participants/${encodeURIComponent(input.runtimeUsername)}`, {
       method: "GET",
       headers: { "x-api-key": this.apiKey },
     });
@@ -355,7 +379,7 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
   }
 
   async listParticipants(tripId: string): Promise<SiteParticipant[]> {
-    const response = await fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(tripId)}/participants`, {
+    const response = await this.call(`/internal/t/${encodeURIComponent(tripId)}/participants`, {
       method: "GET",
       headers: { "x-api-key": this.apiKey },
       signal: AbortSignal.timeout(this.timeoutMs),
@@ -375,7 +399,7 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
   }
 
   private async binding(action: "adopt" | "release", input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[]; inviteId?: string }): Promise<Response> {
-    return fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants/${action}`, {
+    return this.call(`/internal/t/${encodeURIComponent(input.tripId)}/participants/${action}`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": this.apiKey },
       body: JSON.stringify({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername, ...(action === "adopt" && input.deadInviteIds?.length ? { deadInviteIds: input.deadInviteIds } : {}), ...(action === "release" && input.inviteId ? { inviteId: input.inviteId } : {}) }),
@@ -392,7 +416,13 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
   }
 
   async releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }): Promise<void> {
-    const response = await this.binding("release", input);
+    let response: Response;
+    // A redirect is not an answer and the key went nowhere (`call`): retryable, never `done` and never given up (the outbox gives up only
+    // on the site's own 400/403 with its own code; this carries the 3xx status and no code).
+    try { response = await this.binding("release", input); } catch (error) {
+      if (error instanceof RuntimeRedirectRefusedError) throw new SiteReleaseError(error.status);
+      throw error;
+    }
     // The status travels with the failure, and so does the body's JSON `error` code when the body is an object carrying a string one
     // (SiteReleaseError): the durable retry (site-release-outbox.ts) gives up only on the site's or gateway's OWN refusal of that status
     // and keeps retrying everything else, a proxy's or WAF's 4xx included. A 200 counts only when it is the site's own answer,
@@ -404,7 +434,7 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
   }
 
   async provisionParticipant(input: Parameters<RuntimeAccountAdapter["provisionParticipant"]>[0]): Promise<void> {
-    const response = await fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants`, {
+    const response = await this.call(`/internal/t/${encodeURIComponent(input.tripId)}/participants`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": this.apiKey },
       body: JSON.stringify(input),

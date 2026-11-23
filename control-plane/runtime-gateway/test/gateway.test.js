@@ -815,6 +815,10 @@ test("the trip site's internal routes are unreachable through /t/<trip>/ however
     "/api%2Finternal/control-plane/participants", "/api%2fINTERNAL/control-plane/participants", "/%61pi/internal/control-plane/participants", "/api/%69nternal/control-plane/participants",
     "/%41pi/%49nternal/control-plane/session", "/api%252Finternal/control-plane/participants", "/%2561pi/internal/control-plane/participants", "/api//internal/control-plane/participants",
     "/api/internal", "/API/INTERNAL", "/api/internal%2Fcontrol-plane/session", "/api/internal/../internal/control-plane/session", "/api/internal/%E0%A4%A", "/api/internal/%zz", "/API/INTERNAL/%zz/x", "/api/internal%2F%zz",
+    // The spellings host mode (`internalApiPath`) always blocked and this mode let through to the site (found 2026-11-23): a backslash, a path parameter on
+    // either segment (Express ignores `;x`), and the same behind percent-encoding. Both modes now read one normalisation.
+    "/api%5cinternal/control-plane/participants", "/api%5Cinternal/control-plane/participants", "/api\\internal/control-plane/participants", "/api/internal;x/control-plane/participants", "/api;x/internal/control-plane/participants",
+    "/api/internal%3bx/control-plane/participants", "/api%3bx/internal/control-plane/participants", "/api%255cinternal/control-plane/participants", "/api/internal/..;/internal/control-plane/session",
   ];
   for (const path of spellings) {
     for (const method of ["GET", "POST"]) {
@@ -829,8 +833,10 @@ test("the trip site's internal routes are unreachable through /t/<trip>/ however
   assert.equal(bindingCalls.length, before.bindings);
   proxiedAuthorization = before.proxied;
   // an ordinary path that merely contains the word is still proxied
-  const ordinary = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/internals-are-not-a-thing`, { headers: { cookie } });
-  assert.equal(ordinary.status, 200);
+  for (const path of ["/api/internals-are-not-a-thing", "/api/internal-notes", "/api/internals-x", "/api/not-internal/x", "/apix/internal/x"]) {
+    const ordinary = await fetch(`${gatewayOrigin}/t/trip_abcdefgh${path}`, { headers: { cookie } });
+    assert.equal(ordinary.status, 200, path);
+  }
 });
 
 test("a correctly encoded literal percent sign in an ordinary path is NOT mistaken for an internal route: 100%25.jpg and friends are proxied", async () => {

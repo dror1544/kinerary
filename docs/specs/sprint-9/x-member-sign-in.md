@@ -437,6 +437,16 @@ contradicts the text above, the amendment wins.
   traveller can disconnect one by hand.
 - **A27: the "wip" commits are squashed at merge.** The branch's pushed history is not
   rewritten.
+- **A28 (2026-11-23, after the merge with main's per-trip keys): which key reaches which door,
+  and no keyed call follows a redirect.** A1's "internal key only" is read under main's key model
+  (`docs/runtime-session-exchange.md`): the gateway calls the trip site's adopt, release, list and
+  provision routes with THAT TRIP'S OWN key (derived, or the legacy key on a `shared` route). The
+  control-plane key is used only between the API, the relay and the gateway's own `/internal/t/*`
+  routes, and from the gateway to the control plane. No keyed call follows a redirect: the API's
+  runtime adapter and the gateway's `timedFetch` use `redirect: "manual"`, and a 3xx fails closed
+  (an unreachable site for the API's callers, a retryable release for the outbox, a `502
+  UPSTREAM_REDIRECT` from the gateway). Held by `runtime-account-adapter-redirects.test.ts`,
+  `runtime-adapter-redirect-flows.test.ts` and the gateway's `redirects.test.js`.
 
 ## Open questions (answered, kept for the record)
 

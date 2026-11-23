@@ -40,7 +40,20 @@ const secureCookie = RUNTIME_ORIGIN.startsWith("https://");
 const routeCache = new Map();
 // A hung control plane or trip must fail closed quickly, not hold every request open.
 const UPSTREAM_TIMEOUT_MS = Math.max(50, Number(process.env.RUNTIME_UPSTREAM_TIMEOUT_MS ?? 5000) || 5000);
-const timedFetch = (url, init = {}) => fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+// EVERY call made with this carries a key (a trip site is sent that trip's own key, the control plane RUNTIME_EXCHANGE_KEY), and fetch's
+// default is to follow a redirect and forward `x-api-key` to whatever origin it points at (Node drops only `authorization` and `cookie`
+// across origins), then to believe the answer. So a redirect is never followed here, whatever the caller passes: it comes back as the 3xx
+// itself. A caller that talks to a trip site answers it as a 502 UPSTREAM_REDIRECT (`refuseRedirect`); the control-plane calls already
+// treat any non-2xx as a failure. The browser-facing reverse proxy is node:http (`proxy`, `proxyToHost`), not this, and still passes a
+// site's own 3xx on to the browser.
+const timedFetch = (url, init = {}) => fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+const isRedirect = (response) => response.status >= 300 && response.status < 400;
+// A trip site (or what stands in front of it) answered 3xx to a keyed call: answer 502, say so in the log (trip id and status only), end the body.
+async function refuseRedirect(res, response, tripId, call) {
+  await response.body?.cancel().catch(() => {});
+  console.error(`runtime_gateway.upstream_redirect: trip=${tripId} call=${call} status=${response.status}`);
+  return json(res, 502, { error: "UPSTREAM_REDIRECT" });
+}
 
 // The per-trip cookie is SameSite=Strict, so the portal and this origin must be
 // the same SITE: from another site the browser stores the cookie after the launch
@@ -274,6 +287,11 @@ async function launch(req, res, tripId) {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) },
     body: JSON.stringify(identity),
   });
+  if (isRedirect(sessionResponse)) {
+    await sessionResponse.body?.cancel().catch(() => {});
+    console.error(`runtime_gateway.upstream_redirect: trip=${tripId} call=session status=${sessionResponse.status}`);
+    return launchRefused(res, 503);
+  }
   if (!sessionResponse.ok) return launchRefused(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503);
   const runtime = await sessionResponse.json();
   if (typeof runtime.token !== "string") return launchRefused(res, 503);
@@ -296,6 +314,7 @@ async function provisionParticipant(req, res, tripId) {
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) }, body: JSON.stringify(body),
   });
+  if (isRedirect(response)) return refuseRedirect(res, response, tripId, "provision");
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
@@ -309,6 +328,7 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
     method: "GET", headers: { "x-api-key": tripKeyFor(tripId, route), "x-control-plane-trip-id": tripId },
   });
+  if (isRedirect(response)) return refuseRedirect(res, response, tripId, "exists");
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
@@ -386,6 +406,7 @@ async function bindingAction(req, res, tripId, action) {
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${action}`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) }, body: JSON.stringify(body),
   });
+  if (isRedirect(response)) return refuseRedirect(res, response, tripId, action);
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
@@ -402,6 +423,7 @@ async function listParticipants(req, res, tripId) {
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
     method: "GET", headers: { "x-api-key": tripKeyFor(tripId, route), "x-control-plane-trip-id": tripId },
   });
+  if (isRedirect(response)) return refuseRedirect(res, response, tripId, "list");
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
@@ -522,10 +544,27 @@ async function memberInvites(req, res, tripId, username) {
 // `/api/internal/...` while `/api/photos/file/100%25.jpg` never becomes anything internal. Previously `/API/internal/...` got past a
 // case-sensitive prefix test and was held only because the gateway strips x-api-key; a first version of this treated any decode failure as
 // internal, which blocked ordinary file names with a literal percent sign.
-const isInternalForm = (value) => {
-  const form = value.toLowerCase().replace(/\/{2,}/g, "/");
-  return form === "/api/internal" || form.startsWith("/api/internal/");
-};
+//
+// WHAT "LOOKS LIKE /api/internal" MEANS is ONE function for both modes, `spellsInternal` (this mode's `isInternalPath` and host mode's
+// `internalApiPath` differ only in how they DECODE: this one leniently, so a file name with a literal percent sign is served; that one
+// strictly, answering 400 for what cannot be read). It reads the way Express routes: segments split on `/` and on `\`, a path parameter
+// (`;x`) dropped from a segment, case ignored, empty and `.` segments ignored, `..` resolved. It answers yes when the first two segments
+// are `api`, `internal` either before `..` is resolved or after: so `/api/internal/../x` (this mode always blocked it) and
+// `/x/../api/internal/x` (host mode always blocked it) both stay blocked. Until 2026-11-23 this mode had its own prefix test and
+// let `/api%5cinternal/..`, `/api/internal;x/..` and `/api;x/internal/..` through to the site (harmless then, with no key and a 404,
+// but the two checkers disagreed about the same request).
+function spellsInternal(path) {
+  const raw = [], resolved = [];
+  for (const piece of path.replace(/\\/g, "/").split("/")) {
+    const segment = piece.split(";")[0].toLowerCase();
+    if (segment === "" || segment === ".") continue;
+    raw.push(segment);
+    if (segment === "..") resolved.pop(); else resolved.push(segment);
+  }
+  const under = (segments) => segments[0] === "api" && segments[1] === "internal";
+  return under(raw) || under(resolved);
+}
+const isInternalForm = spellsInternal;
 const lenientDecode = (value) => value.replace(/%([0-9a-fA-F]{2})/g, (_match, hex) => String.fromCharCode(parseInt(hex, 16)));
 export function isInternalPath(suffix) {
   let path = String(suffix);
@@ -669,14 +708,7 @@ function internalApiPath(target) {
     path = decoded;
   }
   if (!settled) return "unreadable";
-  const segments = [];
-  for (const raw of path.replace(/\\/g, "/").split("/")) {
-    const segment = raw.split(";")[0].toLowerCase();
-    if (segment === "" || segment === ".") continue;
-    if (segment === "..") { segments.pop(); continue; }
-    segments.push(segment);
-  }
-  return segments[0] === "api" && segments[1] === "internal";
+  return spellsInternal(path);
 }
 
 function hostRouteFromBody(body) {
