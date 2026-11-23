@@ -12,7 +12,7 @@
  * reactions, stickers), a group stub, and anything that arrived as history
  * (`type !== "notify"`).
  */
-import { idKind, isGroupId, normalizeId } from "./ids.js";
+import { idKind, isGroupId, normalizeId, phoneLast4 } from "./ids.js";
 
 /** Peel the envelopes a message can arrive wrapped in (ephemeral, view-once, caption wrappers). */
 export function unwrap(message) {
@@ -112,7 +112,7 @@ export async function extractMessage(msg, { resolver, own }) {
   const ownLid = own.lid;
   let chatId;
   let senderId = null;
-  let senderPhone;
+  let senderPhone; // the phone id, held only long enough to take its last four digits
 
   if (remoteKind === "group") {
     chatId = remote;
@@ -157,7 +157,9 @@ export async function extractMessage(msg, { resolver, own }) {
     mentionedIds: mentioned,
   };
   if (!event.messageId) return { skip: "no_message_id" };
-  if (senderPhone) event.senderPhone = senderPhone;
+  // A full number never leaves the bridge in a message: the relay needs only the last four at binding time.
+  const last4 = senderPhone ? phoneLast4(senderPhone) : undefined;
+  if (last4) event.senderPhoneLast4 = last4;
   if (typeof ctxInfo.stanzaId === "string" && ctxInfo.stanzaId) {
     event.quotedMessageId = ctxInfo.stanzaId;
     if (ctxInfo.participant) {

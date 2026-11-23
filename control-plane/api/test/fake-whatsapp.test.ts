@@ -1,11 +1,12 @@
 import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startFakeWhatsApp, type FakeWhatsApp } from "../tools/fake-whatsapp.js";
 
-const SECRET = "stand-in-test-secret-0123456789";
+const SECRET = "stand-in-test-secret-0123456789-abcdefgh";
 const ALICE = "100000000000001@lid";
 const GROUP = "120000000000000001@g.us";
 const api = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -25,7 +26,7 @@ describe("the stand-in bridge", () => {
   test("it listens on loopback only, and needs a real secret", async () => {
     const f = await fake();
     assert.match(f.url, /^http:\/\/127\.0\.0\.1:\d+$/);
-    await assert.rejects(startFakeWhatsApp({ secret: "short" }), /16 characters/);
+    await assert.rejects(startFakeWhatsApp({ secret: "short" }), /32 characters/);
   });
 
   test("every bridge path needs the bearer; the control API does not", async () => {
@@ -58,6 +59,35 @@ describe("the stand-in bridge", () => {
 
     assert.equal((await post("state", { state: "bogus" })).status, 400);
     assert.equal((await post("message", { chatId: "junk" })).status, 400);
+  });
+
+  test("it refuses what the bridge refuses: path-shaped ids (as written), a phone-form participant, a replyTo that is not an id, and edits of messages it did not send", async () => {
+    const f = await fake();
+    const bridgeUrl = new URL(f.url);
+    const rawGet = (path: string) =>
+      new Promise<number>((resolve, reject) => {
+        const req = httpRequest({ host: bridgeUrl.hostname, port: bridgeUrl.port, path, headers: auth }, (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode ?? 0));
+        });
+        req.on("error", reject);
+        req.end();
+      });
+    assert.equal(await rawGet("/media/../health"), 400);
+    assert.equal(await rawGet(`/media/${encodeURIComponent(GROUP)}/..`), 400);
+    assert.equal(await rawGet("/chat/.."), 400);
+    assert.equal(await rawGet(`/chat/${encodeURIComponent(GROUP)}/participant/..`), 400);
+    assert.equal(await rawGet(`/chat/${encodeURIComponent(GROUP)}/participant/${encodeURIComponent("200000000001@s.whatsapp.net")}`), 400);
+    assert.equal(await rawGet(`/chat/${encodeURIComponent("200000000001@s.whatsapp.net")}`), 400);
+    assert.equal(await rawGet("/chat/%E0%A4%A"), 400, "a bad escape is a 400, not a 500");
+
+    const post = (path: string, body: unknown) =>
+      fetch(`${f.url}${path}`, { method: "POST", headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    for (const replyTo of ["../x", "a-b", "", 5, null]) assert.equal((await post("/send", { chatId: GROUP, text: "x", replyTo })).status, 400, String(replyTo));
+    f.control.message({ chatId: GROUP, senderId: ALICE, messageId: "TYPEDONPHONE", fromMe: true, text: "typed on the phone" });
+    assert.equal((await post("/edit", { chatId: GROUP, messageId: "TYPEDONPHONE", text: "no" })).status, 403);
+    assert.equal((await post("/edit", { chatId: GROUP, messageId: "a-b", text: "no" })).status, 400);
+    assert.deepEqual(f.control.sent(), []);
   });
 
   test("scripted failures fire the stated number of times and then stop", async () => {

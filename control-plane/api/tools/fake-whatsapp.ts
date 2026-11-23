@@ -17,20 +17,19 @@
  *
  * Two ways in:
  *
- *   node --import tsx tools/fake-whatsapp.ts --port 4398 --secret <16+ chars>
+ *   node --import tsx tools/fake-whatsapp.ts --port 4398 --secret <32+ chars>
  *   const fake = await startFakeWhatsApp({ secret });   // in-process, for tests
  *
  * The control API (no bearer: it is the test's hand, not the relay's) scripts
  * what the bridge would deliver and records what the relay did:
  *
- *   POST /_control/message  {chatId, senderId?, senderName?, text?, messageId?, fromMe?, senderPhone?,
+ *   POST /_control/message  {chatId, senderId?, senderName?, text?, messageId?, fromMe?, senderPhoneLast4?,
  *                            quotedMessageId?, quotedParticipant?, quotedText?, mentionedIds?,
  *                            media?: {kind, mime, filename?, base64}}      a message arrives
  *   POST /_control/added    {chatId, addedBy?, title?}                     the number is added to a group
  *   POST /_control/left     {chatId, participantId}                        a participant leaves
  *   POST /_control/title    {chatId, title}                                a group is renamed
  *   POST /_control/group    {chatId, title, participants: [lid...]}        set a group's membership
- *   POST /_control/person   {lid, phone}                                   a person's two ids, so a phone-form membership question matches
  *   POST /_control/state    {state}                                        connected | logged_out | ...
  *   POST /_control/fail     {path?, status?, hang?, times?}                make a path fail (500 by default), or hang
  *   POST /_control/membership-unavailable {on}                             "could not check"
@@ -42,7 +41,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { GROUP_REAL_ID, PERSON_REAL_ID, PHONE_REAL_ID } from "../src/relay/whatsapp/client.js";
+import { GROUP_REAL_ID, MESSAGE_ID, PERSON_REAL_ID } from "../src/relay/whatsapp/client.js";
 
 export const FAKE_OWN = { lid: "100000000000099@lid", phone: "200000000099@s.whatsapp.net" };
 
@@ -50,6 +49,8 @@ interface StoredMessage {
   id: string;
   chatId: string;
   fromMe: boolean;
+  /** Sent through THIS bridge (editable); a message typed on the number's own phone is fromMe but not this. */
+  sent?: boolean;
   media?: { mime: string; bytes: Buffer };
 }
 
@@ -86,7 +87,6 @@ export interface FakeWhatsApp {
     left(input: { chatId: string; participantId: string }): void;
     title(input: { chatId: string; title: string }): void;
     group(input: { chatId: string; title: string; participants: string[] }): void;
-    person(input: { lid: string; phone: string }): void;
     setState(state: string): void;
     failNext(input: { path?: string; status?: number; hang?: boolean; times?: number }): void;
     membershipUnavailable(on: boolean): void;
@@ -96,7 +96,7 @@ export interface FakeWhatsApp {
   };
 }
 
-const TOKEN_STATES = new Set(["starting", "connecting", "connected", "disconnected", "logged_out", "replaced"]);
+const TOKEN_STATES = new Set(["starting", "connecting", "connected", "disconnected", "logged_out", "replaced", "unpaired"]);
 
 function bearerOk(header: string | undefined, secret: string): boolean {
   const match = typeof header === "string" ? /^Bearer (.+)$/.exec(header) : null;
@@ -134,8 +134,8 @@ const isChat = (id: string) => GROUP_REAL_ID.test(id) || PERSON_REAL_ID.test(id)
 const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
 
 export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<FakeWhatsApp> {
-  if (typeof options.secret !== "string" || options.secret.length < 16) {
-    throw new Error("the stand-in needs a secret of at least 16 characters, as the bridge does");
+  if (typeof options.secret !== "string" || options.secret.length < 32 || /\s/.test(options.secret)) {
+    throw new Error("the stand-in needs a secret of at least 32 characters with no whitespace, as the bridge does");
   }
   const secret = options.secret;
   const own = options.own ?? FAKE_OWN;
@@ -149,7 +149,6 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
   const waiters = new Set<() => void>();
   const store = new Map<string, StoredMessage>();
   const groups = new Map<string, { title: string; participants: Set<string> }>();
-  const lidByPhone = new Map<string, string>();
   let calls: RecordedCall[] = [];
   let callSeq = 0;
   let requestLog: { method: string; path: string; authorised: boolean }[] = [];
@@ -193,8 +192,8 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
         fromMe,
         mentionedIds: Array.isArray(input.mentionedIds) ? input.mentionedIds : [],
       };
-      const phone = str(input.senderPhone);
-      if (phone && PHONE_REAL_ID.test(phone)) event.senderPhone = phone;
+      const last4 = str(input.senderPhoneLast4);
+      if (last4 && /^[0-9]{4}$/.test(last4)) event.senderPhoneLast4 = last4;
       for (const key of ["quotedMessageId", "quotedParticipant", "quotedText"] as const) {
         const v = str(input[key]);
         if (v) event[key] = v;
@@ -224,10 +223,6 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
       if (!GROUP_REAL_ID.test(chatId)) throw new Error("chatId must be a group real id");
       groups.set(chatId, { title, participants: new Set(participants) });
     },
-    person({ lid, phone }) {
-      if (!PERSON_REAL_ID.test(lid) || !PHONE_REAL_ID.test(phone)) throw new Error("a linked-identity id and a phone id are required");
-      lidByPhone.set(phone, lid);
-    },
     setState(next) {
       if (!TOKEN_STATES.has(next)) throw new Error(`unknown state: ${next}`);
       state = next;
@@ -242,7 +237,6 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
       ring = [];
       store.clear();
       groups.clear();
-      lidByPhone.clear();
       calls = [];
       requestLog = [];
       failures = [];
@@ -268,9 +262,18 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
 
   const server: Server = createServer(async (req, res) => {
     try {
-      const url = new URL(req.url ?? "/", "http://stand-in.invalid");
+      // The path is split as written, as the bridge does: `new URL` would resolve `..` into another route.
+      const target = req.url ?? "/";
+      const queryAt = target.indexOf("?");
+      const pathname = queryAt === -1 ? target : target.slice(0, queryAt);
+      const url = { pathname, searchParams: new URLSearchParams(queryAt === -1 ? "" : target.slice(queryAt + 1)) };
       const method = req.method ?? "GET";
-      const parts = url.pathname.split("/").filter(Boolean).map((p) => decodeURIComponent(p));
+      let parts: string[];
+      try {
+        parts = pathname.split("/").filter(Boolean).map((p) => decodeURIComponent(p));
+      } catch {
+        return reply(res, 400, { ok: false, error: "bad_path" });
+      }
 
       // The test's hand: no bearer, never part of the contract.
       if (parts[0] === "_control") {
@@ -284,7 +287,6 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
           else if (method === "POST" && action === "left") control.left(body as never);
           else if (method === "POST" && action === "title") control.title(body as never);
           else if (method === "POST" && action === "group") control.group(body as never);
-          else if (method === "POST" && action === "person") control.person(body as never);
           else if (method === "POST" && action === "state") control.setState(String(body.state));
           else if (method === "POST" && action === "fail") control.failNext(body as never);
           else if (method === "POST" && action === "membership-unavailable") control.membershipUnavailable(body.on !== false);
@@ -352,6 +354,8 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
       }
 
       if (method === "GET" && parts.length === 3 && parts[0] === "media") {
+        if (!isChat(parts[1]!)) return reply(res, 400, { ok: false, error: "bad_chat" });
+        if (!MESSAGE_ID.test(parts[2]!)) return reply(res, 400, { ok: false, error: "bad_message" });
         const entry = store.get(keyOf(parts[1]!, parts[2]!));
         if (!entry) return reply(res, 404, { ok: false, error: "gone" });
         if (!entry.media) return reply(res, 404, { ok: false, error: "no_media" });
@@ -368,12 +372,13 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
         const text = body.text;
         if (!isChat(chatId)) return reply(res, 400, { ok: false, error: "bad_chat" });
         if (typeof text !== "string" || !text.trim() || text.length > 20_000) return reply(res, 400, { ok: false, error: "bad_text" });
+        if (body.replyTo !== undefined && !(typeof body.replyTo === "string" && MESSAGE_ID.test(body.replyTo))) return reply(res, 400, { ok: false, error: "bad_message" });
         if (!connected()) return down(res);
         const replyTo = str(body.replyTo);
         // A reply quotes only a message of THIS chat.
         const quoted = !!replyTo && store.has(keyOf(chatId, replyTo));
         const messageId = `FAKESENT${String((sentCounter += 1)).padStart(6, "0")}`;
-        remember({ id: messageId, chatId, fromMe: true });
+        remember({ id: messageId, chatId, fromMe: true, sent: true });
         record({ kind: "send", chatId, messageId, text, ...(replyTo ? { replyTo } : {}), quoted });
         return reply(res, 200, { ok: true, messageId, quoted });
       }
@@ -385,10 +390,10 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
         const text = body.text;
         if (!isChat(chatId)) return reply(res, 400, { ok: false, error: "bad_chat" });
         if (typeof text !== "string" || !text.trim() || text.length > 20_000) return reply(res, 400, { ok: false, error: "bad_text" });
-        if (!messageId) return reply(res, 400, { ok: false, error: "bad_message" });
+        if (!MESSAGE_ID.test(messageId)) return reply(res, 400, { ok: false, error: "bad_message" });
         const target = store.get(keyOf(chatId, messageId));
         if (!target) return reply(res, 404, { ok: false, error: "gone" });
-        if (!target.fromMe) return reply(res, 403, { ok: false, error: "not_own_message" });
+        if (!target.sent) return reply(res, 403, { ok: false, error: "not_own_message" });
         if (!connected()) return down(res);
         record({ kind: "edit", chatId, messageId, text });
         return reply(res, 200, { ok: true, messageId });
@@ -418,13 +423,11 @@ export async function startFakeWhatsApp(options: FakeWhatsAppOptions): Promise<F
         const chatId = parts[1]!;
         const who = parts[3]!;
         if (!GROUP_REAL_ID.test(chatId)) return reply(res, 400, { ok: false, error: "bad_chat" });
-        if (!PERSON_REAL_ID.test(who) && !PHONE_REAL_ID.test(who)) return reply(res, 400, { ok: false, error: "bad_participant" });
+        if (!PERSON_REAL_ID.test(who)) return reply(res, 400, { ok: false, error: "bad_participant" });
         if (!connected() || membershipDown) return reply(res, 503, { ok: false, error: "unavailable", reason: "metadata", state });
         const group = groups.get(chatId);
         if (!group) return reply(res, 503, { ok: false, error: "unavailable", reason: "metadata", state });
-        // Matched across id forms, as the bridge does: a phone id counts when its pair is known.
-        const lid = PHONE_REAL_ID.test(who) ? lidByPhone.get(who) : who;
-        return reply(res, 200, { ok: true, chatId, inGroup: !!lid && group.participants.has(lid) });
+        return reply(res, 200, { ok: true, chatId, inGroup: group.participants.has(who) });
       }
 
       return reply(res, 404, { ok: false, error: "not_found" });

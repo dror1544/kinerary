@@ -7,8 +7,8 @@
  * Adapted from the MIT-licensed Hermes Agent WhatsApp bridge (see NOTICE.md).
  */
 import { parseArgs, USAGE } from "./cli.js";
-import { prepareSessionDir } from "./session.js";
-import { createSafeLogger, errorCode } from "./safe-log.js";
+import { prepareSessionDir, sessionIsPaired } from "./session.js";
+import { createSafeLogger, crashSummary, errorCode } from "./safe-log.js";
 
 const { log } = createSafeLogger();
 
@@ -18,14 +18,13 @@ const { log } = createSafeLogger();
 for (const level of ["log", "info", "warn", "error", "debug", "trace"]) console[level] = () => {};
 
 // A crash must not write the error: a library error message can quote an id.
-process.on("uncaughtException", (err) => {
-  log("fatal", { code: errorCode(err) });
+const fatal = (err) => {
+  const { name, at } = crashSummary(err);
+  log("fatal", { code: errorCode(err), name, at });
   process.exit(1);
-});
-process.on("unhandledRejection", (err) => {
-  log("fatal", { code: errorCode(err) });
-  process.exit(1);
-});
+};
+process.on("uncaughtException", fatal);
+process.on("unhandledRejection", fatal);
 
 let options;
 let sessionDir;
@@ -35,6 +34,13 @@ try {
 } catch (err) {
   process.stderr.write(`${err instanceof Error ? err.message : "invalid arguments"}\n${USAGE}\n`);
   process.exit(2);
+}
+
+// Serving needs a paired session; check before the library is even loaded.
+if (!options.pairOnly && !sessionIsPaired(sessionDir)) {
+  log("unpaired", {});
+  process.stderr.write("The session is not paired. Run with --pair-only first.\n");
+  process.exit(3);
 }
 
 // The library is loaded only now, after the arguments are good.
@@ -74,7 +80,10 @@ if (options.pairOnly) {
   const http = createBridgeServer(bridge, { secret: options.secret, log });
   const address = await http.listen(options.port);
   log("listening", { loopback: address.address === "127.0.0.1", port: address.port });
-  await bridge.start();
+  if (!(await bridge.start())) {
+    await http.close();
+    process.exit(3);
+  }
   const shutdown = async () => {
     bridge.stop();
     await http.close();

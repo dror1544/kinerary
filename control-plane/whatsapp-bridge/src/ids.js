@@ -57,6 +57,17 @@ export function idKind(value) {
 
 export const isGroupId = (value) => idKind(value) === "group";
 
+/** A message id as WhatsApp issues it: letters and digits only. Checked before it is used in a lookup or a path. */
+export const MESSAGE_ID_RE = /^[A-Za-z0-9]{1,128}$/;
+export const isMessageId = (value) => typeof value === "string" && MESSAGE_ID_RE.test(value);
+
+/** The last four digits of a phone id, or undefined. The only form of a person's number that leaves the bridge. */
+export function phoneLast4(value) {
+  const id = normalizeId(value);
+  if (idKind(id) !== "pn") return undefined;
+  return id.slice(0, id.indexOf("@")).slice(-4);
+}
+
 /** A bounded map that forgets its oldest entry first. */
 class Lru {
   constructor(limit) {

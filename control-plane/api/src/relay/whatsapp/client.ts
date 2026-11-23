@@ -37,6 +37,9 @@ export const PERSON_REAL_ID = /^[0-9]{5,40}@lid$/;
 /** The phone form, which is only ever a separate optional field. */
 export const PHONE_REAL_ID = /^[0-9]{5,40}@s\.whatsapp\.net$/;
 
+/** A message id as WhatsApp issues it. Checked before an id goes into a path, a lookup or a quote. */
+export const MESSAGE_ID = /^[A-Za-z0-9]{1,128}$/;
+
 export const isGroupRealId = (id: string): boolean => GROUP_REAL_ID.test(id);
 export const isPersonRealId = (id: string): boolean => PERSON_REAL_ID.test(id);
 
@@ -59,7 +62,8 @@ const messageEvent = z.object({
   chatId,
   /** null = the bridge could not resolve the sender: unknown, never guessed. */
   senderId: personId.nullable(),
-  senderPhone: phoneId.optional(),
+  /** Only the last four digits of the sender's number, when the bridge knew it. A full number never arrives. */
+  senderPhoneLast4: z.string().regex(/^[0-9]{4}$/).optional(),
   senderName: z.string().max(200),
   messageId: z.string().min(1).max(200),
   text,
@@ -105,10 +109,10 @@ export type BridgeTitleChanged = z.infer<typeof titleEvent>;
 export type BridgeEvent = z.infer<typeof eventSchema>;
 export type BridgeMedia = z.infer<typeof mediaSchema>;
 
-export type BridgeState = "starting" | "connecting" | "connected" | "disconnected" | "logged_out" | "replaced";
+export type BridgeState = "starting" | "connecting" | "connected" | "disconnected" | "logged_out" | "replaced" | "unpaired";
 
 const healthSchema = z.object({
-  state: z.enum(["starting", "connecting", "connected", "disconnected", "logged_out", "replaced"]),
+  state: z.enum(["starting", "connecting", "connected", "disconnected", "logged_out", "replaced", "unpaired"]),
   epoch: z.string().min(1).max(100),
   own: z.object({ lid: personId.nullable(), phone: phoneId.nullable() }),
   lastSeq: z.number().int().nonnegative(),
@@ -215,10 +219,13 @@ export interface WhatsAppClient {
 // ---------------------------------------------------------------- the URL rule
 
 /**
- * The bridge's base URL, which must point at THIS machine. It receives a bearer
- * secret, and anything else would put the secret on a network. `telegramApiRoot`
- * is not reused: it accepts https to any host. Exact parsed hostname, http only
- * (there is no certificate to check on a loopback socket), no credentials, no
+ * The bridge's base URL. The bridge binds the literal 127.0.0.1 and nothing else,
+ * and it receives a bearer secret, so the host here must be that same literal:
+ * `localhost` resolves to ::1 first on some systems (and a different process may
+ * be listening there), and numeric spellings such as `2130706433`, `127.1` or
+ * `0x7f.1` merely normalise to it. The check is on the text as written, not on
+ * what `URL` makes of it. `telegramApiRoot` is not reused: it accepts https to any
+ * host. http only (a loopback socket has no certificate), no credentials, no
  * path, query or fragment.
  */
 export function whatsappBridgeUrl(configured: string | undefined): string {
@@ -230,11 +237,13 @@ export function whatsappBridgeUrl(configured: string | undefined): string {
   } catch {
     throw new Error("relay.whatsapp.bridge_url is not a URL");
   }
-  const loopback = url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]";
-  if (url.protocol !== "http:" || !loopback) {
-    throw new Error("relay.whatsapp.bridge_url must be http to 127.0.0.1, localhost or [::1]: the bridge is a loopback sidecar");
-  }
   if (url.username || url.password) throw new Error("relay.whatsapp.bridge_url must not carry credentials");
+  const authority = /^http:\/\/([^/?#]*)/i.exec(value)?.[1] ?? "";
+  const port = /^127\.0\.0\.1(?::([0-9]{1,5}))?$/.exec(authority)?.[1];
+  const literal = /^127\.0\.0\.1(?::[0-9]{1,5})?$/.test(authority) && (port === undefined || (Number(port) >= 1 && Number(port) <= 65535));
+  if (url.protocol !== "http:" || !literal) {
+    throw new Error("relay.whatsapp.bridge_url must be http://127.0.0.1:<port>: the bridge binds 127.0.0.1 only, so no other host name or spelling of it is accepted");
+  }
   if ((url.pathname !== "/" && url.pathname !== "") || url.search || url.hash) {
     throw new Error("relay.whatsapp.bridge_url must be a bare origin");
   }
@@ -262,6 +271,13 @@ export interface HttpClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+/** An id that does not have the shape of one is refused before a URL or a body is built from it. */
+const badId = (): WhatsAppFailure => ({ ok: false, reason: "refused", detail: "bad_id" });
+const chatOk = (id: unknown): id is string => typeof id === "string" && (GROUP_REAL_ID.test(id) || PERSON_REAL_ID.test(id));
+const groupOk = (id: unknown): id is string => typeof id === "string" && GROUP_REAL_ID.test(id);
+const personOk = (id: unknown): id is string => typeof id === "string" && PERSON_REAL_ID.test(id);
+const messageOk = (id: unknown): id is string => typeof id === "string" && MESSAGE_ID.test(id);
+
 const unavailable = (detail: string, status?: number): WhatsAppFailure => ({
   ok: false,
   reason: "unavailable",
@@ -279,8 +295,8 @@ function tokenOf(value: unknown): string | undefined {
 export function createHttpWhatsAppClient(options: HttpClientOptions): WhatsAppClient {
   const base = whatsappBridgeUrl(options.baseUrl);
   const secret = options.secret;
-  if (typeof secret !== "string" || secret.length < 16) {
-    throw new Error("relay.whatsapp.bridge_secret must be at least 16 characters");
+  if (typeof secret !== "string" || secret.length < 32 || /\s/.test(secret)) {
+    throw new Error("relay.whatsapp.bridge_secret must be at least 32 characters with no whitespace");
   }
   const doFetch = options.fetchImpl ?? fetch;
   const requestTimeout = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -398,6 +414,7 @@ export function createHttpWhatsAppClient(options: HttpClientOptions): WhatsAppCl
     },
 
     async fetchMedia(chat, messageId, opts = {}) {
+      if (!chatOk(chat) || !messageOk(messageId)) return badId();
       const cap = Math.min(opts.maxBytes ?? DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES * 2);
       const query = new URLSearchParams({ maxBytes: String(cap) });
       const sent = await request(`/media/${enc(chat)}/${enc(messageId)}?${query}`, { timeoutMs: mediaTimeout });
@@ -432,8 +449,9 @@ export function createHttpWhatsAppClient(options: HttpClientOptions): WhatsAppCl
       }
     },
 
-    send: (req) =>
-      call("/send", parseWith(sendSchema), {
+    send: async (req) => {
+      if (!chatOk(req.chatId) || (req.replyTo !== undefined && !messageOk(req.replyTo)) || !(req.mentions ?? []).every(personOk)) return badId();
+      return call("/send", parseWith(sendSchema), {
         method: "POST",
         body: {
           chatId: req.chatId,
@@ -441,15 +459,19 @@ export function createHttpWhatsAppClient(options: HttpClientOptions): WhatsAppCl
           ...(req.replyTo ? { replyTo: req.replyTo } : {}),
           ...(req.mentions?.length ? { mentions: req.mentions } : {}),
         },
-      }),
+      });
+    },
 
-    edit: (req) =>
-      call("/edit", parseWith(editSchema), {
+    edit: async (req) => {
+      if (!chatOk(req.chatId) || !messageOk(req.messageId)) return badId();
+      return call("/edit", parseWith(editSchema), {
         method: "POST",
         body: { chatId: req.chatId, messageId: req.messageId, text: req.text },
-      }),
+      });
+    },
 
     async typing(req) {
+      if (!chatOk(req.chatId)) return badId();
       const out = await call("/typing", (body) => (body && typeof body === "object" ? (body as object) : undefined), {
         method: "POST",
         body: { chatId: req.chatId, ...(req.state ? { state: req.state } : {}) },
@@ -457,9 +479,10 @@ export function createHttpWhatsAppClient(options: HttpClientOptions): WhatsAppCl
       return out.ok ? { ok: true, value: undefined } : out;
     },
 
-    chatInfo: (id) => call(`/chat/${enc(id)}`, parseWith(chatInfoSchema)),
+    chatInfo: async (id) => (chatOk(id) ? call(`/chat/${enc(id)}`, parseWith(chatInfoSchema)) : badId()),
 
     async isParticipant(chat, participant) {
+      if (!groupOk(chat) || !personOk(participant)) return badId();
       const out = await call(`/chat/${enc(chat)}/participant/${enc(participant)}`, parseWith(participantSchema));
       return out.ok ? { ok: true, value: out.value.inGroup } : out;
     },

@@ -28,7 +28,7 @@ interface Backend {
   name: string;
   url: string;
   secret: string;
-  message(input: { chatId: string; senderId?: string | null; senderName?: string; text?: string; messageId: string; media?: { kind: string; mime: string; filename: string; bytes: Buffer }; mentionedIds?: string[]; quotedMessageId?: string }): Promise<void>;
+  message(input: { chatId: string; fromMe?: boolean; senderId?: string | null; senderName?: string; text?: string; messageId: string; media?: { kind: string; mime: string; filename: string; bytes: Buffer }; mentionedIds?: string[]; quotedMessageId?: string }): Promise<void>;
   added(input: { chatId: string; addedBy?: string; title?: string }): Promise<void>;
   left(input: { chatId: string; participantId: string }): Promise<void>;
   title(input: { chatId: string; title: string }): Promise<void>;
@@ -39,7 +39,9 @@ interface Backend {
 }
 
 async function realBackend(): Promise<Backend> {
-  const ctx = await startBridge();
+  // The bridge caches group metadata for 60 s; the clock is ours so "could not check" can be provoked.
+  let clock = Date.now();
+  const ctx = await startBridge({ now: () => clock });
   const server = await serve(ctx.bridge);
   const media = new Map<string, Buffer>();
   ctx.fake.lib.downloadMediaMessage = async (m: { key: { id: string } }) => media.get(m.key.id) ?? Buffer.from("");
@@ -48,7 +50,7 @@ async function realBackend(): Promise<Backend> {
     name: "the real bridge core (fake library socket)",
     url: server.base,
     secret: BRIDGE_SECRET,
-    async message({ chatId, senderId, senderName, text, messageId, media: m, mentionedIds, quotedMessageId }) {
+    async message({ chatId, fromMe, senderId, senderName, text, messageId, media: m, mentionedIds, quotedMessageId }) {
       const isGroup = chatId.endsWith("@g.us");
       const who = senderId ? { lid: senderId, phone: people.get(senderId) ?? ALICE.phone, name: senderName ?? "" } : null;
       const ctx2: Record<string, unknown> = {};
@@ -60,6 +62,10 @@ async function realBackend(): Promise<Backend> {
       if (m) {
         media.set(messageId, m.bytes);
         msg.message = { [`${m.kind}Message`]: { mimetype: m.mime, fileLength: m.bytes.length, fileName: m.filename, caption: text ?? "" } };
+      }
+      if (fromMe) {
+        msg.key.fromMe = true;
+        msg.key.participant = OWN.lid;
       }
       await ctx.sock.emit("messages.upsert", upsertOf([msg]));
     },
@@ -85,6 +91,7 @@ async function realBackend(): Promise<Backend> {
       await ctx.sock.emit("connection.update", { connection: "close", lastDisconnect: { error: { output: { statusCode: 401 } } } });
     },
     async membershipUnavailable(on: boolean) {
+      clock += 61_000; // past the cache, so the next question really asks
       ctx.sock.metadataError = on ? new Error("timeout") : null;
     },
     close: () => server.http.close(),
@@ -92,14 +99,15 @@ async function realBackend(): Promise<Backend> {
 }
 
 async function standInBackend(): Promise<Backend> {
-  const fake = await startFakeWhatsApp({ secret: "stand-in-secret-0123456789" });
+  const fake = await startFakeWhatsApp({ secret: "stand-in-secret-0123456789-abcdefgh" });
   return {
     name: "the stand-in (tools/fake-whatsapp.ts)",
     url: fake.url,
     secret: fake.secret,
-    async message({ chatId, senderId, senderName, text, messageId, media, mentionedIds, quotedMessageId }) {
+    async message({ chatId, fromMe, senderId, senderName, text, messageId, media, mentionedIds, quotedMessageId }) {
       fake.control.message({
         chatId,
+        ...(fromMe ? { fromMe: true, senderId: OWN.lid } : {}),
         ...(senderId !== undefined ? { senderId } : {}),
         senderName,
         text,
@@ -119,7 +127,6 @@ async function standInBackend(): Promise<Backend> {
       fake.control.title(input);
     },
     async group({ chatId, title, members }) {
-      for (const m of members) fake.control.person(m);
       fake.control.group({ chatId, title, participants: [...members.map((m) => m.lid), FAKE_OWN.lid] });
     },
     async loggedOut() {
@@ -185,6 +192,14 @@ for (const make of [realBackend, standInBackend]) {
       assert.equal(byId.get("C3")!.senderId, ALICE.lid);
       assert.deepEqual(byId.get("C4")!.media, { kind: "image", mime: "image/jpeg", size: 10, filename: "" });
       for (const e of byId.values()) assert.equal(e.fromMe, false);
+    });
+
+    t("/messages never carries a full phone number, only the last four digits", async () => {
+      await backend.message({ chatId: GROUP, senderId: ALICE.lid, senderName: ALICE.name, text: "with a number nearby", messageId: "NUM1", mentionedIds: [OWN.lid] });
+      const raw = await (await fetch(`${backend.url}/messages?after=0&waitMs=0`, { headers: { Authorization: `Bearer ${backend.secret}` } })).text();
+      for (const full of ["200000000002", "200000000099", "@s.whatsapp.net"]) // (the old group id legitimately embeds its creator's number)
+       assert.ok(!raw.includes(full), full);
+      assert.ok(raw.includes('"senderPhoneLast4":"0001"') || !raw.includes("senderPhone"), "last four digits at most");
     });
 
     t("a batch is cut at 100: following lastSeq while more is true delivers every event, none twice", async () => {
@@ -253,6 +268,10 @@ for (const make of [realBackend, standInBackend]) {
       assert.ok(!theirs.ok && theirs.reason === "refused" && theirs.detail === "not_own_message");
       const wrongChat = await client.edit({ chatId: OLD_GROUP, messageId: sameChat.value.messageId, text: "no" });
       assert.ok(!wrongChat.ok && wrongChat.reason === "not_found");
+      // Typed on the number's own phone: flagged fromMe, but not sent through the bridge, so not editable.
+      await backend.message({ chatId: GROUP, fromMe: true, text: "typed on the phone", messageId: "TYPEDONPHONE" });
+      const phoneTyped = await client.edit({ chatId: GROUP, messageId: "TYPEDONPHONE", text: "no" });
+      assert.ok(!phoneTyped.ok && phoneTyped.reason === "refused" && phoneTyped.detail === "not_own_message");
       assert.ok((await client.typing({ chatId: GROUP })).ok);
     });
 
@@ -267,13 +286,16 @@ for (const make of [realBackend, standInBackend]) {
       for (const id of [ALICE.lid, ALICE.phone, BOB.lid, BOB.phone, OWN.lid, OWN.phone, "100000000000001", "200000000001"]) assert.ok(!raw.includes(id), id);
     });
 
-    t("membership: yes, no (in either id form) and could-not-check", async () => {
+    t("membership: yes, no and could-not-check; linked-identity form only", async () => {
       assert.deepEqual(await client.isParticipant(GROUP, ALICE.lid), { ok: true, value: true });
-      assert.deepEqual(await client.isParticipant(GROUP, ALICE.phone), { ok: true, value: true });
-      // Bob left in the group events test, whichever id form he is asked about by.
+      // Bob left in the group events test.
       assert.deepEqual(await client.isParticipant(GROUP, BOB.lid), { ok: true, value: false });
-      assert.deepEqual(await client.isParticipant(GROUP, BOB.phone), { ok: true, value: false });
       assert.deepEqual(await client.isParticipant(GROUP, "100000000000003@lid"), { ok: true, value: false });
+      // A phone form is refused: by the client before a request, and by the server itself (a 400, same on both backends).
+      const refused = await client.isParticipant(GROUP, ALICE.phone);
+      assert.ok(!refused.ok && refused.reason === "refused" && refused.detail === "bad_id");
+      const raw = await fetch(`${backend.url}/chat/${encodeURIComponent(GROUP)}/participant/${encodeURIComponent(ALICE.phone)}`, { headers: { Authorization: `Bearer ${backend.secret}` } });
+      assert.equal(raw.status, 400);
       await backend.membershipUnavailable(true);
       const unknown = await client.isParticipant(GROUP, ALICE.lid);
       assert.ok(!unknown.ok && unknown.reason === "unavailable");

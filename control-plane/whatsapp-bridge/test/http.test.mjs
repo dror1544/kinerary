@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { request } from "node:http";
 import { test } from "node:test";
 import { createBridgeServer, LOOPBACK_HOST } from "../src/http.js";
 import {
@@ -19,6 +20,19 @@ import {
 } from "./helpers.mjs";
 
 const enc = encodeURIComponent;
+
+/** A request whose path is sent exactly as written: `fetch` would collapse `..` before it left the process. */
+function rawGet(base, rawPath) {
+  const url = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = request({ host: url.hostname, port: url.port, path: rawPath, method: "GET", headers: { Authorization: `Bearer ${SECRET}` } }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
 
 async function withServer(fn, options) {
   const ctx = await startBridge(options);
@@ -137,16 +151,16 @@ test("GET /messages: a different epoch (the bridge restarted) is read as 'everyt
 
 test("POST /send: text out, one messageId; a replyTo quotes only a message of THE SAME chat", async () => {
   await withServer(async ({ call, sock }) => {
-    await sock.emit("messages.upsert", upsertOf([groupText({ group: NEW_GROUP, id: "IN_NEW" }), groupText({ group: OLD_GROUP, id: "IN_OLD" })]));
+    await sock.emit("messages.upsert", upsertOf([groupText({ group: NEW_GROUP, id: "INNEW" }), groupText({ group: OLD_GROUP, id: "INOLD" })]));
 
-    const same = await readJson(await call("/send", { method: "POST", body: { chatId: NEW_GROUP, text: "hello", replyTo: "IN_NEW" } }));
+    const same = await readJson(await call("/send", { method: "POST", body: { chatId: NEW_GROUP, text: "hello", replyTo: "INNEW" } }));
     assert.equal(same.status, 200);
     assert.equal(same.body.quoted, true);
-    assert.equal(sock.sent[0].options.quoted.key.id, "IN_NEW");
+    assert.equal(sock.sent[0].options.quoted.key.id, "INNEW");
     assert.equal(sock.sent[0].content.text, "hello");
 
     // A message of ANOTHER chat is not quoted; the text still goes.
-    const other = await readJson(await call("/send", { method: "POST", body: { chatId: NEW_GROUP, text: "again", replyTo: "IN_OLD" } }));
+    const other = await readJson(await call("/send", { method: "POST", body: { chatId: NEW_GROUP, text: "again", replyTo: "INOLD" } }));
     assert.equal(other.status, 200);
     assert.equal(other.body.quoted, false);
     assert.equal(sock.sent[1].options.quoted, undefined);
@@ -154,6 +168,14 @@ test("POST /send: text out, one messageId; a replyTo quotes only a message of TH
     // An unknown id is not quoted either.
     const unknown = await readJson(await call("/send", { method: "POST", body: { chatId: NEW_GROUP, text: "third", replyTo: "NOPE" } }));
     assert.equal(unknown.body.quoted, false);
+    assert.equal(sock.sent.length, 3);
+
+    // A replyTo that is not shaped like a message id is refused outright.
+    for (const bad of ["../health", "a-b", "x".repeat(129), "", 12, null, ["INNEW"]]) {
+      const res = await readJson(await call("/send", { method: "POST", body: { chatId: NEW_GROUP, text: "x", replyTo: bad } }));
+      assert.equal(res.status, 400, JSON.stringify(bad));
+      assert.equal(res.body.error, "bad_message");
+    }
     assert.equal(sock.sent.length, 3);
   });
 });
@@ -236,6 +258,16 @@ test("POST /edit: only a message the number sent, in THAT chat", async () => {
     const theirs = await readJson(await call("/edit", { method: "POST", body: { chatId: NEW_GROUP, messageId: "THEIRS", text: "nope" } }));
     assert.equal(theirs.status, 403);
     assert.equal(theirs.body.error, "not_own_message");
+
+    // Typed on the number's own phone: flagged fromMe, but not sent by the bridge, so not its to edit.
+    const typed = groupText({ group: NEW_GROUP, id: "TYPEDONPHONE" });
+    typed.key.fromMe = true;
+    typed.key.participant = OWN.lid;
+    await sock.emit("messages.upsert", upsertOf([typed]));
+    const phoneTyped = await readJson(await call("/edit", { method: "POST", body: { chatId: NEW_GROUP, messageId: "TYPEDONPHONE", text: "no" } }));
+    assert.equal(phoneTyped.status, 403);
+    assert.equal(phoneTyped.body.error, "not_own_message");
+    assert.equal(sock.sent.length, before);
 
     // The number's own message, but in a different chat: not found, nothing sent.
     const elsewhere = await readJson(await call("/edit", { method: "POST", body: { chatId: OLD_GROUP, messageId: mine, text: "nope" } }));
@@ -335,30 +367,119 @@ test("GET /chat/:id: a group's title and size, and NO participant ids; a private
   });
 });
 
-test("GET /chat/:id/participant/:id: yes, no, and 'could not check' are three different answers; id forms are matched", async () => {
+test("GET /chat/:id/participant/:id: yes, no, and 'could not check' are three different answers", async () => {
+  let clock = 1_000_000;
   await withServer(async ({ call, sock }) => {
     sock.groups.set(NEW_GROUP, group(NEW_GROUP, [ALICE, BOB]));
     const ask = async (chat, who) => readJson(await call(`/chat/${enc(chat)}/participant/${enc(who)}`));
 
     assert.deepEqual((await ask(NEW_GROUP, ALICE.lid)).body, { ok: true, chatId: NEW_GROUP, inGroup: true });
-    // Asked by the phone form: the bridge matches across forms.
-    assert.equal((await ask(NEW_GROUP, BOB.phone)).body.inGroup, true);
+    assert.equal((await ask(NEW_GROUP, BOB.lid)).body.inGroup, true);
     assert.equal((await ask(NEW_GROUP, CAROL.lid)).body.inGroup, false);
-    assert.equal((await ask(NEW_GROUP, CAROL.phone)).body.inGroup, false);
 
-    // A participant entry that carries only a phone id still matches that phone id.
-    sock.groups.set(OLD_GROUP, { id: OLD_GROUP, participants: [{ id: CAROL.phone }] });
-    assert.equal((await ask(OLD_GROUP, CAROL.phone)).body.inGroup, true);
+    // A participant the group lists under a phone id only is still matched, once its pair is known.
+    sock.groups.set(OLD_GROUP, { id: OLD_GROUP, participants: [{ id: CAROL.phone, lid: CAROL.lid }] });
+    assert.equal((await ask(OLD_GROUP, CAROL.lid)).body.inGroup, true);
 
     // Cannot check: metadata unavailable -> 503, which is NOT "inGroup: false".
+    clock += 61_000; // past the cache
     sock.metadataError = new Error("timeout");
     const unknown = await ask(NEW_GROUP, ALICE.lid);
     assert.equal(unknown.status, 503);
     assert.equal(unknown.body.error, "unavailable");
     assert.equal("inGroup" in unknown.body, false);
-
     sock.metadataError = null;
+  }, { now: () => clock });
+});
+
+test("participant: the linked-identity form only; a phone form, junk and a non-group chat are 400", async () => {
+  await withServer(async ({ call, sock, base }) => {
+    sock.groups.set(NEW_GROUP, group(NEW_GROUP, [ALICE]));
+    const ask = async (chat, who) => readJson(await call(`/chat/${enc(chat)}/participant/${enc(who)}`));
+    for (const who of [ALICE.phone, "junk", "100000000000001", `${ALICE.lid}/x`]) {
+      const res = await ask(NEW_GROUP, who);
+      assert.equal(res.status, 400, who);
+      assert.equal(res.body.error, "bad_participant");
+    }
     assert.equal((await ask("junk", ALICE.lid)).status, 400);
-    assert.equal((await ask(NEW_GROUP, "junk")).status, 400);
+    assert.equal((await ask(ALICE.lid, ALICE.lid)).status, 400);
+    // Dot segments, sent as written (fetch would have collapsed them).
+    assert.equal(await rawGet(base, `/chat/${enc(NEW_GROUP)}/participant/..`), 400);
+    assert.equal(await rawGet(base, `/chat/../participant/${enc(ALICE.lid)}`), 400);
+    assert.equal(sock.metadataCalls ?? 0, 0, "a refused question asks WhatsApp nothing");
+  });
+});
+
+test("group metadata is cached 60 s per group, and a participant or group event for that group drops it", async () => {
+  let clock = 5_000_000;
+  await withServer(async ({ call, sock }) => {
+    let queries = 0;
+    const real = sock.groupMetadata.bind(sock);
+    sock.groupMetadata = async (id) => {
+      queries += 1;
+      return real(id);
+    };
+    sock.groups.set(NEW_GROUP, { ...group(NEW_GROUP, [ALICE, BOB]), subject: "Cached Fixture" });
+    sock.groups.set(OLD_GROUP, group(OLD_GROUP, [ALICE]));
+    const ask = (who, chat = NEW_GROUP) => call(`/chat/${enc(chat)}/participant/${enc(who)}`);
+
+    for (let i = 0; i < 5; i += 1) await ask(ALICE.lid);
+    await call(`/chat/${enc(NEW_GROUP)}`);
+    assert.equal(queries, 1, "six questions about one group, one query to WhatsApp");
+
+    await ask(ALICE.lid, OLD_GROUP);
+    assert.equal(queries, 2, "another group is its own entry");
+
+    // Bob leaves: the notification drops that group's entry, so the next answer is fresh.
+    sock.groups.get(NEW_GROUP).participants = sock.groups.get(NEW_GROUP).participants.filter((p) => p.id !== BOB.lid);
+    await sock.emit("group-participants.update", { id: NEW_GROUP, author: ALICE.lid, action: "remove", participants: [{ id: BOB.lid }] });
+    const gone = await readJson(await ask(BOB.lid));
+    assert.equal(gone.body.inGroup, false);
+    assert.equal(queries, 3);
+    await ask(BOB.lid);
+    assert.equal(queries, 3);
+
+    // A rename drops it too, so /chat shows the new title.
+    sock.groups.get(NEW_GROUP).subject = "Renamed Fixture";
+    await sock.emit("groups.update", [{ id: NEW_GROUP, subject: "Renamed Fixture" }]);
+    assert.equal((await readJson(await call(`/chat/${enc(NEW_GROUP)}`))).body.title, "Renamed Fixture");
+    assert.equal(queries, 4);
+
+    // After 60 s the entry is stale.
+    clock += 61_000;
+    await ask(ALICE.lid);
+    assert.equal(queries, 5);
+
+    // A failed lookup is never cached.
+    clock += 61_000;
+    sock.metadataError = new Error("timeout");
+    assert.equal((await ask(ALICE.lid)).status, 503);
+    sock.metadataError = null;
+    assert.equal((await ask(ALICE.lid)).status, 200);
+  }, { now: () => clock });
+});
+
+test("ids are checked before use: a path-shaped, wrong-form or oversized id is 400 on /media, /chat, /edit", async () => {
+  await withServer(async ({ call, sock, base }) => {
+    const photo = groupText({ id: "PHOTO9" });
+    photo.message = { imageMessage: { mimetype: "image/jpeg", fileLength: 1 } };
+    await sock.emit("messages.upsert", upsertOf([photo]));
+    assert.equal((await call(`/media/${enc(NEW_GROUP)}/PHOTO9`)).status, 200);
+
+    for (const [chat, message] of [[NEW_GROUP, "a-b"], [NEW_GROUP, "x".repeat(129)], [ALICE.phone, "PHOTO9"], ["status@broadcast", "PHOTO9"]]) {
+      const res = await call(`/media/${enc(chat)}/${enc(message)}`);
+      assert.equal(res.status, 400, `${chat} ${message}`);
+    }
+    assert.equal((await call(`/chat/${enc(ALICE.phone)}`)).status, 400, "a phone-form chat is not a chat");
+    // Dot segments as written: they must be refused by shape, not resolved into another route.
+    assert.equal(await rawGet(base, "/media/../health"), 400);
+    assert.equal(await rawGet(base, `/media/${enc(NEW_GROUP)}/..`), 400);
+    assert.equal(await rawGet(base, "/chat/.."), 400);
+    assert.equal(await rawGet(base, "/media/%2e%2e/health"), 400);
+    for (const messageId of ["..", "a-b", "", 7]) {
+      const res = await call("/edit", { method: "POST", body: { chatId: NEW_GROUP, messageId, text: "x" } });
+      assert.equal(res.status, 400, JSON.stringify(messageId));
+    }
+    assert.equal(sock.sent.length, 0);
   });
 });

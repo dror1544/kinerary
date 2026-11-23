@@ -21,12 +21,13 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 export const LOOPBACK_HOST = "127.0.0.1";
 const MAX_BODY = 64 * 1024;
-const MIN_SECRET = 16;
+const MIN_SECRET = 32;
 
 export function validateSecret(secret) {
   if (typeof secret !== "string" || secret.length < MIN_SECRET) {
     throw new Error(`bridge secret must be at least ${MIN_SECRET} characters`);
   }
+  if (/\s/.test(secret)) throw new Error("bridge secret must not contain whitespace");
   return secret;
 }
 
@@ -87,8 +88,13 @@ export function createBridgeServer(bridge, { secret, log }) {
       if (!bearerOk(req.headers.authorization, secret)) {
         return send(res, 401, { ok: false, error: "unauthorized" });
       }
-      const url = new URL(req.url ?? "/", "http://bridge.invalid");
-      const parts = url.pathname.split("/").filter(Boolean).map(decodeSegment);
+      // The path is split as written. `new URL` would resolve `..` segments into
+      // another route before any id was checked.
+      const target = req.url ?? "/";
+      const queryAt = target.indexOf("?");
+      const rawPath = queryAt === -1 ? target : target.slice(0, queryAt);
+      const url = { searchParams: new URLSearchParams(queryAt === -1 ? "" : target.slice(queryAt + 1)) };
+      const parts = rawPath.split("/").filter(Boolean).map(decodeSegment);
       if (parts.includes(null)) return send(res, 400, { ok: false, error: "bad_path" });
       const method = req.method ?? "GET";
 

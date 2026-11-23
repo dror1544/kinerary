@@ -58,10 +58,10 @@ function restore(text: string, slots: string[]): string {
 // The first line is a language tag only when it is one word and a newline follows: "```hello```" is code.
 const FENCE = /```(?:[\w+#.-]*[ \t]*\n)?([\s\S]*?)```/g;
 const INLINE_CODE = /`([^`\n]+)`/g;
-const IMAGE = /!\[([^\]\n]*)\]\(\s*(https?:\/\/[^\s)]+)[^)]*\)/g;
-const LINK = /\[([^\]\n]*)\]\(\s*(https?:\/\/[^\s)]+)[^)]*\)/g;
+const IMAGE = /!\[([^\]\n]{0,500})\]\(\s*(https?:\/\/[^\s)]{1,2000})(?:\s[^)]{0,300})?\)/g;
+const LINK = /\[([^\]\n]{0,500})\]\(\s*(https?:\/\/[^\s)]{1,2000})(?:\s[^)]{0,300})?\)/g;
 // Trailing punctuation is not part of a bare URL.
-const BARE_URL = /https?:\/\/[^\s<>()\[\]]+[^\s<>()\[\].,;:!?'"»”’)]/g;
+const BARE_URL = /https?:\/\/[^\s<>()\[\]]{1,2000}[^\s<>()\[\].,;:!?'"»”’)]/g;
 const HEADING = /^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/;
 const RULE = /^[ \t]*([-*_])([ \t]*\1){2,}[ \t]*$/;
 const TABLE_SEPARATOR = /^[ \t]*\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
@@ -85,22 +85,32 @@ function emphasis(text: string): string {
   const notWordBefore = `(?<![*${LETTER_OR_DIGIT}])`;
   const notWordAfter = `(?![*${LETTER_OR_DIGIT}])`;
   // ***bold italic***
-  out = out.replace(/\*\*\*(?!\s)([^\n]+?)(?<!\s)\*\*\*/gu, `${B}${I}$1${I}${B}`);
+  out = out.replace(/\*\*\*(?!\s)([^\n]{1,2000}?)(?<!\s)\*\*\*/gu, `${B}${I}$1${I}${B}`);
   // **bold**, __bold__
-  out = out.replace(/\*\*(?!\s)([^\n]+?)(?<!\s)\*\*/gu, `${B}$1${B}`);
-  out = out.replace(new RegExp(`(?<![_${LETTER_OR_DIGIT}])__(?!\\s)([^\\n]+?)(?<!\\s)__(?![_${LETTER_OR_DIGIT}])`, "gu"), `${B}$1${B}`);
+  out = out.replace(/\*\*(?!\s)([^\n]{1,2000}?)(?<!\s)\*\*/gu, `${B}$1${B}`);
+  out = out.replace(new RegExp(`(?<![_${LETTER_OR_DIGIT}])__(?!\\s)([^\\n]{1,2000}?)(?<!\\s)__(?![_${LETTER_OR_DIGIT}])`, "gu"), `${B}$1${B}`);
   // ~~strike~~
-  out = out.replace(/~~(?!\s)([^\n]+?)(?<!\s)~~/gu, `${S}$1${S}`);
+  out = out.replace(/~~(?!\s)([^\n]{1,2000}?)(?<!\s)~~/gu, `${S}$1${S}`);
   // *italic*
-  out = out.replace(new RegExp(`${notWordBefore}\\*(?!\\s)([^*\\n]+?)(?<!\\s)\\*${notWordAfter}`, "gu"), `${I}$1${I}`);
+  out = out.replace(new RegExp(`${notWordBefore}\\*(?!\\s)([^*\\n]{1,2000}?)(?<!\\s)\\*${notWordAfter}`, "gu"), `${I}$1${I}`);
   // _italic_ (already WhatsApp's own, but only where Markdown would read it as emphasis)
-  out = out.replace(new RegExp(`(?<![_${LETTER_OR_DIGIT}])_(?!\\s)([^_\\n]+?)(?<!\\s)_(?![_${LETTER_OR_DIGIT}])`, "gu"), `${I}$1${I}`);
+  out = out.replace(new RegExp(`(?<![_${LETTER_OR_DIGIT}])_(?!\\s)([^_\\n]{1,2000}?)(?<!\\s)_(?![_${LETTER_OR_DIGIT}])`, "gu"), `${I}$1${I}`);
   return out.replaceAll(B, "*").replaceAll(I, "_").replaceAll(S, "~");
 }
+
+/**
+ * The longest input that is converted. A companion reply is a few thousand
+ * characters; beyond this the text is passed through as written (and split), so
+ * a pathological run of brackets cannot hold the relay's loop for seconds.
+ */
+export const MAX_CONVERT_CHARS = 64_000;
+// Every pattern below that scans for a closer is also bounded (labels 500, targets and spans 2000):
+// an unbounded scan from each of many openers is quadratic, and a cap on the input alone is not enough.
 
 /** Convert one message's Markdown to WhatsApp's dialect. */
 export function toWhatsAppText(markdown: string): string {
   if (!markdown) return "";
+  if (markdown.length > MAX_CONVERT_CHARS) return markdown.replace(/\r\n?/g, "\n").trim();
   try {
     const slots: string[] = [];
     let text = markdown.replace(/\r\n?/g, "\n").replace(PUA, "");

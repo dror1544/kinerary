@@ -7,20 +7,37 @@ async function events(bridge, after = 0) {
   return out.body.events;
 }
 
-test("a private message: chat and sender are the linked-identity id, the phone is a separate optional field", async () => {
+test("a private message: chat and sender are the linked-identity id, the phone's last four digits are a separate optional field", async () => {
   const { bridge, sock } = await startBridge();
   await sock.emit("messages.upsert", upsertOf([privateText({ text: "where is the hotel?" })]));
   const [event] = await events(bridge);
   assert.equal(event.type, "message");
   assert.equal(event.chatId, ALICE.lid);
   assert.equal(event.senderId, ALICE.lid);
-  assert.equal(event.senderPhone, ALICE.phone);
+  // Never the full number: only its last four digits leave the bridge.
+  assert.equal(event.senderPhoneLast4, "0001");
+  assert.equal("senderPhone" in event, false);
   assert.equal(event.senderName, "Alice Fixture");
   assert.equal(event.text, "where is the hotel?");
   assert.equal(event.messageId, "MSGPRIV0001");
   assert.equal(event.fromMe, false);
   assert.deepEqual(event.mentionedIds, []);
   assert.equal(event.media, undefined);
+});
+
+test("no /messages item carries a full phone number, in any field: private, group, own, mention and quote cases", async () => {
+  const { bridge, sock } = await startBridge();
+  await sock.emit("messages.upsert", upsertOf([
+    privateText({ id: "N1" }),
+    groupText({ id: "N2", from: BOB, ctx: { mentionedJid: [ALICE.phone, OWN.phone], quotedMessage: { conversation: "q" }, stanzaId: "Q1", participant: ALICE.phone } }),
+  ]));
+  const own = groupText({ id: "N3" });
+  own.key.fromMe = true;
+  own.key.participant = OWN.lid;
+  await sock.emit("messages.upsert", upsertOf([own]));
+  const raw = JSON.stringify(await events(bridge));
+  for (const digits of ["200000000001", "200000000002", "200000000099", "@s.whatsapp.net"]) assert.ok(!raw.includes(digits), digits);
+  assert.ok(raw.includes('"senderPhoneLast4":"0099"'), "the number's own messages carry its last four too");
 });
 
 test("a private message whose chat id arrives as a phone id is resolved through the library's mapping", async () => {
@@ -53,7 +70,7 @@ test("a group message: real group id (new and old), participant canonical, phone
   const [a, b] = await events(bridge);
   assert.equal(a.chatId, NEW_GROUP);
   assert.equal(a.senderId, BOB.lid);
-  assert.equal(a.senderPhone, BOB.phone);
+  assert.equal(a.senderPhoneLast4, "0002");
   assert.equal(b.chatId, OLD_GROUP);
   assert.equal(b.senderId, ALICE.lid);
 });
@@ -65,7 +82,7 @@ test("a group sender that is a phone id only and unmapped is reported unknown (n
   await sock.emit("messages.upsert", upsertOf([msg]));
   const [event] = await events(bridge);
   assert.equal(event.senderId, null);
-  assert.equal(event.senderPhone, CAROL.phone);
+  assert.equal(event.senderPhoneLast4, "0003");
 });
 
 test("a phone-only sender is resolved once the pair has been seen in other traffic", async () => {

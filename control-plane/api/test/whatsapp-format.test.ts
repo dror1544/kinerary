@@ -39,6 +39,7 @@ describe("toWhatsAppText: the companion's Markdown in WhatsApp's dialect", () =>
     ["underscores in a url are not italic", "open https://example.org/a_b_c now", "open https://example.org/a_b_c now"],
     ["underscores in a link target survive", "[x](https://example.org/a_b_c_d)", "x (https://example.org/a_b_c_d)"],
     ["a trailing full stop is not part of a url", "go to https://example.org.", "go to https://example.org."],
+    ["a link with a title", '[x](https://example.org/x "the title")', "x (https://example.org/x)"],
     ["bold label on a link", "**[Map](https://example.org/m)**", "*Map (https://example.org/m)*"],
 
     ["inline code is untouched", "run `a_b *c* **d**` now", "run `a_b *c* **d**` now"],
@@ -71,6 +72,26 @@ describe("toWhatsAppText: the companion's Markdown in WhatsApp's dialect", () =>
 
   test("a message cannot forge the converter's private markers", () => {
     assert.equal(toWhatsAppText("abc"), "abc");
+  });
+
+  test("input beyond the cap is passed through unconverted, and a pathological run of brackets is fast", () => {
+    const hostile = "[".repeat(40_000) + "](".repeat(40_000); // 120,000 characters
+    const started = Date.now();
+    const out = formatForWhatsApp(hostile, 4000);
+    assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
+    assert.equal(out.join(""), hostile.trim(), "nothing lost, nothing converted");
+    assert.ok(out.every((c) => c.length <= 4000));
+    // Just under the cap is still converted, and fast.
+    const justUnder = "[a](https://example.org/x) **b** ".repeat(1900); // ~60k
+    const t0 = Date.now();
+    assert.ok(toWhatsAppText(justUnder).includes("a (https://example.org/x) *b*"));
+    assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`);
+    // Under the cap, so it IS converted: each of these used to scan to the end from every opener.
+    for (const nasty of ["[".repeat(63_000), "[a](https://".repeat(5000), "*a ".repeat(20_000), "~~a ".repeat(15_000), "![a](https://".repeat(4500)]) {
+      const t1 = Date.now();
+      toWhatsAppText(nasty);
+      assert.ok(Date.now() - t1 < 1000, `took ${Date.now() - t1} ms on ${nasty.slice(0, 14)}`);
+    }
   });
 
   test("it never throws, whatever it is given", () => {

@@ -37,6 +37,30 @@ export function errorCode(err) {
 }
 
 /**
+ * What a crash may say: the error's NAME and the top stack frame's file and line,
+ * never its message (a library error message is free to quote an id). The message
+ * is stripped from the stack by value before the first frame is read, so a message
+ * that imitates a frame cannot be mistaken for one.
+ */
+export function crashSummary(err) {
+  const name = typeof err?.name === "string" && /^[A-Za-z]{1,40}$/.test(err.name) ? err.name : "Error";
+  let at = "unknown";
+  try {
+    let stack = String(err?.stack ?? "");
+    const message = String(err?.message ?? "");
+    const head = `${err?.name ?? "Error"}: ${message}`;
+    if (message && stack.startsWith(head)) stack = stack.slice(head.length);
+    else if (message) stack = stack.split(message).join("");
+    const frame = stack.split("\n").find((l) => /^\s+at /.test(l));
+    const m = frame && /([^\\/():\s]+):(\d+):\d+\)?\s*$/.exec(frame);
+    if (m) at = `${m[1]}:${m[2]}`.toLowerCase();
+  } catch {
+    /* a crash report that crashes */
+  }
+  return { name: name.toLowerCase(), at };
+}
+
+/**
  * @param {(line: string) => void} [write] where a finished line goes; stderr by default
  */
 export function createSafeLogger(write = (line) => process.stderr.write(`${line}\n`)) {

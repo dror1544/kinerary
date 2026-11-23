@@ -16,7 +16,7 @@ export const BOB = { lid: "100000000000002@lid", phone: "200000000002@s.whatsapp
 export const CAROL = { lid: "100000000000003@lid", phone: "200000000003@s.whatsapp.net", name: "Carol Fixture" };
 export const NEW_GROUP = "120000000000000001@g.us";
 export const OLD_GROUP = "200000000001-1466483396@g.us";
-export const SECRET = "test-secret-0123456789abcdef";
+export const SECRET = "test-secret-0123456789abcdef-0123456789";
 export const DISCONNECT = { loggedOut: 401, restartRequired: 515, connectionReplaced: 440, connectionClosed: 428 };
 
 export class FakeSocket {
@@ -74,7 +74,8 @@ export function makeFakeLib() {
     DisconnectReason: DISCONNECT,
     useMultiFileAuthState: async (dir) => {
       authCalls.push(dir);
-      return { state: { creds: {}, keys: {} }, saveCreds: async () => {} };
+      // A paired session: serving refuses one without registered credentials.
+      return { state: { creds: lib.creds ?? { registered: true, me: { id: "200000000099:7@s.whatsapp.net" } }, keys: {} }, saveCreds: async () => {} };
     },
     makeWASocket: (options) => {
       const sock = new FakeSocket();
@@ -120,7 +121,7 @@ export function tempDir(prefix = "wa-bridge-test-") {
 }
 
 /** A connected bridge on a fake library, with its log captured. */
-export async function startBridge({ timers, limits } = {}) {
+export async function startBridge({ timers, limits, now } = {}) {
   const fake = makeFakeLib();
   const logs = [];
   const bridge = createBridge({
@@ -129,6 +130,7 @@ export async function startBridge({ timers, limits } = {}) {
     log: (event, fields) => logs.push({ event, ...fields }),
     timers,
     limits,
+    ...(now ? { now } : {}),
     epoch: "epoch-test",
   });
   await bridge.start();

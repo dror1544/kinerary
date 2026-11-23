@@ -43,6 +43,12 @@ phone-preferred sender form, every log line that named an id, and
 `process.exit` on logout. This bridge decides nothing about who may talk to the
 companion; the relay does.
 
+The address book and history-sync notices that pairing delivers to a linked device
+are not forwarded and not logged by this bridge. (The library itself persists
+linked-identity-to-phone mappings in the session directory, so "not stored" would
+overstate it; the directory is a credential for that reason, and the bot's number
+should have an empty address book.)
+
 The WhatsApp Web client library, `@whiskeysockets/baileys`, is a separate
 dependency under its own licence, pinned to the exact version the capture in
 `docs/specs/sprint-9/625-whatsapp-via-relay.md` (AC-0) was taken on.

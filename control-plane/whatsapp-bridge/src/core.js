@@ -13,7 +13,7 @@
  * does not carry: the allow-lists, the reply prefix, polls, locations, media
  * caches, the owner-message gate, and every `console.log` that named an id.
  */
-import { createIdResolver, idKind, isGroupId, normalizeId } from "./ids.js";
+import { createIdResolver, idKind, isGroupId, isMessageId, normalizeId } from "./ids.js";
 import {
   createEventLog,
   createMessageStore,
@@ -34,6 +34,8 @@ const SEND_TIMEOUT_MS = 60_000;
 const META_TIMEOUT_MS = 15_000;
 const MAX_WAIT_MS = 30_000;
 const ADDED_DEDUPE_MS = 30_000;
+/** How long a group's metadata is reused before WhatsApp is asked again. */
+export const METADATA_TTL_MS = 60_000;
 /** How old an offline-delivered (`append`) message may be and still be delivered. */
 export const OFFLINE_MAX_AGE_S = 600;
 
@@ -75,13 +77,14 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   const reasons = lib.DisconnectReason ?? { loggedOut: 401, restartRequired: 515, connectionReplaced: 440 };
 
   let sock = null;
-  let state = "starting"; // starting | connecting | connected | disconnected | logged_out | replaced
+  let state = "starting"; // starting | connecting | connected | disconnected | logged_out | replaced | unpaired
   let own = { lid: null, phone: null };
   let reconnectAttempt = 0;
   let reconnectTimer = null;
   let stopped = false;
   let sendQueue = Promise.resolve();
   const sentIds = new Set();
+  const metadataCache = new Map(); // chatId -> { md, at }
   const addedSeen = new Map();
   const counters = { delivered: 0, skipped: {} };
 
@@ -166,12 +169,14 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   }
 
   async function onGroupsUpsert(groups) {
+    for (const g of groups ?? []) metadataCache.delete(normalizeId(g?.id));
     for (const event of await groupEventsFromUpsert(groups, { resolver, own, remember: rememberAdded })) {
       events.push(event);
     }
   }
 
   async function onParticipants(update) {
+    metadataCache.delete(normalizeId(update?.id));
     for (const event of await groupEventsFromParticipants(update, {
       resolver,
       own,
@@ -183,6 +188,7 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   }
 
   async function onGroupsUpdate(updates) {
+    for (const u of updates ?? []) metadataCache.delete(normalizeId(u?.id));
     for (const event of groupEventsFromUpdates(updates)) events.push(event);
   }
 
@@ -202,6 +208,21 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
 
   function onConnection(update = {}) {
     const { connection, lastDisconnect } = update;
+    if (update.qr) {
+      // A QR in serve mode means the session is not paired. Showing one is
+      // pairing's job (--pair-only); here it would be a reconnect loop.
+      state = "unpaired";
+      stopped = true;
+      t.clearTimeout(reconnectTimer);
+      log("unpaired", {});
+      try {
+        sock?.end?.(undefined);
+      } catch {
+        /* closing */
+      }
+      sock = null;
+      return;
+    }
     if (connection === "open") {
       state = "connected";
       reconnectAttempt = 0;
@@ -243,6 +264,14 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   async function connect() {
     if (stopped) return;
     const { state: auth, saveCreds } = await lib.useMultiFileAuthState(sessionDir);
+    // Serving needs a paired session. With none, no socket is made at all: the
+    // library would otherwise ask for a QR and reconnect for ever.
+    if (!auth?.creds?.registered && !auth?.creds?.me) {
+      state = "unpaired";
+      stopped = true;
+      log("unpaired", {});
+      return false;
+    }
     let version;
     if (typeof lib.fetchLatestBaileysVersion === "function") {
       try {
@@ -285,11 +314,13 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
     socket.ev.on("groups.upsert", guard("groups_upsert", live(onGroupsUpsert)));
     socket.ev.on("groups.update", guard("groups_update", live(onGroupsUpdate)));
     socket.ev.on("group-participants.update", guard("participants", live(onParticipants)));
+    return true;
   }
 
+  /** @returns {Promise<boolean>} false when the session is not paired and nothing was started */
   async function start() {
     stopped = false;
-    await connect();
+    return (await connect()) === true;
   }
 
   function stop() {
@@ -348,6 +379,8 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
 
   async function media(chatIdRaw, messageId, maxBytesRaw) {
     const chatId = normalizeId(chatIdRaw);
+    if (!["group", "lid"].includes(idKind(chatId))) return failure(400, "bad_chat");
+    if (!isMessageId(messageId)) return failure(400, "bad_message");
     const entry = store.get(chatId, messageId);
     if (!entry) return failure(404, "gone");
     const content = unwrap(entry.message);
@@ -383,6 +416,7 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
     if (kind !== "group" && kind !== "lid") return failure(400, "bad_chat");
     const text = body?.text;
     if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT) return failure(400, "bad_text");
+    if (body.replyTo !== undefined && !isMessageId(body.replyTo)) return failure(400, "bad_message");
     const socket = connected();
     if (!socket) return unavailable();
     const content = { text };
@@ -392,7 +426,7 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
     }
     const options = {};
     let quoted = false;
-    if (typeof body.replyTo === "string" && body.replyTo) {
+    if (typeof body.replyTo === "string") {
       // A reply quotes only a message of THIS chat: the store is keyed by chat.
       const target = store.get(chatId, body.replyTo);
       if (target) {
@@ -419,11 +453,13 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
     if (!["group", "lid"].includes(idKind(chatId))) return failure(400, "bad_chat");
     const text = body?.text;
     if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT) return failure(400, "bad_text");
-    if (typeof body.messageId !== "string" || !body.messageId) return failure(400, "bad_message");
-    // Only a message the number itself sent, in this chat.
+    if (!isMessageId(body.messageId)) return failure(400, "bad_message");
+    // Only a message THIS BRIDGE sent, in this chat. One typed on the number's own
+    // phone is the number's, but not the relay's to rewrite; and after a restart
+    // the bridge no longer remembers what it sent, so the answer is `gone`.
     const target = store.get(chatId, body.messageId);
     if (!target) return failure(404, "gone");
-    if (target.key?.fromMe !== true) return failure(403, "not_own_message");
+    if (!sentIds.has(body.messageId) || target.key?.fromMe !== true) return failure(403, "not_own_message");
     const socket = connected();
     if (!socket) return unavailable();
     try {
@@ -453,8 +489,13 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   async function groupMetadata(chatId) {
     const socket = connected();
     if (!socket) return { error: unavailable() };
+    const cached = metadataCache.get(chatId);
+    if (cached && now() - cached.at < METADATA_TTL_MS) return { md: cached.md };
     try {
-      return { md: await withTimeout(socket.groupMetadata(chatId), META_TIMEOUT_MS, "metadata") };
+      const md = await withTimeout(socket.groupMetadata(chatId), META_TIMEOUT_MS, "metadata");
+      metadataCache.set(chatId, { md, at: now() });
+      while (metadataCache.size > 256) metadataCache.delete(metadataCache.keys().next().value);
+      return { md };
     } catch (err) {
       log("metadata_failed", { code: errorCode(err) });
       return { error: failure(503, "unavailable", { reason: "metadata", state }) };
@@ -465,7 +506,7 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   async function chatInfo(idRaw) {
     const chatId = normalizeId(idRaw);
     const kind = idKind(chatId);
-    if (kind === "lid" || kind === "pn") return reply(200, { ok: true, chatId, kind: "private" });
+    if (kind === "lid") return reply(200, { ok: true, chatId, kind: "private" });
     if (kind !== "group") return failure(400, "bad_chat");
     const { md, error } = await groupMetadata(chatId);
     if (error) return error;
@@ -481,20 +522,22 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   /**
    * Is this person in this group now? Three answers, and the third is not "no":
    * `inGroup: true`, `inGroup: false`, or 503 "could not check" (the relay's
-   * AC-31 treats the last differently). The match is across id forms.
+   * AC-31 treats the last differently). The match is across the forms the group lists a person under.
    */
   async function participant(chatIdRaw, participantRaw) {
     const chatId = normalizeId(chatIdRaw);
     if (!isGroupId(chatId)) return failure(400, "bad_chat");
-    const wanted = await resolver.resolve(participantRaw);
-    if (!wanted.lid && !wanted.phone) return failure(400, "bad_participant");
+    // The linked-identity form only: the relay holds no other, and a phone form
+    // would make the bridge's answer depend on a mapping it may not have.
+    const wantedId = normalizeId(participantRaw);
+    if (idKind(wantedId) !== "lid") return failure(400, "bad_participant");
     const { md, error } = await groupMetadata(chatId);
     if (error) return error;
     if (!Array.isArray(md?.participants)) return failure(503, "unavailable", { reason: "metadata", state });
     let inGroup = false;
     for (const entry of md.participants) {
       const who = await resolveParticipant(entry, resolver);
-      if ((wanted.lid && who.lid === wanted.lid) || (wanted.phone && who.phone === wanted.phone)) {
+      if (who.lid === wantedId) {
         inGroup = true;
         break;
       }

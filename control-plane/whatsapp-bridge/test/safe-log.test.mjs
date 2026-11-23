@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createSafeLogger, errorCode, safeValue } from "../src/safe-log.js";
+import { createSafeLogger, crashSummary, errorCode, safeValue } from "../src/safe-log.js";
 import { ALICE } from "./helpers.mjs";
 
 test("a log line keeps states and counts and redacts everything else", () => {
@@ -47,6 +47,21 @@ test("a number shaped like a phone number or an id is redacted; counts and codes
   assert.equal(safeValue(1795380942), "[redacted]");
   assert.equal(safeValue(515), 515);
   assert.equal(safeValue(60587), 60587);
+});
+
+test("a crash is reported by error name and top frame (file:line), never by message", () => {
+  const err = new TypeError(`bad thing for ${ALICE.lid}\n    at fake (file:///elsewhere/leak.js:1:1)`);
+  err.stack = `${err.name}: ${err.message}\n    at doWork (file:///srv/app/src/core.js:123:9)\n    at next (node:internal/process/task_queues:105:5)`;
+  const out = crashSummary(err);
+  assert.deepEqual(out, { name: "typeerror", at: "core.js:123" });
+  assert.ok(!JSON.stringify(out).includes("100000000000001"));
+  // No stack, no name, odd input: still no throw, still no message.
+  assert.deepEqual(crashSummary({ message: ALICE.lid }), { name: "error", at: "unknown" });
+  assert.deepEqual(crashSummary(undefined), { name: "error", at: "unknown" });
+  assert.deepEqual(crashSummary("a string with 100000000000001"), { name: "error", at: "unknown" });
+  const lines = [];
+  createSafeLogger((l) => lines.push(l)).log("fatal", { ...out, code: errorCode(err) });
+  assert.equal(lines[0], '{"event":"fatal","name":"typeerror","at":"core.js:123","code":"error"}');
 });
 
 test("a sink that throws does not take the caller down", () => {

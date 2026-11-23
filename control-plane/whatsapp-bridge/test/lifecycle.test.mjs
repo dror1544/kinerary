@@ -105,6 +105,31 @@ test("a late event from a replaced socket is ignored and cannot tear down its re
   assert.deepEqual((await bridge.poll({ after: 0, waitMs: 0, epoch: "epoch-test" })).body.events, []);
 });
 
+test("an unpaired session is not served: no socket is made, /health says unpaired, and start() says so", async () => {
+  const fake = makeFakeLib();
+  fake.lib.creds = { registered: false };
+  const logs = [];
+  const timers = makeTimers();
+  const bridge = createBridge({ lib: fake.lib, sessionDir: tempDir(), log: (event, fields) => logs.push({ event, ...fields }), timers });
+  assert.equal(await bridge.start(), false);
+  assert.equal(fake.sockets.length, 0, "no socket, so no QR and no reconnect loop");
+  assert.equal(bridge.health().body.state, "unpaired");
+  assert.deepEqual(timers.pending, []);
+  assert.ok(logs.some((l) => l.event === "unpaired"));
+  assert.equal((await bridge.send({ chatId: "100000000000001@lid", text: "x" })).status, 503);
+});
+
+test("a QR update in serve mode means unpaired: state is set, the socket is ended, nothing reconnects", async () => {
+  const timers = makeTimers();
+  const { bridge, fake, sock } = await startBridge({ timers });
+  await sock.emit("connection.update", { qr: "QR-FIXTURE" });
+  assert.equal(bridge.health().body.state, "unpaired");
+  assert.equal(sock.ended, true);
+  await sock.emit("connection.update", closeWith(DISCONNECT.connectionClosed));
+  assert.deepEqual(timers.pending, []);
+  assert.equal(fake.sockets.length, 1);
+});
+
 test("the socket is built with history sync refused, and with a silent library logger", async () => {
   const { sock } = await startBridge();
   const options = sock.options;

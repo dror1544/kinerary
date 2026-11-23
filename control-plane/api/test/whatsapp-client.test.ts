@@ -10,7 +10,7 @@ import {
 } from "../src/relay/whatsapp/client.js";
 import { FAKE_OWN, startFakeWhatsApp, type FakeWhatsApp } from "../tools/fake-whatsapp.js";
 
-const SECRET = "client-test-secret-0123456789";
+const SECRET = "client-test-secret-0123456789-abcdefgh";
 const ALICE = "100000000000001@lid";
 const GROUP = "120000000000000001@g.us";
 const OLD_GROUP = "200000000001-1466483396@g.us";
@@ -48,21 +48,36 @@ function jsonServer(handler: (url: string, auth: string | undefined) => { status
 }
 
 describe("whatsappBridgeUrl: loopback only", () => {
-  for (const ok of ["http://127.0.0.1:4320", "http://localhost:4320", "http://[::1]:4320", "http://127.0.0.1:4320/"]) {
-    test(`accepts ${ok}`, () => assert.ok(whatsappBridgeUrl(ok).startsWith("http://")));
+  // The bridge binds the literal 127.0.0.1. Anything that merely resolves or normalises to a loopback is a
+  // different socket (`localhost` is ::1 first on some systems) and would receive the bearer secret.
+  for (const ok of ["http://127.0.0.1:4320", "http://127.0.0.1:4320/", "http://127.0.0.1", "http://127.0.0.1:65535"]) {
+    test(`accepts ${ok}`, () => assert.ok(whatsappBridgeUrl(ok).startsWith("http://127.0.0.1")));
   }
   const bad: [string, RegExp][] = [
     ["", /required/],
     ["   ", /required/],
     ["not a url", /not a URL/],
-    ["https://127.0.0.1:4320", /http to/],
-    ["http://192.0.2.10:4320", /http to/],
-    ["http://example.org:4320", /http to/],
-    ["http://127.0.0.1.example.org:4320", /http to/],
-    ["http://127.0.0.2:4320", /http to/],
-    ["http://0.0.0.0:4320", /http to/],
-    ["http://[::]:4320", /http to/],
-    ["http://localhost.evil.example:4320", /http to/],
+    ["https://127.0.0.1:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://localhost:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://[::1]:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://2130706433:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://127.1:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://0x7f.1:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://0x7f000001:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://127.0.0.01:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://127.000.000.001:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://017700000001:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://127.0.0.1.:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://[::ffff:127.0.0.1]:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://127.0.0.1:0", /http:\/\/127\.0\.0\.1/],
+    ["http://127.0.0.1:99999", /(http:\/\/127\.0\.0\.1|not a URL)/],
+    ["http://192.0.2.10:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://example.org:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://127.0.0.1.example.org:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://127.0.0.2:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://0.0.0.0:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://[::]:4320", /http:\/\/127\.0\.0\.1/],
+    ["http://localhost.evil.example:4320", /http:\/\/127\.0\.0\.1/],
     ["http://user:pass@127.0.0.1:4320", /credentials/],
     ["http://127.0.0.1:4320/api", /bare origin/],
     ["http://127.0.0.1:4320/?x=1", /bare origin/],
@@ -71,8 +86,10 @@ describe("whatsappBridgeUrl: loopback only", () => {
   for (const [url, pattern] of bad) test(`refuses ${JSON.stringify(url)}`, () => assert.throws(() => whatsappBridgeUrl(url), pattern));
 
   test("the client refuses a non-loopback URL or a short secret at construction, not at first use", () => {
-    assert.throws(() => createHttpWhatsAppClient({ baseUrl: "http://192.0.2.10:1", secret: SECRET }), /http to/);
-    assert.throws(() => createHttpWhatsAppClient({ baseUrl: "http://127.0.0.1:1", secret: "short" }), /16 characters/);
+    assert.throws(() => createHttpWhatsAppClient({ baseUrl: "http://192.0.2.10:1", secret: SECRET }), /127\.0\.0\.1/);
+    assert.throws(() => createHttpWhatsAppClient({ baseUrl: "http://localhost:1", secret: SECRET }), /127\.0\.0\.1/);
+    assert.throws(() => createHttpWhatsAppClient({ baseUrl: "http://127.0.0.1:1", secret: "short" }), /32 characters/);
+    assert.throws(() => createHttpWhatsAppClient({ baseUrl: "http://127.0.0.1:1", secret: `${SECRET} with space` }), /whitespace/);
   });
 });
 
@@ -197,12 +214,12 @@ describe("the client against the stand-in", () => {
 
   test("a sender the bridge could not resolve arrives as senderId null (unknown, not guessed)", async () => {
     const { fake, client } = await withStandIn();
-    fake.control.message({ chatId: GROUP, senderId: null, text: "who said this", senderPhone: "200000000007@s.whatsapp.net" });
+    fake.control.message({ chatId: GROUP, senderId: null, text: "who said this", senderPhoneLast4: "0007" });
     const out = await client.poll({ after: 0 }, { waitMs: 0 });
     assert.ok(out.ok);
     const [event] = out.value.events;
     assert.equal(event!.type === "message" && event.senderId, null);
-    assert.equal(event!.type === "message" && event.senderPhone, "200000000007@s.whatsapp.net");
+    assert.equal(event!.type === "message" && event.senderPhoneLast4, "0007");
   });
 
   test("media: bytes on demand for an old-format group id too; gone is not_found; over the cap is too_large", async () => {
@@ -269,7 +286,6 @@ describe("the client against the stand-in", () => {
   test("typing, chatInfo (title and size only) and isParticipant (yes, no, could-not-check)", async () => {
     const { fake, client } = await withStandIn();
     fake.control.group({ chatId: GROUP, title: "Family Fixture", participants: [ALICE, FAKE_OWN.lid] });
-    fake.control.person({ lid: ALICE, phone: "200000000001@s.whatsapp.net" });
 
     assert.ok((await client.typing({ chatId: GROUP })).ok);
     assert.deepEqual(fake.control.sent().at(-1), { seq: 1, kind: "typing", chatId: GROUP, state: "composing" });
@@ -279,12 +295,62 @@ describe("the client against the stand-in", () => {
     assert.deepEqual(await client.chatInfo(ALICE), { ok: true, value: { kind: "private", chatId: ALICE } });
 
     assert.deepEqual(await client.isParticipant(GROUP, ALICE), { ok: true, value: true });
-    assert.deepEqual(await client.isParticipant(GROUP, "200000000001@s.whatsapp.net"), { ok: true, value: true });
+    // The phone form is not a question the relay may ask: refused before any request is made.
+    const phone = await client.isParticipant(GROUP, "200000000001@s.whatsapp.net");
+    assert.ok(!phone.ok && phone.reason === "refused" && phone.detail === "bad_id");
     assert.deepEqual(await client.isParticipant(GROUP, "100000000000002@lid"), { ok: true, value: false });
 
     fake.control.membershipUnavailable(true);
     const unknown = await client.isParticipant(GROUP, ALICE);
     assert.ok(!unknown.ok && unknown.reason === "unavailable", "could not check is NOT 'false'");
+  });
+});
+
+describe("ids are checked before any path or body is built from them", () => {
+  const seen: string[] = [];
+  const client = createHttpWhatsAppClient({
+    baseUrl: "http://127.0.0.1:4320",
+    secret: SECRET,
+    fetchImpl: (async (url: string) => {
+      seen.push(url);
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+  const refused = (out: { ok: boolean; reason?: string; detail?: string }) => out.ok === false && out.reason === "refused" && out.detail === "bad_id";
+
+  test("a `..` or otherwise path-shaped id never becomes a URL: fetchMedia('..', 'health') makes no request", async () => {
+    seen.length = 0;
+    for (const [chat, message] of [["..", "health"], [GROUP, ".."], [GROUP, "a/b"], [GROUP, "a-b"], [GROUP, "x".repeat(129)], [GROUP, ""], ["status@broadcast", "M1"], ["200000000001@s.whatsapp.net", "M1"], [`${ALICE}/x`, "M1"]] as const) {
+      assert.ok(refused(await client.fetchMedia(chat, message)), `${chat} ${message}`);
+    }
+    assert.deepEqual(seen, [], "no request was made for any of them");
+  });
+
+  test("every method refuses a bad id the same way, before any request", async () => {
+    seen.length = 0;
+    assert.ok(refused(await client.send({ chatId: "..", text: "x" })));
+    assert.ok(refused(await client.send({ chatId: GROUP, text: "x", replyTo: "../health" })));
+    assert.ok(refused(await client.send({ chatId: GROUP, text: "x", mentions: ["200000000001@s.whatsapp.net"] })));
+    assert.ok(refused(await client.edit({ chatId: GROUP, messageId: "..", text: "x" })));
+    assert.ok(refused(await client.edit({ chatId: "junk", messageId: "M1", text: "x" })));
+    assert.ok(refused(await client.typing({ chatId: "../chat" })));
+    assert.ok(refused(await client.chatInfo("..")));
+    assert.ok(refused(await client.chatInfo("200000000001@s.whatsapp.net")));
+    assert.ok(refused(await client.isParticipant("..", ALICE)));
+    assert.ok(refused(await client.isParticipant(ALICE, ALICE)), "a participant question is about a group");
+    assert.ok(refused(await client.isParticipant(GROUP, "..")));
+    assert.ok(refused(await client.isParticipant(GROUP, "200000000001@s.whatsapp.net")));
+    assert.deepEqual(seen, []);
+  });
+
+  test("well-formed ids still go through, percent-encoded", async () => {
+    seen.length = 0;
+    await client.fetchMedia(OLD_GROUP, "ABC123def");
+    await client.isParticipant(GROUP, ALICE);
+    assert.deepEqual(seen, [
+      `http://127.0.0.1:4320/media/${encodeURIComponent(OLD_GROUP)}/ABC123def?maxBytes=20971520`,
+      `http://127.0.0.1:4320/chat/${encodeURIComponent(GROUP)}/participant/${encodeURIComponent(ALICE)}`,
+    ]);
   });
 });
 
@@ -335,7 +401,7 @@ describe("the client never throws, and says which kind of failure it is", () => 
 
   test("a wrong secret is unavailable (a configuration fault, loud in the detail) and the secret is never in a result", async () => {
     const { fake } = await withStandIn();
-    const wrong = createHttpWhatsAppClient({ baseUrl: fake.url, secret: "a-different-secret-0123456789", requestTimeoutMs: 1000 });
+    const wrong = createHttpWhatsAppClient({ baseUrl: fake.url, secret: "a-different-secret-0123456789-abcdefgh", requestTimeoutMs: 1000 });
     const out = await wrong.health();
     assert.ok(!out.ok);
     assert.equal(out.reason, "unavailable");

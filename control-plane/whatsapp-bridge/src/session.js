@@ -8,7 +8,7 @@
  *  - it is refused when it sits inside a git work tree, which is how a
  *    credential ends up in a commit.
  */
-import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 function insideWorkTree(start) {
@@ -21,19 +21,50 @@ function insideWorkTree(start) {
   }
 }
 
+/** The real path of `target`, resolving symlinks in its nearest existing ancestor. */
+function realish(target) {
+  let existing = target;
+  const rest = [];
+  while (!existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    rest.unshift(path.basename(existing));
+    existing = parent;
+  }
+  return path.join(realpathSync(existing), ...rest);
+}
+
+const REFUSED = "the session directory must not be inside a git work tree: it is a credential";
+
 export function prepareSessionDir(dirArg) {
   if (typeof dirArg !== "string" || !dirArg.trim()) {
     throw new Error("a session directory is required (--session <dir>)");
   }
   const dir = path.resolve(dirArg);
-  if (insideWorkTree(dir)) {
-    throw new Error("the session directory must not be inside a git work tree: it is a credential");
-  }
+  // Both the path as written and where it really leads: a symlink must not be
+  // a way into a repository.
+  if (insideWorkTree(dir) || insideWorkTree(realish(dir))) throw new Error(REFUSED);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  chmodSync(dir, 0o700);
-  const mode = statSync(dir).mode & 0o777;
+  const real = realpathSync(dir);
+  if (insideWorkTree(real)) throw new Error(REFUSED);
+  chmodSync(real, 0o700);
+  const mode = statSync(real).mode & 0o777;
   if ((mode & 0o077) !== 0) {
     throw new Error("the session directory is readable by others and could not be restricted");
   }
-  return dir;
+  return real;
+}
+
+/**
+ * Does the session hold registered credentials? Read before the library is even
+ * loaded: serving an unpaired session would make it ask for a QR and reconnect
+ * for ever.
+ */
+export function sessionIsPaired(dir) {
+  try {
+    const creds = JSON.parse(readFileSync(path.join(dir, "creds.json"), "utf8"));
+    return creds?.registered === true || !!creds?.me;
+  } catch {
+    return false;
+  }
 }

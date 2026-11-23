@@ -35,7 +35,10 @@ export function parseArgs(argv, env = {}) {
     throw new UsageError("--port <1-65535> is required");
   }
 
-  let secret = env.WHATSAPP_BRIDGE_SECRET;
+  let secret = typeof env.WHATSAPP_BRIDGE_SECRET === "string" ? env.WHATSAPP_BRIDGE_SECRET.trim() : undefined;
+  // Read once and removed: a secret left in the environment is inherited by every
+  // child process and readable from /proc and `ps eww`.
+  delete env.WHATSAPP_BRIDGE_SECRET;
   const secretFile = valueOf(argv, "--secret-file");
   if (!secret && secretFile) {
     // Refuse a secret file anyone but its owner can read.
