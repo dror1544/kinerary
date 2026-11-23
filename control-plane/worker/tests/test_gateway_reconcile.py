@@ -615,6 +615,50 @@ class SweepTests(unittest.TestCase):
         self.sweep().run()
         self.assertEqual(self.row(t)["reason"], "NOT_CURRENT")
 
+    # ── AC-19 (docs/specs/sprint-9/625-whatsapp-via-relay.md): a WhatsApp-only organizer keeps the companion running ──
+
+    def wa_private(self, trip: dict[str, str], user_id: str | None, *, closed: bool = False, platform: str = "whatsapp") -> str:
+        """An open (or closed) WhatsApp private binding with the person link that ties it to `user_id`'s account."""
+        sender = "wa_" + secrets.token_hex(16)
+        self.conn.execute(
+            "INSERT INTO control_plane.trip_person_links(id, trip_id, telegram_user_id, participant_username, role, "
+            "verified_via, platform, account_user_id) VALUES (%s, %s, %s, NULL, 'participant', 'dashboard_code', %s, %s)",
+            (f"tpl_{rnd(8)}", trip["trip_id"], sender, platform, user_id))
+        self.conn.execute(
+            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, platform, closed_at, closed_reason) "
+            "VALUES (%s, %s, %s, %s, 'whatsapp', %s, %s)",
+            (f"tcb_{rnd(8)}", sender + "@p", trip["trip_id"], trip["profile"], self.now if closed else None,
+             "dashboard_removed" if closed else None))
+        return sender
+
+    def test_AC19_an_open_whatsapp_private_binding_of_the_owner_makes_the_trip_current(self) -> None:
+        t, other = self.trip(undated=True), self.trip(undated=True)
+        owner = self.organizer(t, "7101", role="owner")
+        self.organizer(other, "7102", role="owner")
+        self.wa_private(t, owner)
+        self.host.set(t["profile"], "running")
+        self.host.set(other["profile"], "running")
+        self.sweep().run()
+        self.assertEqual((self.row(t)["desired"], self.row(t)["reason"]), ("running", "CURRENT_TRIP"))
+        self.assertEqual(self.row(other)["reason"], "NOT_CURRENT", "no binding of any kind: unchanged")
+
+    def test_AC19_only_the_owners_open_private_chat_counts(self) -> None:
+        member_trip, closed_trip, group_trip, nolink_trip = (self.trip(undated=True) for _ in range(4))
+        member = self.organizer(member_trip, "7103", role="member")
+        self.wa_private(member_trip, member)                         # a member, not the owner
+        owner_closed = self.organizer(closed_trip, "7104", role="owner")
+        self.wa_private(closed_trip, owner_closed, closed=True)      # removed
+        self.organizer(group_trip, "7105", role="owner")
+        self.conn.execute(                                           # a WhatsApp GROUP is not a private chat
+            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, platform) "
+            "VALUES (%s, %s, %s, %s, 'whatsapp')",
+            (f"tcb_{rnd(8)}", "".join(secrets.choice("0123456789") for _ in range(18)) + "@g.us",
+             group_trip["trip_id"], group_trip["profile"]))
+        self.wa_private(nolink_trip, None)                           # a claim from the group: no account
+        self.sweep().run()
+        for t in (member_trip, closed_trip, group_trip, nolink_trip):
+            self.assertEqual(self.row(t)["reason"], "NOT_CURRENT", t["slug"])
+
     def test_a_dm_bound_to_a_retired_trip_is_nobodys_current_trip(self) -> None:
         dead = self.trip(slug=f"retired-gw-{rnd(3)}-20260101")
         self.organizer(dead, "7006")

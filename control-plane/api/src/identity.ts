@@ -188,3 +188,43 @@ export function verifyTelegramWebhookSecret(headerValue: unknown, configuredSecr
 export function isPrivateChatId(chatId: string): boolean {
   return /^\d{1,20}$/.test(chatId);
 }
+
+// ── WhatsApp chat ids: ONE place (docs/specs/sprint-9/625-whatsapp-via-relay.md, "Chat ids") ────────────────────────
+// A chat id identifies one chat on one platform and is never a phone number. The migration
+// (20261122090000_chat_binding_platform.sql) repeats these shapes in its CHECKs; change them together.
+
+/** A WhatsApp group as stored and sent on the wire: its id with the suffix kept. Older, phone-carrying ids do not match. */
+export const WHATSAPP_GROUP_CHAT_ID = /^[0-9]{5,40}@g\.us$/;
+/** A WhatsApp private chat: the person's opaque id plus `@p`. */
+export const WHATSAPP_PRIVATE_CHAT_ID = /^wa_[0-9a-f]{32}@p$/;
+/** The person's opaque sender id (the key of a WhatsApp person link). */
+export const WHATSAPP_SENDER_ID = /^wa_[0-9a-f]{32}$/;
+/** SQL (POSIX regex) forms of the same shapes, for queries that classify a `chat_id` column. */
+export const WHATSAPP_GROUP_CHAT_ID_SQL = String.raw`^[0-9]{5,40}@g\.us$`;
+export const TELEGRAM_GROUP_CHAT_ID_SQL = "^-[0-9]{1,20}$";
+
+export type ChatPlatform = "telegram" | "whatsapp";
+export type ChatKind = "private" | "group" | "unknown";
+
+/**
+ * Private, group or unknown, from the SHAPE of the id alone (so no reader needs the platform column).
+ * Telegram: digits are private, minus-digits a group. WhatsApp: `@g.us` a group, `@p` private. Anything else is
+ * `unknown`, which every caller treats as the most restrictive answer. `isPrivateChatId` keeps meaning "a TELEGRAM
+ * private chat": a WhatsApp private chat is never an interview handover and never a Mini App chat.
+ */
+export function chatKind(chatId: string): ChatKind {
+  if (typeof chatId !== "string") return "unknown";
+  if (/^[0-9]{1,20}$/.test(chatId)) return "private";
+  if (new RegExp(TELEGRAM_GROUP_CHAT_ID_SQL).test(chatId)) return "group";
+  if (WHATSAPP_GROUP_CHAT_ID.test(chatId)) return "group";
+  if (WHATSAPP_PRIVATE_CHAT_ID.test(chatId)) return "private";
+  return "unknown";
+}
+
+/** Which platform a chat id's shape belongs to, or null for an unrecognised shape. */
+export function chatPlatformOf(chatId: string): ChatPlatform | null {
+  if (typeof chatId !== "string") return null;
+  if (/^-?[0-9]{1,20}$/.test(chatId)) return "telegram";
+  if (WHATSAPP_GROUP_CHAT_ID.test(chatId) || WHATSAPP_PRIVATE_CHAT_ID.test(chatId)) return "whatsapp";
+  return null;
+}

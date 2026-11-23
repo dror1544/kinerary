@@ -285,7 +285,15 @@ describe('config allow-list — golden round trip (nothing the site needs is los
       // override-aware answer to "what timezone is this trip" — nothing
       // reads meta.timezone client-side.
       assert.deepEqual(dropped, ['meta.timezone'], `${name}: provisioner fields missing from the allow-list: ${dropped.join(', ')}`);
+      // A switch that is not member-visible is withheld from the SERVED features block by design (the first such switch is
+      // `whatsapp`, spec 625): it is allowed here as `features.<name>`, and only for a registered name whose entry says so.
+      const hiddenSwitches = new Set(createRequire(import.meta.url)('../shared/feature-switches.js').FEATURE_SWITCHES
+        .filter((entry) => !entry.memberVisible).map((entry) => entry.name));
       for (const p of withheld) {
+        if (/^features\.[a-z][a-z0-9_]*$/.test(p)) {
+          assert.ok(hiddenSwitches.has(p.slice('features.'.length)), `${name}: ${p} is withheld but its switch is member-visible`);
+          continue;
+        }
         assert.match(p, /^participants\[\d+\]\.needs\[\d+\]$|^agent\.standing_instructions\[\d+\]$/, `${name}: ${p}`);
       }
       const expected = withoutWithheld(cfg, withheld);

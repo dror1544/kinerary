@@ -322,6 +322,10 @@ def resolve(target: str) -> dict:
     trip["live_group_tokens"] = int(psql(
         f"SELECT count(*) FROM control_plane.telegram_group_binding_tokens "
         f"WHERE trip_id = '{trip['id']}' AND expires_at > now()") or 0)
+    trip["live_whatsapp_codes"] = int(psql(
+        f"SELECT count(*) FROM control_plane.chat_binding_codes "
+        f"WHERE trip_id = '{trip['id']}' AND state = 'issued' AND expires_at > now()")
+        if psql("SELECT to_regclass('control_plane.chat_binding_codes') IS NOT NULL") == "t" else 0) or 0
     return trip
 
 
@@ -682,9 +686,40 @@ $clear$"""
 REVOKE_GROUP_TOKENS = ("UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() "
                        "WHERE trip_id = '{id}' AND expires_at > now()")
 
+# WhatsApp (spec 625, S2). A one-time code (chat_binding_codes) is a way to bind a chat to this trip, so it is expired in
+# the same transaction as everything else - and FIRST, before REVOKE_GROUP_TOKENS and every other statement: the code row
+# is the first lock redemption takes (code row, then the binding, then `trips` through the foreign key), so teardown must
+# queue for it in that same order or the two meet in a 40P01, the way issue #175's did.
+#
+# GUARDED like CLEAR_TEARDOWN_PIN: a database from before the WhatsApp migration has no such table, and a bare UPDATE would
+# fail the whole transaction for every Telegram trip. plpgsql plans a statement when it first runs, so the branch not taken
+# is never resolved against the missing table.
+EXPIRE_CHAT_BINDING_CODES = """DO $wa_codes$
+BEGIN
+  IF to_regclass('control_plane.chat_binding_codes') IS NOT NULL THEN
+    UPDATE control_plane.chat_binding_codes SET state = 'expired'
+     WHERE trip_id = '{id}' AND state = 'issued';
+  END IF;
+END
+$wa_codes$"""
+
+# An open WhatsApp private binding holds the person's address in `transport_address` (and, optionally, the last four digits
+# of the number): the database refuses a CLOSED row that still holds either, so they are cleared BEFORE the bindings close,
+# in the same transaction. The close itself stays the one statement every platform shares, with the same reason.
+CLEAR_WHATSAPP_ADDRESSES = """DO $wa_addr$
+BEGIN
+  IF to_regclass('control_plane.chat_binding_codes') IS NOT NULL THEN
+    UPDATE control_plane.telegram_chat_bindings
+       SET transport_address = NULL, phone_last4 = NULL
+     WHERE trip_id = '{id}' AND closed_at IS NULL
+       AND (transport_address IS NOT NULL OR phone_last4 IS NOT NULL);
+  END IF;
+END
+$wa_addr$"""
+
 
 def retire_in_db(trip: dict) -> str:
-    # LOCK ORDER (issue #387), both branches: group-binding tokens, intake
+    # LOCK ORDER (issue #387), both branches: WhatsApp binding codes (spec 625: the first lock a redemption takes), group-binding tokens, intake
     # sessions, chat bindings, `trips` (rename branch), then the teardown-pin
     # clear LAST. It must agree with `executeClear` (control-plane/api/src/
     # trip-clear.ts: tokens, enrollments, sessions, bindings, `trips` LAST) and
@@ -704,8 +739,10 @@ def retire_in_db(trip: dict) -> str:
         # for why the order avoids a real deadlock against
         # redeemGroupBindingToken.
         psql(f"""BEGIN;
+{EXPIRE_CHAT_BINDING_CODES.format(id=trip['id'])};
 {REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 {CLOSE_SESSIONS.format(id=trip['id'])};
+{CLEAR_WHATSAPP_ADDRESSES.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 {CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
@@ -718,8 +755,10 @@ COMMIT;""")
             break
         new = f"{base}-{n}"
     psql(f"""BEGIN;
+{EXPIRE_CHAT_BINDING_CODES.format(id=trip['id'])};
 {REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 {CLOSE_SESSIONS.format(id=trip['id'])};
+{CLEAR_WHATSAPP_ADDRESSES.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
@@ -865,9 +904,11 @@ def main() -> int:
           f"on http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/" if args.keep_container
           else f"Cloudflare + NPM + LXC for {orig}") if topo else "never provisioned"),
         ("database", trip["open_bindings"] > 0 or trip["live_group_tokens"] > 0
-         or not trip["slug"].startswith("retired-"),
+         or trip.get("live_whatsapp_codes", 0) > 0 or not trip["slug"].startswith("retired-"),
          f"close {trip['open_bindings']} binding(s), revoke {trip['live_group_tokens']} live "
-         f"group-binding token(s), retire slug {trip['slug']}"),
+         f"group-binding token(s)"
+         + (f" and expire {trip['live_whatsapp_codes']} live WhatsApp code(s)" if trip.get("live_whatsapp_codes") else "")
+         + f", retire slug {trip['slug']}"),
         ("documents", originals > 0,
          f"archive and remove {originals} kept original(s); registry rows stay, marked unstored"),
         ("deploy dir", trip_dir.is_dir(),

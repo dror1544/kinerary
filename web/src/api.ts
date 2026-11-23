@@ -44,6 +44,11 @@ export type TripSummary = {
   telegram?: { links: TelegramLink[]; /** Unlinked accounts that can be restored without Telegram: absent for a Telegram-minted session. */ unlinked?: UnlinkedTelegramLink[] };
   /** The trip's secondary organizers (#523). Present only for its main organizer on a password or Google session. */
   secondaryOrganizers?: SecondaryOrganizer[];
+  /**
+   * The WhatsApp section's facts: the deployment's number (to add to a group) and whether the viewer owns the trip. Present
+   * only when the deployment has a number AND the trip's switch is on AND the viewer runs the trip; absent means "show nothing".
+   */
+  whatsapp?: { number: string; owner: boolean };
 };
 
 /** A person the main organizer added with a trip link. Display data from Telegram (first name, @username); `id` is only the handle for Remove. */
@@ -144,6 +149,7 @@ const tripSchema: z.ZodType<TripSummary> = z.object({
   members: z.array(memberSchema).optional(),
   telegram: telegramSchema.optional(),
   secondaryOrganizers: z.array(z.object({ id: z.string(), name: z.string().nullable(), username: z.string().nullable(), joinedAt: z.string() })).optional(),
+  whatsapp: z.object({ number: z.string(), owner: z.boolean() }).optional(),
 });
 // What a member WITHOUT dashboard access gets in their list: name, place, dates, their own
 // permissions and whether it opens. Filled out to a TripSummary with neutral defaults.
@@ -240,6 +246,27 @@ export const issueSecondaryOrganizerLink = (tripId: string) =>
 /** Removes a secondary organizer; effective at once in Telegram and on the trip site. */
 export const removeSecondaryOrganizer = (tripId: string, secondaryId: string) =>
   api<{ status: string }>(`/v1/trips/${encodeURIComponent(tripId)}/secondary-organizers/${encodeURIComponent(secondaryId)}`, { method: "DELETE" });
+
+/** One WhatsApp code: a link that opens WhatsApp with the code already written, and when it stops working. Never shown as text. */
+const whatsappCodeSchema = z.object({ link: z.string().regex(/^https:\/\/wa\.me\/[0-9]*\?text=[^\s]+$/), expiresAt: z.string() });
+export type WhatsAppCode = z.infer<typeof whatsappCodeSchema>;
+/** `me` binds the sender's own WhatsApp to the trip as the signed-in person; `group` (the trip's owner only) binds a group. */
+export const issueWhatsAppCode = (tripId: string, kind: "me" | "group", language?: "he" | "en") =>
+  api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/whatsapp-codes`, { method: "POST", body: JSON.stringify({ kind, ...(language ? { language } : {}) }) })
+    .then((value) => whatsappCodeSchema.parse(value));
+
+export type WhatsAppConnection = {
+  bindingId: string; kind: "group" | "person"; name: string | null;
+  via: "group_code" | "added_to_group" | "dashboard_code" | "group_membership"; connectedAt: string; lastFour?: string;
+};
+const whatsappConnectionSchema: z.ZodType<WhatsAppConnection> = z.object({
+  bindingId: z.string(), kind: z.enum(["group", "person"]), name: z.string().nullable(),
+  via: z.enum(["group_code", "added_to_group", "dashboard_code", "group_membership"]), connectedAt: z.string(), lastFour: z.string().regex(/^[0-9]{4}$/).optional(),
+});
+export const getWhatsAppConnections = (tripId: string) =>
+  api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/whatsapp-connections`).then((value) => z.object({ connections: z.array(whatsappConnectionSchema) }).parse(value).connections);
+export const removeWhatsAppConnection = (tripId: string, bindingId: string) =>
+  api<{ status: string }>(`/v1/trips/${encodeURIComponent(tripId)}/whatsapp-connections/${encodeURIComponent(bindingId)}`, { method: "DELETE" });
 
 export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse(value));
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(z.union([tripSchema, memberTripSchema])) }).parse(value));

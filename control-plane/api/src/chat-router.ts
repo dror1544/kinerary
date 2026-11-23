@@ -55,7 +55,7 @@ import {
 } from "./interview.js";
 import { peekEnrollmentTripId } from "./enrollment.js";
 import { recordForeignLinkOpen, type ApproverNotice, type ForeignLinkResult } from "./organizer-link-approval.js";
-import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
+import { chatPlatformOf, digestTelegramId, isPrivateChatId, type ChatPlatform, type TelegramName } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 import { nativeSeededOpening } from "./native-names.js";
 import type { StructuredModelRunner } from "./model-runner.js";
@@ -164,6 +164,12 @@ export type ChatRoute =
        * this chat is.
        */
       assistantNames: string[];
+      /**
+       * Which platform the chat is on, from the BINDING ROW found by the chat id (AC-5): nothing passes a platform in.
+       * A row whose platform is not one of the two known values, or disagrees with the shape of its chat id, is not
+       * routed at all (it resolves `unbound`): the fail-safe direction.
+       */
+      platform: ChatPlatform;
     }
   | { kind: "unbound" };
 
@@ -276,6 +282,9 @@ export async function resolveTripPerson(
   telegramUserId: string,
 ): Promise<{ username: string; displayName: string | null; role: string } | null> {
   if (!tripId || !telegramUserId) return null;
+  // A WhatsApp sender's role is DERIVED from the account's membership (resolveWhatsAppPerson, chat-binding-codes.ts) and
+  // never read from the stored column: this Telegram lookup must not answer for one.
+  if (telegramUserId.startsWith("wa_")) return null;
   const digest = isPrivateChatId(telegramUserId) ? digestTelegramId(telegramUserId) : null;
   const { rows } = await db.query<{
     participant_username: string;
@@ -402,8 +411,12 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
     trip_id: string;
     hermes_profile: string | null;
     assistant_names: string[] | null;
+    platform: string;
   }>(
-    `SELECT b.trip_id, b.hermes_profile, t.assistant_names
+    // The platform is read in a form that does not fail on a database that does not have the column yet (new code on the
+    // old schema, AC-5): absent reads as 'telegram'. No Telegram path selects a new column by name.
+    `SELECT b.trip_id, b.hermes_profile, t.assistant_names,
+            COALESCE(to_jsonb(b)->>'platform', 'telegram') AS platform
      FROM control_plane.telegram_chat_bindings b
      JOIN control_plane.trips t ON t.id = b.trip_id
      WHERE b.chat_id = $1 AND b.closed_at IS NULL`,
@@ -411,8 +424,14 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
   );
   const [binding] = bound.rows;
   if (binding) {
+    // Unknown platform value, or one that disagrees with the chat id's own shape: never routed.
+    const platform = binding.platform;
+    // (A Telegram row's id keeps whatever shape it always had; only a WhatsApp-shaped id on a Telegram row, or the reverse, disagrees.)
+    if (platform !== "telegram" && platform !== "whatsapp") return { kind: "unbound" };
+    if ((chatPlatformOf(chatId) === "whatsapp") !== (platform === "whatsapp")) return { kind: "unbound" };
     return {
       kind: "companion",
+      platform,
       tripId: binding.trip_id,
       hermesProfile: binding.hermes_profile,
       // NULL and empty mean the same thing to the gate: no names, fall back to

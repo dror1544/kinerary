@@ -131,6 +131,20 @@ class GrantListMatchesTheCatalogue(unittest.TestCase):
             for column in columns:
                 self.assertRegex(column, r"^[a-z_][a-z0-9_]*$")
 
+    def test_the_whatsapp_address_and_code_columns_are_not_granted(self):
+        """Spec 625, S2: `transport_address` is the ONLY column that holds a WhatsApp address (a person's, normally a
+        linked-identity address, sometimes a phone number) and `phone_last4` a piece of a number; neither may be readable
+        by the monitor's database role, nor the codes table, nor the account a WhatsApp link names. The role already reads
+        `chat_id`, which now never holds a number."""
+        grants = grant_list()
+        bindings = grants["control_plane.telegram_chat_bindings"]
+        self.assertEqual(bindings, {"chat_id", "trip_id", "hermes_profile", "created_at", "closed_at", "closed_reason"})
+        for withheld in ("transport_address", "phone_last4", "chat_title", "platform"):
+            self.assertNotIn(withheld, bindings, f"telegram_chat_bindings.{withheld} must stay out of the monitor's grants")
+        self.assertNotIn("control_plane.chat_binding_codes", grants)
+        self.assertNotIn("account_user_id", grants["control_plane.trip_person_links"])
+        self.assertNotIn("telegram_user_id", grants["control_plane.trip_person_links"])
+
     def test_companion_usage_is_granted_by_column_and_never_the_ids_or_metadata(self):
         """assistant_events is metadata-only by construction; the role reads only what the usage query counts."""
         columns = grant_list().get("control_plane.assistant_events")

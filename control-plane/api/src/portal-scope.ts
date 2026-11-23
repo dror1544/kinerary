@@ -121,6 +121,11 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/trips/:id/interview-link": "account",
   "POST /v1/trips/:id/interview-link/replace": "account",
   "POST /v1/trips/:id/telegram-link": "account",
+  // WhatsApp (spec 625): a code binds whoever sends it as the account that minted it, so a Telegram-minted session cannot
+  // mint one, read the connections, or remove one: a password or Google sign-in only.
+  "POST /v1/trips/:id/whatsapp-codes": "account",
+  "GET /v1/trips/:id/whatsapp-connections": "account",
+  "DELETE /v1/trips/:id/whatsapp-connections/:bindingId": "account",
   // A trip link for a secondary organizer (#523) mints a way into the trip, and removing one takes it from another person: a
   // password or Google sign-in only, like the site invites below.
   "POST /v1/trips/:id/secondary-organizer-link": "account",

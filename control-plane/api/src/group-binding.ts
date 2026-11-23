@@ -47,7 +47,7 @@ export const GROUP_MOVED_CLOSED_REASON = "group_moved";
  * the token is single-trip, expiring, and only usable by one known sender —
  * next to the cost of a family stuck on a character they cannot tell apart.
  */
-const TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+export const TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const TOKEN_LENGTH = 8;
 
 /**
@@ -419,23 +419,42 @@ function isActiveChatBindingConflict(error: unknown): boolean {
  * The caller has made sure no open binding of this chat exists in its own view; if one
  * committed since, the partial unique index throws 23505 and the caller refuses.
  */
-async function openBinding(client: pg.PoolClient, chatId: string, tripId: string): Promise<void> {
-  const inserted = await client.query(
-    `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
-     SELECT $1, $2, t.id,
-            coalesce(
+export async function openBinding(
+  client: pg.PoolClient,
+  chatId: string,
+  tripId: string,
+  whatsapp?: { chatTitle?: string | null; transportAddress?: string | null; phoneLast4?: string | null },
+): Promise<string> {
+  const id = `tcb_${randomBytes(16).toString("hex")}`;
+  // The profile rule is the same on both platforms; only the columns written differ. The TELEGRAM statement names no new
+  // column, so it keeps working on a database that does not have the platform columns yet (AC-5).
+  const profile = `coalesce(
               t.hermes_profile,
               (SELECT b.hermes_profile
                  FROM control_plane.telegram_chat_bindings b
                 WHERE b.trip_id = t.id AND b.hermes_profile IS NOT NULL
                 ORDER BY b.created_at DESC
-                LIMIT 1))
-       FROM control_plane.trips t
-      WHERE t.id = $3`,
-    [`tcb_${randomBytes(16).toString("hex")}`, chatId, tripId],
-  );
-  // The token's foreign key guarantees the trip exists; no row here would be a bug, not a state.
+                LIMIT 1))`;
+  const inserted = whatsapp === undefined
+    ? await client.query(
+      `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
+       SELECT $1, $2, t.id, ${profile}
+         FROM control_plane.trips t
+        WHERE t.id = $3`,
+      [id, chatId, tripId],
+    )
+    : await client.query(
+      `INSERT INTO control_plane.telegram_chat_bindings
+         (id, chat_id, trip_id, hermes_profile, platform, chat_title, transport_address, phone_last4)
+       SELECT $1, $2, t.id, ${profile}, 'whatsapp', $4, $5, $6
+         FROM control_plane.trips t
+        WHERE t.id = $3 AND ${NOT_RETIRED_SQL}`,
+      [id, chatId, tripId, whatsapp.chatTitle ?? null, whatsapp.transportAddress ?? null, whatsapp.phoneLast4 ?? null],
+    );
+  // The token's foreign key guarantees the trip exists; no row here would be a bug, not a state (a WhatsApp open also
+  // refuses a retired trip, so there it can mean a teardown just committed: the caller treats the throw as a failure).
   if (!inserted.rowCount) throw new Error("openBinding: trip row missing");
+  return id;
 }
 
 /**

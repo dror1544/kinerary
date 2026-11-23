@@ -15,6 +15,8 @@ import { generatePlan, retryProvision } from "./planner.js";
 import { RETIRED_SLUG_PREFIX } from "./trip-retirement.js";
 import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
+import { issueChatBindingCode, listWhatsAppConnections, removeWhatsAppConnection, tripEntitlement, WHATSAPP_SWITCH } from "./chat-binding-codes.js";
+import { featureEnabled } from "./feature-switches.js";
 import { structuredLog } from "./redaction.js";
 import {
   TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
@@ -334,6 +336,13 @@ export interface PortalDependencies {
   telegramMiniApp?: TelegramMiniAppConfig & { log?: (line: string) => void };
   /** How long a dashboard-issued Telegram link works. Defaults to 15 minutes. */
   telegramLinkTtlSeconds?: number;
+  /**
+   * WhatsApp (docs/specs/sprint-9/625-whatsapp-via-relay.md): the deployment's number (digits only) and how long a code
+   * works, both from the profile's `relay.whatsapp` block (`whatsappPortalSettings`, config.ts). ABSENT means the
+   * deployment has no WhatsApp number: no WhatsApp route answers (404) and no trip page shows a section (AC-6). The
+   * per-trip `whatsapp` switch is read on every request on top of this.
+   */
+  whatsapp?: { number: string; codeTtlSeconds: number };
   /**
    * Carries the verification and password-reset messages. ABSENT means email is
    * not configured: `POST /v1/auth/sign-up` and `/v1/auth/password/forgot` answer
@@ -703,6 +712,11 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       // session is never told which accounts were Unlinked, because it cannot restore one (portal-scope.ts).
       ...(opts.restorable ? { unlinked: (await unlinkedTelegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] } : {}),
     },
+    // The WhatsApp section (spec 625): present ONLY when this deployment has a number, the trip's `whatsapp` switch is on
+    // and the viewer runs the trip. Absent otherwise, so a trip with the switch off shows no trace of the feature (AC-6).
+    ...(deps.whatsapp && trip.dashboard_access && isOrganizerSide(trip.role) && (await featureEnabled(deps.db, tripId, WHATSAPP_SWITCH))
+      ? { whatsapp: { number: deps.whatsapp.number, owner: trip.role === "owner" } }
+      : {}),
     // Secondary organizers (#523), named for the MAIN organizer's page only: an owner on a full session. A Telegram-minted session
     // is never handed this list (it cannot remove anyone, and the names are display data of other people).
     ...(opts.restorable && trip.dashboard_access && trip.role === "owner"
@@ -746,6 +760,20 @@ async function memberTripSummary(deps: PortalDependencies, tripId: string, userI
     runtimeReady: row.runtime_ready,
     telegram: { links: (await telegramLinksByTrip(deps.db, userId, [tripId], labels)).get(tripId) ?? [] },
   };
+}
+
+/**
+ * The link a code travels in. `me` opens a chat with the deployment's number with the code already written; `group`
+ * opens WhatsApp's share screen, because a link cannot target a group. The sentence round the code is in the person's
+ * language; the relay reads only the token.
+ */
+export function whatsappLink(kind: "me" | "group", number: string, code: string, language: "he" | "en"): string {
+  const text = kind === "me"
+    ? (language === "he" ? `הקוד שלי ל-Kinerary: ${code}` : `My Kinerary code: ${code}`)
+    : (language === "he" ? `הקוד לחיבור הקבוצה ל-Kinerary: ${code}` : `Connect this group to Kinerary: ${code}`);
+  return kind === "me"
+    ? `https://wa.me/${encodeURIComponent(number)}?text=${encodeURIComponent(text)}`
+    : `https://wa.me/?text=${encodeURIComponent(text)}`;
 }
 
 export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependencies): void {
@@ -1475,6 +1503,62 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(issued.token)}`,
       expiresAt: issued.expiresAt.toISOString(),
     });
+  });
+
+  // WHATSAPP (spec 625, S2). Three routes, all policy "account" (portal-scope.ts): a Telegram-minted session is refused 403
+  // ACCOUNT_SIGN_IN_REQUIRED before the handler, because a code MINTS a way into the trip's chat. Without a number in the
+  // profile, with the trip's switch off, for a non-member, for a non-owner where the owner is required, for a trip that does
+  // not exist or is retired: one 404. No response carries a code except the one just minted for the asker, and no response
+  // carries a phone number but the deployment's own (the number a code's link opens).
+  const whatsappCodeAttempts: Attempts = new Map();
+  app.post("/v1/trips/:id/whatsapp-codes", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    if (!deps.whatsapp) return reply.code(404).send({ error: "NOT_FOUND" });
+    // The same per-user cap as the Telegram link route.
+    if (!admitLogin(whatsappCodeAttempts, user.id, 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "RATE_LIMITED" });
+    }
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const issued = await issueChatBindingCode(deps.db, {
+      tripId, userId: user.id, kind: body.kind, ttlSeconds: deps.whatsapp.codeTtlSeconds, log: deps.emailAuthLog,
+    });
+    if (!issued.ok) return issued.reason === "INVALID_KIND" ? reply.code(400).send({ error: "INVALID_REQUEST" }) : reply.code(404).send({ error: "NOT_FOUND" });
+    const language = pickLanguage(body.language, request.headers["accept-language"]);
+    return reply.code(201).send({
+      link: whatsappLink(issued.kind, deps.whatsapp.number, issued.code, language),
+      expiresAt: issued.expiresAt.toISOString(),
+    });
+  });
+
+  /** The trip's owner, with the switch on and a number configured: the gate of the two owner-only WhatsApp routes. */
+  async function whatsappOwnerOf(tripId: string, userId: string): Promise<boolean> {
+    if (!deps.whatsapp) return false;
+    const entitlement = await tripEntitlement(deps.db, tripId, userId);
+    return entitlement.owner && (await featureEnabled(deps.db, tripId, WHATSAPP_SWITCH, deps.emailAuthLog));
+  }
+
+  app.get("/v1/trips/:id/whatsapp-connections", async (request, reply) => {
+    const user = await requireUser(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const tripId = (request.params as { id?: string }).id ?? "";
+    if (!(await whatsappOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { connections: await listWhatsAppConnections(deps.db, tripId) };
+  });
+
+  app.delete("/v1/trips/:id/whatsapp-connections/:bindingId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const params = request.params as { id?: string; bindingId?: string };
+    const tripId = params.id ?? "";
+    if (!(await whatsappOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+    const removed = await removeWhatsAppConnection(deps.db, { tripId, bindingId: params.bindingId ?? "" });
+    if (!removed.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "removed" };
   });
 
   // A TRIP LINK for a secondary organizer (#523): the trip's MAIN organizer (its owner, with dashboard access) hands it to
