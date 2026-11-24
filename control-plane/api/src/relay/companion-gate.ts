@@ -47,7 +47,7 @@ import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
 import { MEDIA_MAX_BYTES, type MediaKind } from "./media-store.js";
 import type { AttachmentRef, HeldAttachment, PendingAttachments } from "./pending-attachments.js";
 import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
-import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
+import { addressedMark, conversationMark, reactionAnswerMark, whatsappMark } from "./stay-silent.js";
 
 export type { AttachmentRef, HeldAttachment };
 
@@ -459,6 +459,12 @@ async function eventTurn<Extra>(
   // The judge's yes is marked the same way, for the same reason: the companion
   // is told it was not addressed by name and may stay silent (the second guard
   // against a wrong yes).
+  // WhatsApp only (S3, spec Behaviour 8): a forwarded turn that the WhatsApp addressed mark below will not carry (a
+  // private turn; a group turn let in by a window or the judge) says it is on WhatsApp and to answer in plain text.
+  // Innermost, so the conversation and reaction marks keep their place at the front. Absent wording: nothing changes.
+  if (deps.platformWording === "whatsapp" && !(inGroup && explicitHere)) {
+    outcome.event.text = `${whatsappMark()}\n\n${outcome.event.text}`.trimEnd();
+  }
   if (capturedByConversation || capturedByJudge) {
     outcome.event.text = `${conversationMark()}\n\n${outcome.event.text}`.trimEnd();
   }

@@ -76,6 +76,17 @@ export function addressedMark(botUsername?: string, platform: "telegram" | "what
 }
 
 /**
+ * WhatsApp only (#625 S3, spec Behaviour 8): the line on EVERY turn forwarded from a WhatsApp chat that does not already
+ * carry the WhatsApp addressed mark - a private turn, and a group turn let in by the conversation window, the judge or
+ * the "?" window. The companion's own prompt says Telegram (the relay stamps the gateway's primary platform, AC-0), so
+ * this is where it learns the chat is WhatsApp and that WhatsApp shows plain text. It says nothing about being
+ * addressed: the conversation and reaction marks, which keep their place at the front, still say that.
+ */
+export function whatsappMark(): string {
+  return `[this chat is on WhatsApp: answer in plain text, with no Markdown headings, tables or links in brackets]`;
+}
+
+/**
  * The line prefixed to a bare reaction (an emoji, a "?") that took the one-shot
  * "?" window: the assistant's last message ended in a question, and a thumbs-up
  * to "Should I update the site?" is the answer. Without it the companion sees

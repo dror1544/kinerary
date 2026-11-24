@@ -66,6 +66,33 @@ describe("teardown-trip.py's transaction, run for real", { skip: SKIP }, () => {
     await pool.query(renderRetire({ id: tripId, slug: `retired-${slug}` }));
   });
 
+  test("#655 F6: a WhatsApp binding committed between the WhatsApp close and the shared close is closed and cleared too, so the CHECK never aborts the teardown", async () => {
+    pool ??= await freshDatabase();
+    const { tripId } = await mkWhatsappTrip(pool, { title: "Race" });
+    const slug = (await pool.query("SELECT slug FROM control_plane.trips WHERE id=$1", [tripId])).rows[0].slug;
+    // (The renderer names every retired slug after "wa-trip"; this trip needs its own, or it collides with the test above.)
+    const sql = renderRetire({ id: tripId, slug }).replaceAll("retired-wa-trip-", `retired-race-${tripId.slice(-8)}-`);
+    // The real transaction, cut right after the WhatsApp close: everything before it runs, then a concurrent add-to-bind
+    // (or code redemption) commits a WhatsApp binding, then the rest runs. Deterministic: the interleaving under READ COMMITTED.
+    const cut = sql.indexOf("$wa_close$;") + "$wa_close$;".length;
+    assert.ok(cut > "$wa_close$;".length, "the WhatsApp close is in the transaction");
+    const client = await pool.connect();
+    try {
+      await client.query(sql.slice(0, cut));
+      await openBinding(pool, { tripId, chatId: waGroupId(), platform: "whatsapp", title: "Late group", transportAddress: waOldGroupAddress() });
+      await client.query(sql.slice(cut));
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+    const rows = (await pool.query("SELECT platform, closed_reason, transport_address, phone_last4 FROM control_plane.telegram_chat_bindings WHERE trip_id=$1", [tripId])).rows;
+    console.log(`EVIDENCE F6 teardown vs a late WhatsApp binding: ${JSON.stringify(rows.map((r) => ({ ...r, transport_address: r.transport_address === null ? null : "<set>" })))}`);
+    assert.deepEqual(rows, [{ platform: "whatsapp", closed_reason: "trip_destroyed", transport_address: null, phone_last4: null }]);
+    assert.ok((await pool.query("SELECT slug FROM control_plane.trips WHERE id=$1", [tripId])).rows[0].slug.startsWith("retired-"));
+  });
+
   test("AC-17: on the OLD schema the same transaction still retires a Telegram trip (no table, no columns)", async () => {
     await pool?.end();
     pool = await freshDatabase({ oldSchema: true });

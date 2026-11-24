@@ -9,7 +9,7 @@ import { after, before, describe, test } from "node:test";
 import type pg from "pg";
 import { issueChatBindingCode } from "../src/chat-binding-codes.js";
 import { buildJudgePrompt } from "../src/relay/group-judge.js";
-import { SILENCE_SENTINEL, addressedMark } from "../src/relay/stay-silent.js";
+import { SILENCE_SENTINEL, addressedMark, whatsappMark } from "../src/relay/stay-silent.js";
 import { WHATSAPP_WIRE_PLATFORM, rewriteMentions, whatsappSenderName } from "../src/relay/whatsapp/poller.js";
 import { WhatsAppConfigError, whatsappRuntimeConfig } from "../src/relay/whatsapp/runtime.js";
 import { FAKE_OWN } from "../tools/fake-whatsapp.js";
@@ -161,7 +161,7 @@ describe("the WhatsApp loop, end to end on the stand-in", { skip: SKIP }, () => 
       assert.equal(event.source.user_name, "Alice");
       assert.equal(event.source.chat_type, "dm");
       assert.equal(event.source.profile, trip.profile);
-      assert.equal(event.text, "where is the hotel?", "a private chat is addressed by construction and never marked");
+      assert.equal(event.text, `${whatsappMark()}\n\nwhere is the hotel?`, "a private chat is addressed by construction: no addressed mark, only where it is (#655 G)");
 
       const result = await gateway.act({ op: "send", chat_id: event.source.chat_id, content: "The **hotel** is on rue de la Paix.", reply_to: event.message_id });
       console.log(`EVIDENCE AC-24 outbound send -> ${JSON.stringify(result)}; bridge recorded ${JSON.stringify(sends(relay))}`);

@@ -20,11 +20,11 @@
  *   reads the string with its own classifier, and a word like "network" would make it
  *   retry a send that may have been delivered (connector.ts, GATEWAY_TIMEOUT_ERROR).
  */
-import { cleanChatText } from "../../chat-binding-codes.js";
 import { structuredLog } from "../../redaction.js";
 import { MESSAGE_ID, type WhatsAppClient, type WhatsAppFailure } from "./client.js";
 import { formatForWhatsApp } from "./format.js";
 import type { BridgeStateTracker, WhatsAppMessageLedger } from "./state.js";
+import { whatsappChatTitle } from "./text.js";
 
 /** No WhatsApp client is configured on this relay, and the chat's binding is a WhatsApp one (AC-20). */
 export const PLATFORM_UNAVAILABLE = "PLATFORM_UNAVAILABLE";
@@ -37,8 +37,12 @@ export const EDIT_REFUSED = "EDIT_REFUSED";
 
 export interface WhatsAppOutboundDeps {
   client: WhatsAppClient;
-  /** The open WhatsApp binding's `transport_address` for this alias, or null when there is none now. */
-  addressOf(alias: string): Promise<string | null>;
+  /**
+   * The `transport_address` of the alias's open WhatsApp binding OF THIS TRIP (the trip the scope check approved), or
+   * null when there is none now. Tied to the trip, not to the alias alone (#655 review, F2): a chat rebound to another
+   * trip between the scope check and the send must get nothing from the first trip's gateway.
+   */
+  addressOf(alias: string, tripId: string): Promise<string | null>;
   ledger: WhatsAppMessageLedger;
   state: BridgeStateTracker;
   log?: (line: string) => void;
@@ -60,13 +64,13 @@ export class WhatsAppOutbound {
     return { ok: false, error: failure.reason === "not_found" && op === "edit" ? EDIT_REFUSED : WHATSAPP_REFUSED };
   }
 
-  private async address(alias: string): Promise<string | null> {
-    return this.deps.addressOf(alias);
+  private async address(alias: string, tripId: string): Promise<string | null> {
+    return this.deps.addressOf(alias, tripId);
   }
 
   /** Sends companion text, converted and split. Returns the FIRST message's id (the one a streaming edit targets). */
-  async send(alias: string, content: string, replyTo?: string): Promise<DeliveryResult> {
-    const address = await this.address(alias);
+  async send(alias: string, tripId: string, content: string, replyTo?: string): Promise<DeliveryResult> {
+    const address = await this.address(alias, tripId);
     if (!address) return { ok: false, error: "CHAT_NOT_IN_SCOPE" };
     const chunks = formatForWhatsApp(content);
     if (chunks.length === 0) return { ok: true };
@@ -90,12 +94,12 @@ export class WhatsAppOutbound {
    * edits the first and sends the rest as new messages, so nothing the companion wrote
    * is lost.
    */
-  async edit(alias: string, messageId: string, content: string): Promise<DeliveryResult> {
+  async edit(alias: string, tripId: string, messageId: string, content: string): Promise<DeliveryResult> {
     if (!MESSAGE_ID.test(messageId) || !this.deps.ledger.sentHere(alias, messageId)) {
       this.deps.log?.(structuredLog("warn", "whatsapp.edit_refused", { reason: "not_a_message_the_number_sent_here" }));
       return { ok: false, error: EDIT_REFUSED };
     }
-    const address = await this.address(alias);
+    const address = await this.address(alias, tripId);
     if (!address) return { ok: false, error: "CHAT_NOT_IN_SCOPE" };
     const chunks = formatForWhatsApp(content);
     if (chunks.length === 0) return { ok: true };
@@ -110,8 +114,8 @@ export class WhatsAppOutbound {
     return { ok: true };
   }
 
-  async typing(alias: string): Promise<DeliveryResult> {
-    const address = await this.address(alias);
+  async typing(alias: string, tripId: string): Promise<DeliveryResult> {
+    const address = await this.address(alias, tripId);
     if (!address) return { ok: false, error: "CHAT_NOT_IN_SCOPE" };
     const typed = await this.deps.client.typing({ chatId: address });
     if (!typed.ok) return this.failure("typing", typed);
@@ -120,8 +124,8 @@ export class WhatsAppOutbound {
   }
 
   /** A group's title, or a private chat with no name: never an id or a number. */
-  async chatInfo(alias: string): Promise<{ ok: true; name: string; type: "group" | "private" } | { ok: false; error: string }> {
-    const address = await this.address(alias);
+  async chatInfo(alias: string, tripId: string): Promise<{ ok: true; name: string; type: "group" | "private" } | { ok: false; error: string }> {
+    const address = await this.address(alias, tripId);
     if (!address) return { ok: false, error: "CHAT_NOT_IN_SCOPE" };
     const info = await this.deps.client.chatInfo(address);
     if (!info.ok) {
@@ -129,7 +133,7 @@ export class WhatsAppOutbound {
       return failed.ok ? { ok: false, error: WHATSAPP_REFUSED } : failed;
     }
     this.deps.state.observe("connected", "outbound");
-    if (info.value.kind === "group") return { ok: true, name: cleanChatText(info.value.title) ?? "", type: "group" };
+    if (info.value.kind === "group") return { ok: true, name: whatsappChatTitle(info.value.title) ?? "", type: "group" };
     return { ok: true, name: "", type: "private" };
   }
 }

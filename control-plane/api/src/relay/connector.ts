@@ -182,7 +182,7 @@ export interface ConnectorOptions {
    * asked once per WhatsApp action after the scope check and never for a Telegram one.
    * Absent with a client: every WhatsApp action fails closed.
    */
-  whatsappAddressOf?: (alias: string) => Promise<string | null>;
+  whatsappAddressOf?: (alias: string, tripId: string) => Promise<string | null>;
   /** Shared with the WhatsApp loop, so the two halves agree (edit targets, reply targets, one state line). */
   whatsappLedger?: WhatsAppMessageLedger;
   whatsappState?: BridgeStateTracker;
@@ -580,6 +580,8 @@ export class RelayConnector {
     // id shape and row platform disagree). A WhatsApp chat on a relay with no WhatsApp
     // client is refused here, before any branch below, so no Telegram call is made.
     const whatsapp = route.kind === "companion" && route.platform === "whatsapp";
+    // The trip the scope check approved: the WhatsApp address is read for THIS trip's binding only.
+    const tripId = route.kind === "companion" ? route.tripId : "";
     if (whatsapp && !this.whatsapp) {
       this.log(structuredLog("warn", "relay.outbound_platform_unavailable", { op: action.op, platform: "whatsapp" }));
       return { success: false, error: PLATFORM_UNAVAILABLE };
@@ -668,7 +670,7 @@ export class RelayConnector {
         // untouched so onOutbound answers the gateway exactly as before. The
         // WhatsApp transport (chosen from the row above) converts its own dialect.
         const sent = whatsapp
-          ? await this.whatsapp!.send(action.chat_id, content, action.reply_to).catch((error: unknown) => {
+          ? await this.whatsapp!.send(action.chat_id, tripId, content, action.reply_to).catch((error: unknown) => {
               this.options.assistantEvents?.replySent(action.chat_id, "failed", content.length, action.reply_to);
               throw error;
             })
@@ -750,7 +752,7 @@ export class RelayConnector {
           return { success: true };
         }
         if (whatsapp) {
-          const done = await this.whatsapp!.edit(action.chat_id, action.message_id, editVerdict.content);
+          const done = await this.whatsapp!.edit(action.chat_id, tripId, action.message_id, editVerdict.content);
           return done.ok ? { success: true } : { success: false, error: done.error };
         }
         const edited = await telegram.editMessageText({
@@ -766,14 +768,14 @@ export class RelayConnector {
       }
       case "typing":
         if (whatsapp) {
-          const typed = await this.whatsapp!.typing(action.chat_id);
+          const typed = await this.whatsapp!.typing(action.chat_id, tripId);
           return typed.ok ? { success: true } : { success: false, error: typed.error };
         }
         await telegram.sendChatAction({ chatId: action.chat_id });
         return { success: true };
       case "get_chat_info": {
         if (whatsapp) {
-          const info = await this.whatsapp!.chatInfo(action.chat_id);
+          const info = await this.whatsapp!.chatInfo(action.chat_id, tripId);
           return info.ok ? { success: true, name: info.name, type: info.type } : { success: false, error: info.error };
         }
         const info = await telegram.getChatInfo(action.chat_id);

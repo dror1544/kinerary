@@ -8,23 +8,37 @@
  * send and returned to the caller in memory. It is never logged.
  */
 import type pg from "pg";
-import { cleanChatText } from "../../chat-binding-codes.js";
+import { whatsappChatTitle } from "./text.js";
 
 type Queryable = Pick<pg.Pool, "query">;
 
-/** The real address of an OPEN WhatsApp binding, by its alias; null when there is none now. */
-export async function whatsappAddressOf(db: Queryable, alias: string): Promise<string | null> {
-  const found = await db.query<{ transport_address: string | null }>(
-    `SELECT transport_address FROM control_plane.telegram_chat_bindings
-      WHERE chat_id = $1 AND closed_at IS NULL AND platform = 'whatsapp'`,
-    [alias],
-  );
+/**
+ * The real address of an OPEN WhatsApp binding, by its alias; null when there is none now. With `tripId`, only a binding
+ * of that trip counts (#655 review, F2): the connector passes the trip its scope check approved, so a chat rebound to
+ * another trip in between is not sent the first trip's text. Without it (the relay's own owner notice, which has just
+ * read the binding itself) the alias alone decides.
+ */
+export async function whatsappAddressOf(db: Queryable, alias: string, tripId?: string): Promise<string | null> {
+  const found = tripId === undefined
+    ? await db.query<{ transport_address: string | null }>(
+      `SELECT transport_address FROM control_plane.telegram_chat_bindings
+        WHERE chat_id = $1 AND closed_at IS NULL AND platform = 'whatsapp'`,
+      [alias],
+    )
+    : await db.query<{ transport_address: string | null }>(
+      `SELECT transport_address FROM control_plane.telegram_chat_bindings
+        WHERE chat_id = $1 AND trip_id = $2 AND closed_at IS NULL AND platform = 'whatsapp'`,
+      [alias, tripId],
+    );
   return found.rows[0]?.transport_address ?? null;
 }
 
-/** `title_changed`: the open group binding's `chat_title` follows the group's (spec "Bridge sidecar"). Returns whether a row changed. */
+/**
+ * `title_changed`: the open group binding's `chat_title` follows the group's (spec "Bridge sidecar"). A title that is a
+ * number is stored as no title (#655 review, F4). Returns whether a row changed.
+ */
 export async function updateWhatsAppGroupTitle(db: Queryable, alias: string, title: string): Promise<boolean> {
-  const cleaned = cleanChatText(title);
+  const cleaned = whatsappChatTitle(title);
   const updated = await db.query(
     `UPDATE control_plane.telegram_chat_bindings SET chat_title = $2
       WHERE chat_id = $1 AND closed_at IS NULL AND platform = 'whatsapp'`,

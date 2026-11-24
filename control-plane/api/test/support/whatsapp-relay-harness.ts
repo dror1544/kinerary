@@ -18,7 +18,8 @@ import { MediaStore } from "../../src/relay/media-store.js";
 import { outboundScopeOptions } from "../../src/relay/outbound-scope.js";
 import { makeUpgradeToken } from "../../src/relay/protocol.js";
 import type { ChatInfo, SendResult, TelegramClient } from "../../src/relay/telegram-api.js";
-import { createHttpWhatsAppClient } from "../../src/relay/whatsapp/client.js";
+import { createHttpWhatsAppClient, type WhatsAppClient } from "../../src/relay/whatsapp/client.js";
+import type { ScopeRoute } from "../../src/relay/outbound-scope.js";
 import { startWhatsAppLoop, type WhatsAppLoop } from "../../src/relay/whatsapp/poller.js";
 import { BridgeStateTracker, WhatsAppMessageLedger } from "../../src/relay/whatsapp/state.js";
 import { startFakeWhatsApp, type FakeWhatsApp } from "../../tools/fake-whatsapp.js";
@@ -132,11 +133,29 @@ export interface Relay {
   stop(): Promise<void>;
 }
 
-export async function startRelay(pool: pg.Pool, options: { whatsappClient?: boolean } = {}): Promise<Relay> {
+export interface RelayOptions {
+  whatsappClient?: boolean;
+  /** Wraps the HTTP client (a probe that changes what the bridge says). */
+  wrapClient?: (client: WhatsAppClient) => WhatsAppClient;
+  /** Wraps the connector's route lookup (a probe that changes the database between the scope check and the send). */
+  wrapResolve?: (resolve: (chatId: string) => Promise<ScopeRoute>) => (chatId: string) => Promise<ScopeRoute>;
+  /** Do not wait for the loop's first cursor (a bridge that never lets it get one). */
+  waitReady?: boolean;
+  codeAttemptsPerHour?: number;
+  mediaTimeoutMs?: number;
+}
+
+export async function startRelay(pool: pg.Pool, options: RelayOptions = {}): Promise<Relay> {
   const lines: string[] = [];
   const log = (line: string) => { lines.push(line); };
   const fake = await startFakeWhatsApp({ secret: BRIDGE_SECRET });
-  const client = createHttpWhatsAppClient({ baseUrl: fake.url, secret: BRIDGE_SECRET, requestTimeoutMs: 2000 });
+  const http = createHttpWhatsAppClient({
+    baseUrl: fake.url, secret: BRIDGE_SECRET, requestTimeoutMs: 2000,
+    ...(options.mediaTimeoutMs ? { mediaTimeoutMs: options.mediaTimeoutMs } : {}),
+  });
+  const client = options.wrapClient ? options.wrapClient(http) : http;
+  const scope = outboundScopeOptions(pool, undefined, log);
+  if (options.wrapResolve && scope.resolveRoute) scope.resolveRoute = options.wrapResolve(scope.resolveRoute);
   const ledger = new WhatsAppMessageLedger();
   const state = new BridgeStateTracker(log);
   const telegram = new RecordingTelegram();
@@ -148,7 +167,7 @@ export async function startRelay(pool: pg.Pool, options: { whatsappClient?: bool
     port: 0,
     mediaStore,
     log,
-    ...outboundScopeOptions(pool, undefined, log),
+    ...scope,
     ...(options.whatsappClient === false ? {} : { whatsapp: client, whatsappLedger: ledger, whatsappState: state }),
   });
   await connector.listen();
@@ -160,12 +179,12 @@ export async function startRelay(pool: pg.Pool, options: { whatsappClient?: bool
     connector,
     ledger,
     state,
-    codeLimiter: new CodeAttemptLimiter({ log }),
+    codeLimiter: new CodeAttemptLimiter({ log, ...(options.codeAttemptsPerHour ? { perChatPerHour: options.codeAttemptsPerHour } : {}) }),
     log,
     groupJudge: judge,
     media: { store: mediaStore, baseUrl, log },
   }, { waitMs: 150, minBackoffMs: 20, maxBackoffMs: 100 });
-  await loop.ready;
+  if (options.waitReady !== false) await loop.ready;
   const parsed = () => lines.flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } });
   const matches = (e: Record<string, unknown>, name: string, fields: Record<string, unknown>) =>
     e.event === name && Object.entries(fields).every(([k, v]) => e[k] === v);
@@ -178,9 +197,10 @@ export async function startRelay(pool: pg.Pool, options: { whatsappClient?: bool
     },
     async stop() {
       loop.stop();
+      // The stand-in first: closing it ends any request a probe left hanging, so the lanes can drain.
+      await fake.close();
       await loop.settled();
       await connector.close();
-      await fake.close();
     },
   };
 }

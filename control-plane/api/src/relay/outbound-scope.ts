@@ -151,7 +151,7 @@ export function outboundScopeOptions(
   resolveRoute?: (chatId: string) => Promise<ScopeRoute>;
   interviewerProfile?: string;
   profileHasOpenBinding?: (profile: string) => Promise<boolean>;
-  whatsappAddressOf?: (alias: string) => Promise<string | null>;
+  whatsappAddressOf?: (alias: string, tripId: string) => Promise<string | null>;
 } {
   if (!db) return {};
   return {
@@ -165,7 +165,7 @@ export function outboundScopeOptions(
     resolveRoute: (chatId: string) => resolveOutboundRoute(db, chatId, log),
     // The real address of a WhatsApp chat, read off its OPEN binding for each action and
     // asked only for a WhatsApp route (the connector's transport choice). Never logged.
-    whatsappAddressOf: (alias: string) => whatsappAddressOf(db, alias),
+    whatsappAddressOf: (alias: string, tripId: string) => whatsappAddressOf(db, alias, tripId),
     ...(interviewerProfile ? { interviewerProfile } : {}),
   };
 }

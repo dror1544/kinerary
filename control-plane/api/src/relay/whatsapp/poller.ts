@@ -45,7 +45,6 @@ import { parseInbound } from "../../chat-router.js";
 import {
   CodeAttemptLimiter,
   WHATSAPP_SWITCH,
-  cleanChatText,
   closeIfMembershipEnded,
   composeWhatsAppGroupIntroduction,
   extractChatBindingCode,
@@ -78,6 +77,7 @@ import {
   type WhatsAppClient,
 } from "./client.js";
 import { sendFixedText } from "./outbound.js";
+import { rewriteMentions, whatsappChatTitle, whatsappFilename, whatsappSenderName } from "./text.js";
 import { BridgeStateTracker, WhatsAppMessageLedger } from "./state.js";
 
 /**
@@ -152,49 +152,34 @@ interface PassOptions {
   judgedOutcome?: JudgeOutcome | null;
 }
 
-// ── Text that must never carry an id ──────────────────────────────────────────────────
-
-const DIGITS_OF = (id: string) => id.slice(0, id.indexOf("@"));
-
-/**
- * Rewrites every @mention in WhatsApp text (spec, Sender ids): each listed id's token,
- * the number's own in either form, and any other `@` followed by seven or more digits.
- * The number's own becomes `ownName`; anyone else's "someone". Pure; never throws.
- */
-export function rewriteMentions(
-  text: string,
-  mentionedIds: readonly string[],
-  ownIds: ReadonlySet<string>,
-  ownName: string,
-): string {
-  if (!text.includes("@")) return text;
-  const replacement = new Map<string, string>();
-  for (const id of mentionedIds) {
-    const digits = DIGITS_OF(id);
-    if (/^[0-9]+$/.test(digits)) replacement.set(digits, ownIds.has(id) ? ownName : "someone");
+/** A counting semaphore: at most `size` events handled at once, across chats. */
+class Slots {
+  private running = 0;
+  private readonly waiting: Array<() => void> = [];
+  constructor(private readonly size: number) {}
+  async acquire(): Promise<void> {
+    if (this.running < this.size) {
+      this.running += 1;
+      return;
+    }
+    // The releaser hands its slot straight over, so `running` is not touched here.
+    await new Promise<void>((resolve) => this.waiting.push(resolve));
   }
-  for (const id of ownIds) {
-    const digits = DIGITS_OF(id);
-    if (/^[0-9]+$/.test(digits)) replacement.set(digits, ownName);
+  release(): void {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.running -= 1;
   }
-  return text.replace(/@\+?([0-9]+)/g, (whole, digits: string) => {
-    const known = replacement.get(digits);
-    if (known !== undefined) return known;
-    return digits.length >= 7 ? "someone" : whole;
-  });
 }
 
-/**
- * A sender's display name as the companion may see it: one clean line, and EMPTY rather
- * than a number (a WhatsApp name a person never set is often their number written out).
- */
-export function whatsappSenderName(raw: string | null | undefined): string | null {
-  const cleaned = cleanChatText(raw, 64);
-  if (!cleaned) return null;
-  if ((cleaned.match(/[0-9]/g)?.length ?? 0) >= 7) return null;
-  if (/@/.test(cleaned) && /[0-9]{5,}/.test(cleaned)) return null;
-  return cleaned;
-}
+// ── Text that must never carry an id: text.ts (re-exported here, where S3b's tests import them) ──
+
+export { rewriteMentions, whatsappSenderName };
+
+/** Events handled at once across all chats (one per chat; a chat's own events stay in order). */
+export const MAX_CONCURRENT_CHATS = 8;
+/** Events queued in the lanes before the loop stops polling and waits for them to drain. */
+const MAX_QUEUED_EVENTS = 500;
 
 // ── The loop ──────────────────────────────────────────────────────────────────────────
 
@@ -229,25 +214,40 @@ export function startWhatsAppLoop(deps: WhatsAppLoopDeps, options: WhatsAppLoopO
     await sleep(backoffMs);
   };
 
+  /**
+   * Asks the bridge for its state and the number's own ids. True only when it is connected AND its own linked-identity id
+   * is known: without that id the relay cannot tell the number's own messages from anyone else's, so nothing is read
+   * until it is (#655 review, F3), and that is said once (`own_ids_unknown`). `connected` itself is said only when
+   * `sayConnected`, after a poll has worked, so a bridge whose health answers while its message feed fails does not flap.
+   */
+  async function checkHealth(sayConnected: boolean): Promise<boolean> {
+    const health = await deps.client.health();
+    if (!health.ok) {
+      deps.state.observe(health.state ?? "unavailable", "health");
+      return false;
+    }
+    handler.setOwnIds([health.value.own.lid, health.value.own.phone]);
+    if (health.value.state !== "connected") {
+      deps.state.observe(health.value.state, "health");
+      return false;
+    }
+    if (!health.value.own.lid) {
+      deps.state.observe("own_ids_unknown", "health");
+      return false;
+    }
+    if (sayConnected) deps.state.observe("connected", "health");
+    return true;
+  }
+
   async function run(): Promise<void> {
     let cursor: PollCursor = {};
     let knowOwnIds = false;
-    log(structuredLog("info", "whatsapp.loop_started", { wait_ms: waitMs }));
+    log(structuredLog("info", "whatsapp.loop_started", { wait_ms: waitMs, max_concurrent_chats: MAX_CONCURRENT_CHATS }));
     while (!stopped) {
       if (!knowOwnIds) {
-        const health = await deps.client.health();
+        const ok = await checkHealth(false);
         if (stopped) break;
-        if (!health.ok) {
-          deps.state.observe(health.state ?? "unavailable", "health");
-          await fail();
-          continue;
-        }
-        handler.setOwnIds([health.value.own.lid, health.value.own.phone]);
-        // Not connected (logged out, pairing, reconnecting): nothing to read. Ask again.
-        // "Connected" itself is said only after a poll has worked (below), so a bridge
-        // whose health answers while its message feed fails does not flap the state line.
-        if (health.value.state !== "connected") {
-          deps.state.observe(health.value.state, "health");
+        if (!ok) {
           await fail();
           continue;
         }
@@ -262,39 +262,37 @@ export function startWhatsAppLoop(deps: WhatsAppLoopDeps, options: WhatsAppLoopO
         continue;
       }
       backoffMs = 0;
-      // A poll that answers proves the bridge is reachable, not that WhatsApp is
-      // connected (a logged-out bridge still answers). While the last word was not
-      // "connected", the bridge's own state is asked for, so a recovery is said once
-      // and an outage is never "recovered" by a reachable but logged-out bridge.
-      if (!deps.state.connected) {
-        const health = await deps.client.health();
-        if (health.ok) handler.setOwnIds([health.value.own.lid, health.value.own.phone]);
-        deps.state.observe(health.ok ? health.value.state : health.state ?? "unavailable", "health");
-      }
       const b = batch.value;
       if (cursor.epoch !== undefined && b.epoch !== cursor.epoch) {
-        // The bridge restarted: its numbering began again, and the number's own ids are
-        // read again before the next batch is handled.
+        // The bridge restarted: its numbering began again, and the number's own ids are read again first.
         log(structuredLog("warn", "whatsapp.bridge_restarted", {}));
         knowOwnIds = false;
+      }
+      // A poll that answers proves the bridge is reachable, not that WhatsApp is connected (a logged-out bridge still
+      // answers), and the own ids may have changed. While either is in doubt the bridge's own word is asked for BEFORE
+      // the batch is handled; if it is not good, the cursor is NOT advanced, so this batch is read again once it is.
+      if (!knowOwnIds || !deps.state.connected) {
+        const ok = await checkHealth(true);
+        if (stopped) break;
+        if (!ok) {
+          knowOwnIds = false;
+          await fail();
+          continue;
+        }
+        knowOwnIds = true;
       }
       if (b.lost || b.malformed || b.ignored) {
         log(structuredLog("warn", "whatsapp.events_not_handled", { lost: b.lost, malformed: b.malformed, ignored: b.ignored }));
       }
       cursor = { after: b.lastSeq, epoch: b.epoch };
       markReady();
-      if (!knowOwnIds && b.events.length > 0) {
-        // Own ids first, then this batch: an own message must never be read as someone else's.
-        const health = await deps.client.health();
-        if (health.ok) {
-          handler.setOwnIds([health.value.own.lid, health.value.own.phone]);
-          knowOwnIds = health.value.state === "connected";
-        }
-      }
+      // Each event goes to its chat's lane: one chat's slow event (a media fetch, a judge call, a slow database) never
+      // holds another chat's (#655 review, F5).
       for (const event of b.events) {
         if (stopped) break;
-        await handler.dispatch(event);
+        handler.dispatch(event);
       }
+      await handler.drain(MAX_QUEUED_EVENTS);
       // A macrotask between polls, so a stand-in that answers at once cannot starve timers.
       if (!stopped && !b.more) await sleep(0);
     }
@@ -312,7 +310,10 @@ export function startWhatsAppLoop(deps: WhatsAppLoopDeps, options: WhatsAppLoopO
     },
     ready,
     settled: () => handler.settled(),
-    handle: (event) => handler.dispatch(event),
+    handle: async (event) => {
+      handler.dispatch(event);
+      await handler.settled();
+    },
   };
 }
 
@@ -343,25 +344,26 @@ class WhatsAppEventHandler {
   }
 
   /**
-   * One chat at a time, as the Telegram poller serialises a chat: a chat whose judge call
-   * is out holds its later events behind it; every other chat goes straight on.
+   * Queues one event on its chat's lane. A chat's events run one at a time, in arrival order, as the Telegram poller
+   * serialises a chat; different chats run side by side, at most MAX_CONCURRENT_CHATS at once. A judge call releases
+   * its slot while it waits (see `apply`), and keeps its place in the lane.
    */
-  async dispatch(event: BridgeEvent): Promise<void> {
-    const lane = event.chatId;
-    if (this.lanes.has(lane)) {
-      this.enqueue(lane, () => this.handle(event, { defer: false }));
-      return;
-    }
-    this.inFlight += 1;
-    try {
-      await this.handle(event, { defer: true });
-    } finally {
-      this.inFlight -= 1;
-    }
+  dispatch(event: BridgeEvent): void {
+    this.queued += 1;
+    this.enqueue(event.chatId, async () => {
+      await this.slots.acquire();
+      try {
+        await this.handle(event, { defer: true });
+      } finally {
+        this.slots.release();
+        this.queued -= 1;
+      }
+    });
   }
 
-  /** Events being handled on the loop itself right now (not parked on a lane). */
-  private inFlight = 0;
+  private readonly slots = new Slots(MAX_CONCURRENT_CHATS);
+  /** Events dispatched and not yet finished. */
+  private queued = 0;
 
   private enqueue(lane: string, work: () => Promise<void>): void {
     const previous = this.lanes.get(lane) ?? Promise.resolve();
@@ -371,11 +373,13 @@ class WhatsAppEventHandler {
     this.lanes.set(lane, next);
   }
 
+  /** Waits while more than `limit` events are queued: the loop does not read faster than the lanes drain. */
+  async drain(limit: number): Promise<void> {
+    while (this.queued > limit) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
   async settled(): Promise<void> {
-    while (this.lanes.size > 0 || this.inFlight > 0) {
-      if (this.lanes.size > 0) await Promise.all([...this.lanes.values()]);
-      else await new Promise((resolve) => setTimeout(resolve, 5));
-    }
+    while (this.lanes.size > 0) await Promise.all([...this.lanes.values()]);
   }
 
   private async handle(event: BridgeEvent, pass: PassOptions): Promise<void> {
@@ -420,10 +424,10 @@ class WhatsAppEventHandler {
     if (!isAcceptedWhatsAppGroupId(event.chatId)) return this.drop("BAD_CHAT_ID");
     const alias = whatsappChatAlias(senderKey, event.chatId, "group");
     const adder = event.addedBy && PERSON_REAL_ID.test(event.addedBy) ? whatsappOpaqueId(senderKey, event.addedBy) : null;
-    let title = cleanChatText(event.title);
-    if (!title && adder) {
+    let title = whatsappChatTitle(event.title);
+    if (!title && adder && event.title === undefined) {
       const info = await client.chatInfo(event.chatId);
-      if (info.ok && info.value.kind === "group") title = cleanChatText(info.value.title);
+      if (info.ok && info.value.kind === "group") title = whatsappChatTitle(info.value.title);
     }
     const result = await bindGroupByAdding(db, { groupAlias: alias, groupRealId: event.chatId, adderId: adder, title, log: this.log });
     this.log(structuredLog("info", "whatsapp.added_to_group", result.bound ? { bound: true } : { bound: false, reason: result.reason }));
@@ -465,19 +469,9 @@ class WhatsAppEventHandler {
 
     // 3. Mentions, before the text is used for anything.
     const text = rewriteMentions(m.text, m.mentionedIds, this.ownIds, ownName);
-    const quotedText = m.quotedText === undefined ? undefined : rewriteMentions(m.quotedText, m.mentionedIds, this.ownIds, ownName);
-
-    // Media is remembered (metadata only, nothing downloaded) so a later reply can bring it (AC-26).
-    const attachment: AttachmentRef | null = m.media && messageIdOk
-      ? { fileId: m.messageId, kind: m.media.kind, mime: m.media.mime || "application/octet-stream", ...(m.media.filename ? { filename: m.media.filename } : {}) }
-      : null;
-    if (attachment) {
-      this.deps.ledger.noteMedia(alias, {
-        messageId: m.messageId, kind: attachment.kind, mime: attachment.mime, senderId,
-        ...(attachment.filename ? { filename: attachment.filename } : {}),
-        ...(text ? { caption: text } : {}),
-      });
-    }
+    // A quoted text that holds a code is not carried at all (#655 review, F1): a code travels nowhere but the code path.
+    const quotedRaw = m.quotedText === undefined ? undefined : rewriteMentions(m.quotedText, m.mentionedIds, this.ownIds, ownName);
+    const quotedText = quotedRaw !== undefined && extractChatBindingCode(quotedRaw) === null ? quotedRaw : undefined;
 
     // 4. Commands (AC-25).
     if (parseInbound(text).kind !== "text") return this.drop("COMMAND");
@@ -501,6 +495,22 @@ class WhatsAppEventHandler {
     if (kind === "private" && (await closeIfMembershipEnded(db, alias)).closed) {
       this.log(structuredLog("info", "whatsapp.membership_ended_closed", {}));
       return this.drop("MEMBERSHIP_ENDED");
+    }
+    // Media is remembered only HERE, for a bound chat whose message is neither a command nor a code (#655 review, F1: a
+    // remembered caption reaches the companion with a later reply to it, so a code caption must never be remembered).
+    // Metadata only; nothing is downloaded until the message joins a turn (AC-26).
+    const attachment: AttachmentRef | null = m.media && messageIdOk
+      ? (() => {
+          const filename = whatsappFilename(m.media.filename, m.media.kind);
+          return { fileId: m.messageId, kind: m.media.kind, mime: m.media.mime || "application/octet-stream", ...(filename ? { filename } : {}) };
+        })()
+      : null;
+    if (attachment) {
+      this.deps.ledger.noteMedia(alias, {
+        messageId: m.messageId, kind: attachment.kind, mime: attachment.mime, senderId,
+        ...(attachment.filename ? { filename: attachment.filename } : {}),
+        ...(text ? { caption: text } : {}),
+      });
     }
     if (!text.trim() && !attachment) return this.drop("NO_TEXT");
 
@@ -527,6 +537,8 @@ class WhatsAppEventHandler {
     const quotedBy = m.quotedParticipant ? whatsappOpaqueId(senderKey, m.quotedParticipant) : undefined;
     const isReplyToAssistant = (m.quotedParticipant !== undefined && this.ownIds.has(m.quotedParticipant)) || ledger.sentHere(alias, quotedId);
     const remembered = ledger.mediaOf(alias, quotedId);
+    // Never stored with a code (see `message`); checked again here so no later change can let one through.
+    const rememberedCaption = remembered?.caption !== undefined && extractChatBindingCode(remembered.caption) === null ? remembered.caption : undefined;
     const repliedToSenderId = quotedBy ?? remembered?.senderId ?? undefined;
     return {
       platform: "whatsapp",
@@ -549,7 +561,7 @@ class WhatsAppEventHandler {
         ? {
             fileId: remembered.messageId, kind: remembered.kind, mime: remembered.mime,
             ...(remembered.filename ? { filename: remembered.filename } : {}),
-            ...(remembered.caption ? { caption: remembered.caption } : {}),
+            ...(rememberedCaption ? { caption: rememberedCaption } : {}),
           }
         : null,
     };
@@ -617,12 +629,19 @@ class WhatsAppEventHandler {
         if (!delivered) this.log(structuredLog("warn", "whatsapp.turn_lost", { reason: "GATEWAY_UNAVAILABLE" }));
         return;
       }
-      case "judge_pending":
-        this.enqueue(m.chatId, async () => {
-          const judged = await decision.ask().catch(() => null);
-          await this.handle(m, { defer: false, judgedOutcome: judged });
-        });
+      case "judge_pending": {
+        // Still in this chat's lane, so the chat's later events wait behind the verdict; the slot is given back while
+        // the model works, so other chats are not held by it.
+        this.slots.release();
+        let judged: JudgeOutcome | null = null;
+        try {
+          judged = await decision.ask().catch(() => null);
+        } finally {
+          await this.slots.acquire();
+        }
+        await this.handle(m, { defer: false, judgedOutcome: judged });
         return;
+      }
       case "reply":
         if (decision.analytics) events?.companionUnreachable(alias, decision.analytics);
         this.log(structuredLog("info", "whatsapp.relay_reply_withheld", { reason: "not_a_whatsapp_fixed_line" }));
@@ -638,10 +657,15 @@ class WhatsAppEventHandler {
   private async code(m: BridgeMessage, alias: string, kind: "private" | "group", senderId: string | null, text: string): Promise<void> {
     const { db, client, codeLimiter } = this.deps;
     if (kind === "private" && !senderId) return this.drop("PRIVATE_SENDER_UNRESOLVED");
+    // A silenced chat costs nothing: no bridge call, no database read (#655 review, F5).
+    if (codeLimiter.silenced(alias)) {
+      this.log(structuredLog("info", "whatsapp.code_silenced", {}));
+      return;
+    }
     let chatTitle: string | null = null;
     if (kind === "group") {
       const info = await client.chatInfo(m.chatId);
-      if (info.ok && info.value.kind === "group") chatTitle = cleanChatText(info.value.title);
+      if (info.ok && info.value.kind === "group") chatTitle = whatsappChatTitle(info.value.title);
     }
     const outcome = await handleCodeMessage(db, codeLimiter, {
       text,
