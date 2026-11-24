@@ -299,6 +299,8 @@ export interface TripBotPollerDeps {
    * only person who may switch a task's model from a chat (`/model`).
    */
   superAdminSubjectDigest?: string;
+  /** The operator-notices chat the relay stays silent in; see DispatchOptions.opsChatId. */
+  opsChatId?: string;
   /**
    * The relay's assistant-event emitter (#177), or absent — the default, and
    * then nothing is recorded and dispatch attaches no descriptor. Every call
@@ -5773,6 +5775,7 @@ export function startTripBotPoller(
         pendingAttachments,
         groupContext,
         ...(deps.superAdminSubjectDigest ? { superAdminSubjectDigest: deps.superAdminSubjectDigest } : {}),
+        ...(deps.opsChatId ? { opsChatId: deps.opsChatId } : {}),
         ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
         // Descriptors only when something will record them (#177).
         ...(deps.assistantEvents ? { assistantEvents: true } : {}),

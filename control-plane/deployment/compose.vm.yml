@@ -75,6 +75,12 @@ services:
     <<: *api-image
     environment:
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      # Optional: the operator-notices chat (a group the bot sits in). Read only when the
+      # architecture profile's signup.operator_notices_chat_id_secret_ref names it, e.g.
+      # `env://CONTROL_PLANE_OPERATOR_CHAT_ID`; with the default profile it is inert. The worker
+      # takes the same variable below, so one value is one chat. Empty while the profile names it
+      # stops the process at boot rather than quietly falling back to the super-admin's own chat.
+      CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
       CONTROL_PLANE_CHAT_ROUTING_KEY: ${CONTROL_PLANE_CHAT_ROUTING_KEY:-}
       CONTROL_PLANE_INTERVIEW_AGENT_KEY: ${CONTROL_PLANE_INTERVIEW_AGENT_KEY:-}
       # The operator's invitation routes (OperatorDependencies, server.ts) —
@@ -347,6 +353,12 @@ services:
     network_mode: host
     environment:
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      # Optional: the operator-notices chat the relay stays SILENT in (a group the bot sits in). Read only when the
+      # architecture profile's signup.operator_notices_chat_id_secret_ref names it, e.g.
+      # `env://CONTROL_PLANE_OPERATOR_CHAT_ID`; with the default profile it is inert. The worker
+      # takes the same variable below, so one value is one chat. Empty while the profile names it
+      # stops the process at boot rather than quietly falling back to the super-admin's own chat.
+      CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
       # The interview runs here, agentless: the router reaches startSession, and
       # the interpret path shells out to the CLI model-runner.ts names. `:?`
       # makes a missing value fail `up` rather than silently bringing the agent

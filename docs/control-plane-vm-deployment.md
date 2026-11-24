@@ -969,6 +969,38 @@ drifting. Notes on what you are filling in:
   (it is the front-door admission gate; see the schema comment in
   `control-plane/api/src/config.ts`).
 
+### A separate chat for operator notices
+
+Two kinds of message go to the operator. The **signup approval DM** (Approve / Reject
+buttons) goes to `signup.super_admin_chat_id_secret_ref`, a private chat, and stays
+there. The **operator notices** (`operator_*`: provisioning approved, complete, failed)
+are monitoring; by default they follow the same chat, which is also where the owner
+talks to the bot, so they arrive in the middle of whatever is being discussed.
+`signup.operator_notices_chat_id_secret_ref` (optional) names a different chat for the
+notices only, normally a Telegram group the bot has been added to:
+
+1. Add the bot to a group and note its chat id (negative; for a supergroup it starts
+   `-100`, which is the form to use, because Telegram gives a group a new id when it is
+   upgraded to a supergroup, and the notices then fail).
+2. Put the id in `vm.env` as `CONTROL_PLANE_OPERATOR_CHAT_ID`. The worker already reads
+   that variable for the notices it queues (complete, failed); compose now hands it to
+   the api and the relay too.
+3. In the profile copy, add `"operator_notices_chat_id_secret_ref": "env://CONTROL_PLANE_OPERATOR_CHAT_ID"`
+   to the `signup` block.
+4. Recreate the api and worker, and restart the relay with `vm-relay-restart.sh`, so each takes the new environment and profile.
+
+What it does: the outbox dispatcher sends every `operator_*` row to that chat instead of
+the chat the row was addressed to (the worker queues two of the three notices with its
+own environment's chat, so the redirect is made when the row is sent), and the relay
+ignores every update from that chat: no reply, no "bind this group" help, no greeting
+when the bot is added (a `relay.ops_chat_ignored` debug line, which does not carry the id).
+A ref that is named but empty stops the api at boot, and logs
+`relay.ops_chat_unresolved` in the relay, rather than quietly sending notices back to the
+private chat. A value equal to the super-admin chat is refused
+(`operator_notices.same_as_super_admin`) and treated as unset. Unset, nothing changes.
+The setting changes where notices are sent, not whether they are queued: the API
+queues the "approved" notice only when `super_admin_chat_id_secret_ref` is set.
+
 ### Same site
 
 The gateway's per-trip cookie is `SameSite=Strict`, so `PORTAL_ORIGIN` and

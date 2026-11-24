@@ -273,6 +273,43 @@ test("the real server entrypoint refuses to start when a signup secret cannot be
   }
 });
 
+// Issue #649: the ops chat for operator notices is optional, but a profile that NAMES one it cannot read
+// must stop the boot. Falling back would put build notices back in the owner's own chat, and nothing would say so.
+test("the real server entrypoint refuses to start when the named operator-notices chat cannot be resolved", async () => {
+  const port = await freePort();
+  const workerPort = await freePort();
+  const directory = await mkdtemp(join(tmpdir(), "kinerary-control-plane-boot-"));
+  try {
+    const profilePath = join(directory, "architecture.json");
+    await writeFile(profilePath, JSON.stringify({
+      ...baseProfile(port, workerPort),
+      signup: { ...signupBlock, operator_notices_chat_id_secret_ref: "env://CONTROL_PLANE_OPERATOR_NOTICES_BOOT_TEST" },
+    }), "utf8");
+    const child = spawn(process.execPath, ["--import", "tsx", serverEntrypoint], {
+      cwd: apiDirectory,
+      env: {
+        ...process.env,
+        CONTROL_PLANE_ARCHITECTURE_PROFILE: profilePath,
+        CONTROL_PLANE_DATABASE_URL: "postgresql://unused.invalid:5432/unused",
+        CONTROL_PLANE_TELEGRAM_BOT_TOKEN: "12345678:AAFakeBootTestBotToken",
+        CONTROL_PLANE_ACTION_SECRET: "boot-test-action-secret",
+        KINERARY_TEST_RUNTIME_EXCHANGE_KEY: "boot-runtime-exchange-secret",
+        CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET: "boot-test-webhook-secret",
+        // The ref's variable is deliberately empty.
+        CONTROL_PLANE_OPERATOR_NOTICES_BOOT_TEST: "",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    const code = await exitCodeWithin(child, 20_000);
+    assert.notEqual(code, 0, "an unreadable operator-notices ref must fail the boot");
+    assert.match(stderr, /CONTROL_PLANE_OPERATOR_NOTICES_BOOT_TEST is unset or empty/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 // Found in a boundary review before the Sprint 6 -> main merge (2026-10-06):
 // every comment next to these five env vars asserts they are distinct keys
 // for distinct trust tiers (admin, operator, interview-agent, chat-routing,
@@ -416,6 +453,21 @@ for (const composeFile of ["compose.vm.yml", "compose.local.yml"]) {
       /CONTROL_PLANE_ADMIN_KEY/,
       `${composeFile} must not reference CONTROL_PLANE_ADMIN_KEY outside the api service`,
     );
+  });
+}
+
+// #649: `env://CONTROL_PLANE_OPERATOR_CHAT_ID` is how a profile names the ops chat, so the processes that read the
+// profile must receive it. Optional (`:-`): an unset one must not stop `docker compose up`.
+for (const [composeFile, services] of [["compose.vm.yml", ["api", "relay"]], ["compose.local.yml", ["api"]]] as const) {
+  test(`${composeFile} passes CONTROL_PLANE_OPERATOR_CHAT_ID to ${services.join(" and ")}, optionally`, async () => {
+    const composeText = await readFile(fileURLToPath(new URL(`../../deployment/${composeFile}`, import.meta.url)), "utf8");
+    for (const service of services) {
+      assert.match(
+        extractServiceBlock(composeText, service),
+        /CONTROL_PLANE_OPERATOR_CHAT_ID: \$\{CONTROL_PLANE_OPERATOR_CHAT_ID:-\}/,
+        `${composeFile}'s ${service} service must pass CONTROL_PLANE_OPERATOR_CHAT_ID through as an optional var`,
+      );
+    }
   });
 }
 
