@@ -14,6 +14,8 @@
  */
 import type pg from "pg";
 import { resolveChatRoute, type ChatRoute } from "../chat-router.js";
+import { featureEnabled } from "../feature-switches.js";
+import { whatsappAddressOf } from "./whatsapp/bindings.js";
 
 /** The refusal words. Neither is a timeout or retryable to the gateway's classifier (hermes-mirror.test.ts). */
 export const CHAT_NOT_IN_SCOPE = "CHAT_NOT_IN_SCOPE";
@@ -27,7 +29,15 @@ export type OutboundRouteKind = "companion" | "companion_no_profile" | "intervie
  * confirmed and before the trip's companion is bound there (the chat resolves
  * `unbound` in that window). See `resolveOutboundRoute`.
  */
-export type ScopeRoute = ChatRoute | { kind: "interview_handover" };
+export type ScopeRoute =
+  | ChatRoute
+  | { kind: "interview_handover" }
+  /**
+   * A WhatsApp chat whose trip has the `whatsapp` switch off, or whose switch could not
+   * be read (spec 625, AC-22: refused as CHAT_NOT_IN_SCOPE). Never produced for a
+   * Telegram route: the switch is read only when the binding row says WhatsApp.
+   */
+  | { kind: "platform_switched_off" };
 
 export type OutboundScope =
   | { allowed: true }
@@ -80,6 +90,8 @@ export function outboundChatAllowed(
     }
     case "unbound":
       return { allowed: false, routeKind: "unbound", reason: "chat_not_bound" };
+    case "platform_switched_off":
+      return { allowed: false, routeKind: "companion", reason: "platform_switched_off" };
     default:
       // A route kind this function was not written for is refused, not allowed.
       return { allowed: false, routeKind: "unbound", reason: "unrecognised_route" };
@@ -99,8 +111,18 @@ export const INTERVIEW_HANDOVER_HOURS = 24;
  * as usual. `updated_at` is the confirmation time (the confirm statement sets it,
  * and a confirmed session accepts no further writes).
  */
-export async function resolveOutboundRoute(db: pg.Pool, chatId: string): Promise<ScopeRoute> {
+export async function resolveOutboundRoute(
+  db: pg.Pool,
+  chatId: string,
+  log?: (line: string) => void,
+): Promise<ScopeRoute> {
   const route = await resolveChatRoute(db, chatId);
+  // A WhatsApp chat acts only while its trip's `whatsapp` switch is on (AC-22). Read
+  // ONLY for a WhatsApp row: a Telegram route never touches the switch, so an
+  // unreadable switch can never refuse a Telegram send. Unreadable is off.
+  if (route.kind === "companion" && route.platform === "whatsapp") {
+    return (await featureEnabled(db, route.tripId, "whatsapp", log)) ? route : { kind: "platform_switched_off" };
+  }
   if (route.kind !== "unbound" || !/^[0-9]+$/.test(chatId)) return route;
   const recent = await db.query(
     `SELECT 1
@@ -124,10 +146,12 @@ export async function resolveOutboundRoute(db: pg.Pool, chatId: string): Promise
 export function outboundScopeOptions(
   db: pg.Pool | undefined,
   interviewerProfile: string | undefined,
+  log?: (line: string) => void,
 ): {
   resolveRoute?: (chatId: string) => Promise<ScopeRoute>;
   interviewerProfile?: string;
   profileHasOpenBinding?: (profile: string) => Promise<boolean>;
+  whatsappAddressOf?: (alias: string) => Promise<string | null>;
 } {
   if (!db) return {};
   return {
@@ -138,7 +162,10 @@ export function outboundScopeOptions(
       );
       return Boolean(found.rowCount);
     },
-    resolveRoute: (chatId: string) => resolveOutboundRoute(db, chatId),
+    resolveRoute: (chatId: string) => resolveOutboundRoute(db, chatId, log),
+    // The real address of a WhatsApp chat, read off its OPEN binding for each action and
+    // asked only for a WhatsApp route (the connector's transport choice). Never logged.
+    whatsappAddressOf: (alias: string) => whatsappAddressOf(db, alias),
     ...(interviewerProfile ? { interviewerProfile } : {}),
   };
 }

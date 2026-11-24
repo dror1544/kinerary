@@ -53,7 +53,19 @@ export function conversationMark(): string {
  * Starts with `[addressed to you directly` - profile-templates' SOUL names that
  * exact prefix, so the two change together.
  */
-export function addressedMark(botUsername?: string): string {
+export function addressedMark(botUsername?: string, platform: "telegram" | "whatsapp" = "telegram"): string {
+  if (platform === "whatsapp") {
+    // WhatsApp (#625 S3): no @handle to learn (the number's own mention reaches the
+    // model rewritten to the assistant's first name), and the companion's prompt says
+    // Telegram (the relay stamps the gateway's primary platform, AC-0), so this line
+    // is where it learns which chat app it is in and that WhatsApp shows plain text.
+    // Same prefix: profile-templates' SOUL names it.
+    return (
+      `[addressed to you directly — this message is for you; answer it. ` +
+      `Never reply with ${SILENCE_SENTINEL} to it. This chat is on WhatsApp: answer in plain text, ` +
+      `with no Markdown headings, tables or links in brackets.]`
+    );
+  }
   // Telegram usernames are [A-Za-z0-9_]; anything else is dropped, not trusted into a prompt.
   const handle = (botUsername ?? "").trim().replace(/^@/, "").replace(/[^A-Za-z0-9_]/g, "");
   const who = handle ? ` In Telegram you are @${handle}.` : "";

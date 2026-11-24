@@ -1552,3 +1552,166 @@ describe("RelayConnector - a gateway whose id matches no interviewer identity an
     }, { log: (l) => quiet.push(l) });
   });
 });
+
+// ── #625 S3: one chat id, one platform (AC-20, AC-24) ─────────────────────────────────────
+// The transport is chosen from the binding ROW's platform, never from the frame. These
+// cases need no database: the route is what `resolveOutboundRoute` would answer.
+
+/** Records what the connector asked the WhatsApp bridge to do. Answers like a connected bridge. */
+class RecordingWhatsApp {
+  readonly calls: { op: string; chatId: string; text?: string; replyTo?: string; messageId?: string }[] = [];
+  private next = 0;
+  async health() { return { ok: false as const, reason: "unavailable" as const }; }
+  async poll() { return { ok: false as const, reason: "unavailable" as const }; }
+  async fetchMedia() { return { ok: false as const, reason: "unavailable" as const }; }
+  async send(req: { chatId: string; text: string; replyTo?: string }) {
+    this.calls.push({ op: "send", chatId: req.chatId, text: req.text, ...(req.replyTo ? { replyTo: req.replyTo } : {}) });
+    this.next += 1;
+    return { ok: true as const, value: { messageId: `WAOUT${this.next}`, quoted: false } };
+  }
+  async edit(req: { chatId: string; messageId: string; text: string }) {
+    this.calls.push({ op: "edit", chatId: req.chatId, messageId: req.messageId, text: req.text });
+    return { ok: true as const, value: { messageId: req.messageId } };
+  }
+  async typing(req: { chatId: string }) {
+    this.calls.push({ op: "typing", chatId: req.chatId });
+    return { ok: true as const, value: undefined };
+  }
+  async chatInfo(chatId: string) {
+    this.calls.push({ op: "get_chat_info", chatId });
+    return { ok: true as const, value: { kind: "group" as const, chatId, title: "Family", size: 4 } };
+  }
+  async isParticipant() { return { ok: false as const, reason: "unavailable" as const }; }
+}
+
+describe("RelayConnector — WhatsApp and Telegram chats never cross (#625 AC-20, AC-24)", () => {
+  const GW = "companion-colmar";
+  const WA_GROUP = `wa_${"a".repeat(32)}@g`;
+  const WA_PRIVATE = `wa_${"b".repeat(32)}@p`;
+  const WA_OTHER_TRIP = `wa_${"c".repeat(32)}@g`;
+  const TG_GROUP = "-1001234567";
+  const REAL_GROUP = "120363000000000001@g.us";
+  const waRoute: ChatRoute = { kind: "companion", tripId: "t-colmar", hermesProfile: GW, assistantNames: [], platform: "whatsapp" };
+  const tgRoute: ChatRoute = { kind: "companion", tripId: "t-colmar", hermesProfile: GW, assistantNames: [], platform: "telegram" };
+  const otherTrip: ChatRoute = { kind: "companion", tripId: "t-japan", hermesProfile: "companion-japan", assistantNames: [], platform: "whatsapp" };
+  const OPS: ReadonlyArray<{ name: string; action: (chat: string) => Record<string, unknown> }> = [
+    { name: "send", action: (chat) => ({ op: "send", chat_id: chat, content: "**hello** there" }) },
+    { name: "edit", action: (chat) => ({ op: "edit", chat_id: chat, message_id: "WAOUT1", content: "revised" }) },
+    { name: "typing", action: (chat) => ({ op: "typing", chat_id: chat }) },
+    { name: "get_chat_info", action: (chat) => ({ op: "get_chat_info", chat_id: chat }) },
+  ];
+
+  async function withWhatsAppConnector(
+    routes: Record<string, ChatRoute>,
+    fn: (h: { port: number; telegram: FakeTelegram; whatsapp: RecordingWhatsApp; lines: string[] }) => Promise<void>,
+    options: { client?: boolean } = {},
+  ): Promise<void> {
+    const telegram = new FakeTelegram();
+    const whatsapp = new RecordingWhatsApp();
+    const lines: string[] = [];
+    const connector = new RelayConnector({
+      gatewaySecrets: [SECRET],
+      telegram,
+      port: 0,
+      log: (l) => lines.push(l),
+      resolveRoute: async (chatId) => routes[chatId] ?? { kind: "unbound" },
+      ...(options.client === false ? {} : { whatsapp: whatsapp as never, whatsappAddressOf: async (alias: string) => (alias === WA_GROUP ? REAL_GROUP : alias === WA_PRIVATE ? "100000000000001@lid" : null) }),
+    });
+    await connector.listen();
+    try {
+      await fn({ port: connector.address!, telegram, whatsapp, lines });
+    } finally {
+      await connector.close();
+    }
+  }
+
+  async function askAs(port: number, as: string, action: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const { ws, frames } = await dial(port, makeUpgradeToken(as, SECRET, 300));
+    sendFrame(ws, { type: "outbound", requestId: "req_wa", action });
+    const reply = await waitFor(() => frames.find((f) => f.type === "outbound_result"));
+    ws.close();
+    return reply.result as Record<string, unknown>;
+  }
+
+  const telegramCalls = (t: FakeTelegram) => t.sent.length + t.edited.length + t.typing.length + t.infoCalls.length;
+
+  for (const op of OPS) {
+    test(`AC-20 ${op.name}: a WhatsApp binding on a relay with no WhatsApp client is PLATFORM_UNAVAILABLE, and Telegram is never called`, async () => {
+      await withWhatsAppConnector({ [WA_GROUP]: waRoute }, async (h) => {
+        const result = await askAs(h.port, GW, op.action(WA_GROUP));
+        assert.deepEqual(result, { success: false, error: "PLATFORM_UNAVAILABLE" });
+        assert.equal(telegramCalls(h.telegram), 0);
+      }, { client: false });
+    });
+
+    test(`AC-24 ${op.name}: a WhatsApp alias whose row says Telegram is refused, and neither transport is called`, async () => {
+      await withWhatsAppConnector({ [WA_GROUP]: tgRoute }, async (h) => {
+        const result = await askAs(h.port, GW, op.action(WA_GROUP));
+        assert.deepEqual(result, { success: false, error: CHAT_NOT_IN_SCOPE });
+        assert.equal(telegramCalls(h.telegram), 0);
+        assert.equal(h.whatsapp.calls.length, 0);
+        const line = h.lines.map((l) => JSON.parse(l) as Record<string, unknown>).find((l) => l.event === "relay.outbound_out_of_scope");
+        assert.equal(line?.reason, "platform_mismatch");
+        assert.equal(line?.chat_kind, "group", "chat_kind comes from chatKind(), so a WhatsApp alias is classified by its shape");
+        assert.ok(!h.lines.join("\n").includes(WA_GROUP), "the alias is logged only as a digest");
+      });
+    });
+
+    test(`AC-24 ${op.name}: a Telegram id whose row says WhatsApp is refused, and neither transport is called`, async () => {
+      await withWhatsAppConnector({ [TG_GROUP]: waRoute }, async (h) => {
+        const result = await askAs(h.port, GW, op.action(TG_GROUP));
+        assert.deepEqual(result, { success: false, error: CHAT_NOT_IN_SCOPE });
+        assert.equal(telegramCalls(h.telegram), 0);
+        assert.equal(h.whatsapp.calls.length, 0);
+      });
+    });
+
+    test(`AC-24 ${op.name}: a frame naming another trip's WhatsApp alias is refused CHAT_NOT_IN_SCOPE`, async () => {
+      await withWhatsAppConnector({ [WA_OTHER_TRIP]: otherTrip }, async (h) => {
+        const result = await askAs(h.port, GW, op.action(WA_OTHER_TRIP));
+        assert.deepEqual(result, { success: false, error: CHAT_NOT_IN_SCOPE });
+        assert.equal(telegramCalls(h.telegram), 0);
+        assert.equal(h.whatsapp.calls.length, 0);
+      });
+    });
+  }
+
+  test("AC-24: the caller's own WhatsApp chat goes through the bridge, to the row's real address, converted; Telegram is not called", async () => {
+    await withWhatsAppConnector({ [WA_GROUP]: waRoute, [TG_GROUP]: tgRoute }, async (h) => {
+      const sent = await askAs(h.port, GW, OPS[0]!.action(WA_GROUP));
+      assert.equal(sent.success, true);
+      assert.equal(sent.message_id, "WAOUT1");
+      assert.deepEqual(h.whatsapp.calls[0], { op: "send", chatId: REAL_GROUP, text: "*hello* there" });
+      assert.equal((await askAs(h.port, GW, OPS[1]!.action(WA_GROUP))).success, true, "an edit of a message the number sent here");
+      assert.equal((await askAs(h.port, GW, OPS[2]!.action(WA_GROUP))).success, true);
+      const info = await askAs(h.port, GW, OPS[3]!.action(WA_GROUP));
+      assert.deepEqual(info, { success: true, name: "Family", type: "group" });
+      assert.equal(telegramCalls(h.telegram), 0);
+      // The same connector still serves Telegram for a Telegram row.
+      const tg = await askAs(h.port, GW, { op: "send", chat_id: TG_GROUP, content: "hi" });
+      assert.equal(tg.success, true);
+      assert.equal(h.telegram.sent.length, 1);
+      assert.equal(h.whatsapp.calls.filter((c) => c.op === "send").length, 1, "the Telegram send did not touch the bridge");
+    });
+  });
+
+  test("AC-24: an edit of a message the number did not send in that chat is refused before the bridge is asked", async () => {
+    await withWhatsAppConnector({ [WA_GROUP]: waRoute, [WA_PRIVATE]: waRoute }, async (h) => {
+      await askAs(h.port, GW, OPS[0]!.action(WA_PRIVATE)); // WAOUT1 is sent in the PRIVATE chat
+      const result = await askAs(h.port, GW, { op: "edit", chat_id: WA_GROUP, message_id: "WAOUT1", content: "x" });
+      assert.deepEqual(result, { success: false, error: "EDIT_REFUSED" });
+      assert.equal(h.whatsapp.calls.filter((c) => c.op === "edit").length, 0);
+    });
+  });
+
+  test("AC-24: a reply_to that is not a message of the same chat is dropped, and the text still goes, unquoted", async () => {
+    await withWhatsAppConnector({ [WA_GROUP]: waRoute, [WA_PRIVATE]: waRoute }, async (h) => {
+      await askAs(h.port, GW, OPS[0]!.action(WA_PRIVATE)); // WAOUT1, in the private chat
+      const result = await askAs(h.port, GW, { op: "send", chat_id: WA_GROUP, content: "answer", reply_to: "WAOUT1" });
+      assert.equal(result.success, true);
+      const last = h.whatsapp.calls.at(-1)!;
+      assert.equal(last.chatId, REAL_GROUP);
+      assert.equal(last.replyTo, undefined, "a message of another chat is never quoted");
+    });
+  });
+});

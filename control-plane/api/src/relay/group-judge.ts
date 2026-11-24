@@ -130,6 +130,11 @@ export interface JudgePromptInput {
   /** The trip's assistant names, both languages. */
   assistantNames: readonly string[];
   language: "he" | "en";
+  /**
+   * The chat's platform, for the one line that names it. Absent is Telegram, so a
+   * Telegram prompt is byte-identical to what it was before WhatsApp (#625 S3).
+   */
+  platform?: "telegram" | "whatsapp";
 }
 
 /** A name the organizer chose, reduced to what is safe to print on one prompt line. */
@@ -147,7 +152,7 @@ export function buildJudgePrompt(input: JudgePromptInput): string {
   const language = input.language === "he" ? "Hebrew" : "English";
   const message = JSON.stringify(input.text.slice(0, MAX_JUDGED_CHARS));
   return [
-    `You are a filter in a family's trip group chat on Telegram. An AI trip assistant, named ${nameList}, is a member of the chat. Most messages are people talking to each other. Decide whether the message below is meant for the assistant.`,
+    `You are a filter in a family's trip group chat on ${input.platform === "whatsapp" ? "WhatsApp" : "Telegram"}. An AI trip assistant, named ${nameList}, is a member of the chat. Most messages are people talking to each other. Decide whether the message below is meant for the assistant.`,
     "",
     "Answer YES (for_assistant true) when the message:",
     "- asks something about the trip: the plan or itinerary, a hotel, check-in or check-out, bookings, tickets, times, directions, opening hours, the weather, what to do or eat nearby, what to pack;",
