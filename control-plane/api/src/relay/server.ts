@@ -57,7 +57,7 @@ import { organizerDocumentRouteFromEnv } from "../document-correction.js";
 import { groupJudgeFromEnv } from "./group-judge.js";
 import { OutageNoticeLimiter } from "./dispatch.js";
 import { startWhatsAppLoop } from "./whatsapp/poller.js";
-import { createWhatsAppTransport, whatsappRuntimeConfig, type WhatsAppRuntimeConfig } from "./whatsapp/runtime.js";
+import { WhatsAppConfigError, createWhatsAppTransport, whatsappRuntimeConfig, type WhatsAppRuntimeConfig, type WhatsAppTransport } from "./whatsapp/runtime.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
 
@@ -149,6 +149,16 @@ interface Runtime {
   whatsapp?: WhatsAppRuntimeConfig;
 }
 
+/** The one line a WhatsApp block that cannot work leaves, naming the field and the rule (never a value). */
+function whatsappDisabled(error: unknown): void {
+  const known = error instanceof WhatsAppConfigError;
+  log(structuredLog("error", "relay.whatsapp_disabled", {
+    field: known ? error.field : "relay.whatsapp",
+    reason: known ? error.reason : (error instanceof Error ? error.name : "UNKNOWN"),
+    effect: "WhatsApp is off on this relay: no bridge connection, WhatsApp chats answered PLATFORM_UNAVAILABLE; Telegram unaffected",
+  }));
+}
+
 async function serveRuntime(path: string): Promise<Runtime> {
   const profile = await loadArchitectureProfile(path);
   if (!profile.relay) {
@@ -188,16 +198,15 @@ async function serveRuntime(path: string): Promise<Runtime> {
     ...(relay.gateway_key_mode === "both" ? { hint: "accepts shared and derived keys; move to derived once every gateway is re-keyed" } : {}),
   }));
 
-  // WhatsApp (#625 S3): absent block, nothing built and nothing read; a present block that
-  // cannot work refuses to start, naming the field and never its value.
+  // WhatsApp (#625 S3): absent block, nothing built and nothing read. A present block that
+  // cannot work disables WHATSAPP ONLY (owner's decision 2026-11-24): one error line naming the
+  // field and the rule, never a value; no loop, no bridge connection; every action for a
+  // WhatsApp chat answers PLATFORM_UNAVAILABLE (the connector has no client); Telegram as ever.
   let whatsapp: WhatsAppRuntimeConfig | null = null;
   try {
     whatsapp = await whatsappRuntimeConfig(relay.whatsapp, resolveSecretRef);
   } catch (error) {
-    log(structuredLog("error", "relay.whatsapp_invalid", {
-      problem: error instanceof Error ? error.message : "UNKNOWN",
-    }));
-    process.exit(1);
+    whatsappDisabled(error);
   }
   log(structuredLog("info", "relay.whatsapp", { configured: whatsapp !== null }));
 
@@ -422,7 +431,15 @@ async function main(): Promise<void> {
 
   // One client, ledger and state line shared by the connector (outbound) and the loop
   // (inbound); only with a `relay.whatsapp` block AND a database (serve mode).
-  const whatsapp = runtime.whatsapp && runtime.db ? createWhatsAppTransport(runtime.whatsapp, log) : null;
+  let whatsapp: WhatsAppTransport | null = null;
+  if (runtime.whatsapp && runtime.db) {
+    try {
+      whatsapp = createWhatsAppTransport(runtime.whatsapp, log);
+    } catch (error) {
+      // The client re-checks what whatsappRuntimeConfig checked; a refusal here is still WhatsApp's alone.
+      whatsappDisabled(error);
+    }
+  }
 
   const connector = new RelayConnector({
     gatewaySecrets: runtime.gatewaySecrets,

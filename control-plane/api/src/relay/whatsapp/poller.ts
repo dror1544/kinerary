@@ -27,10 +27,14 @@
  *      whose person link's membership has ended: closed and dropped (AC-14).
  *   8. Everything else goes to `companionGate`, and its decision is applied here.
  *
- * WHAT THE RELAY SAYS BY ITSELF (spec, "complete list"): the fixed line answering a code,
- * the group introduction, and the owner's notice. The gate's own `reply` decisions (the
- * companion-pending and companion-unavailable lines) and Telegram's "gateway unavailable"
- * notice are NOT on that list, so on WhatsApp they are withheld and logged.
+ * WHAT THE RELAY SAYS BY ITSELF: the fixed line answering a code, the group introduction, the
+ * owner's notice, and (owner's decision 2026-11-24) the gate's "companion is down" lines:
+ * "still finishing your assistant" for a trip whose companion was never announced, and "I'm
+ * off for now" for one that was and is unreachable, worded as on Telegram. Each goes to a
+ * private chat, or to a group only when the message addressed the companion, and at most
+ * once per chat per window (Telegram's OutageNoticeLimiter). Still withheld: the "gateway
+ * unavailable" notice for a turn lost between the reachability check and the push
+ * (`whatsapp.turn_lost`).
  *
  * NOTHING IDENTIFYING IS LOGGED. Log lines carry reason codes, counts and booleans; never
  * a chat id, an alias, a sender, a name, a title or text.
@@ -57,6 +61,8 @@ import { featureEnabled } from "../../feature-switches.js";
 import { chatKind, isAcceptedWhatsAppGroupId, whatsappChatAlias, whatsappOpaqueId } from "../../identity.js";
 import { structuredLog } from "../../redaction.js";
 import type { InboundFacts } from "../../analytics/relay-facts.js";
+import { isAddressedToAssistant } from "../addressing.js";
+import { DEFAULT_STRINGS, OutageNoticeLimiter } from "../dispatch.js";
 import { companionGate, type GateDecision, type GateDeps, type GateOutcome, type InboundTurn, type MediaStore } from "../companion-gate.js";
 import { GroupContext } from "../group-context.js";
 import type { GroupJudge, JudgeOutcome } from "../group-judge.js";
@@ -129,8 +135,12 @@ export interface WhatsAppLoopDeps {
   /** The media plane the gateway fetches re-hosted attachments from. Absent: text only. */
   media?: { store: MediaStore; baseUrl: string; log?: (line: string) => void };
   assistantEvents?: WhatsAppAssistantEvents;
+  /**
+   * At most one "the companion is down" line per chat per window: Telegram's own limiter (OutageNoticeLimiter, #179),
+   * applied here to every such line this loop sends, private or group. Absent: one of its own.
+   */
   outageNotices?: { allow(chatId: string): boolean };
-  /** The gate's fixed pending text. Never SENT on WhatsApp (see the header); the gate needs a value. */
+  /** The line for a trip whose companion has not been announced as up: Telegram's own (DEFAULT_STRINGS) unless given. */
   companionPendingText?: string;
   unboundPrivateMessage?: UnboundPrivateMessageHook;
 }
@@ -325,14 +335,14 @@ class WhatsAppEventHandler {
   private readonly log: (line: string) => void;
   private readonly pendingAttachments: PendingAttachments;
   private readonly groupContext: GroupContext;
-  private readonly outageNotices: { allow(chatId: string): boolean };
+  /** The once-per-window limiter for the "companion is down" lines (see `apply`). */
+  private readonly noticeLimiter: { allow(chatId: string): boolean };
 
   constructor(private readonly deps: WhatsAppLoopDeps) {
     this.log = deps.log ?? (() => {});
     this.pendingAttachments = deps.pendingAttachments ?? new PendingAttachments();
     this.groupContext = deps.groupContext ?? new GroupContext();
-    // Never consulted for a SEND on WhatsApp (the gate's reply is withheld), but the gate asks.
-    this.outageNotices = deps.outageNotices ?? { allow: () => true };
+    this.noticeLimiter = deps.outageNotices ?? new OutageNoticeLimiter();
   }
 
   setOwnIds(ids: ReadonlyArray<string | null>): void {
@@ -520,7 +530,16 @@ class WhatsAppEventHandler {
       ? { kind: "event", event: this.eventOf(turn, resolution.route.hermesProfile), route: resolution.route }
       : { kind: "dropped", reason: resolution.reason, ...(resolution.route ? { route: resolution.route } : {}) };
     const decision = await companionGate(turn, outcome, this.gateDeps(m.chatId, pass));
-    await this.apply(decision, m, alias);
+    await this.apply(decision, m, alias, {
+      chatType: turn.chatType,
+      // The gate's own addressing rule (pendingTurn's), for a `reply` to a group: chatter is never answered.
+      addressed: () => isAddressedToAssistant({
+        chatType: turn.chatType,
+        text: turn.text,
+        assistantNames: route.assistantNames,
+        isReplyToAssistant: turn.isReplyToAssistant,
+      }),
+    });
   }
 
   private turnOf(
@@ -611,14 +630,21 @@ class WhatsAppEventHandler {
       ...(pass.defer ? { deferJudge: true } : {}),
       ...(pass.judgedOutcome !== undefined ? { judgedOutcome: pass.judgedOutcome } : {}),
       ...(this.deps.assistantEvents ? { assistantEvents: true } : {}),
-      outageNotices: this.outageNotices,
-      companionPendingText: this.deps.companionPendingText ?? "",
+      // The window is applied ONCE, by the WhatsApp sink, to every line it sends (private and group alike); the gate is
+      // given a limiter that allows, so the same chat is not counted twice.
+      outageNotices: { allow: () => true },
+      companionPendingText: this.deps.companionPendingText ?? DEFAULT_STRINGS.companionPending,
       platformWording: "whatsapp",
     };
   }
 
   /** The WhatsApp sink for the gate's decisions. */
-  private async apply(decision: GateDecision, m: BridgeMessage, alias: string): Promise<void> {
+  private async apply(
+    decision: GateDecision,
+    m: BridgeMessage,
+    alias: string,
+    turn: { chatType: InboundTurn["chatType"]; addressed: () => boolean },
+  ): Promise<void> {
     const events = this.deps.assistantEvents;
     switch (decision.kind) {
       case "to_gateway": {
@@ -642,10 +668,22 @@ class WhatsAppEventHandler {
         await this.handle(m, { defer: false, judgedOutcome: judged });
         return;
       }
-      case "reply":
+      case "reply": {
+        // The gate's only `reply` decisions are the "companion is down" lines (pending or unavailable). Sent as plain
+        // text, to a private chat or to a group message that addressed the companion, once per chat per window.
         if (decision.analytics) events?.companionUnreachable(alias, decision.analytics);
-        this.log(structuredLog("info", "whatsapp.relay_reply_withheld", { reason: "not_a_whatsapp_fixed_line" }));
+        if (turn.chatType !== "dm" && !turn.addressed()) {
+          this.log(structuredLog("info", "whatsapp.companion_notice", { sent: false, reason: "not_addressed" }));
+          return;
+        }
+        if (!this.noticeLimiter.allow(alias)) {
+          this.log(structuredLog("info", "whatsapp.companion_notice", { sent: false, reason: "notice_limited" }));
+          return;
+        }
+        const sent = await this.say({ alias, address: m.chatId }, decision.reply.text);
+        this.log(structuredLog(sent ? "info" : "warn", "whatsapp.companion_notice", sent ? { sent: true } : { sent: false, reason: "send_failed" }));
         return;
+      }
       case "drop":
         if (decision.analytics) events?.notAddressed(decision.analytics);
         return this.drop(decision.reason);

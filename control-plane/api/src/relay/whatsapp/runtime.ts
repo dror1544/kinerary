@@ -7,12 +7,14 @@
  * nothing is built, no secret is read and no connection to a bridge is attempted. The
  * relay is exactly what it was.
  *
- * PRESENT IS STRICT. A block that is there but cannot work refuses to start with a
- * message naming the field (never its value): the bridge URL must be exactly
- * `http://127.0.0.1:<port>` (the schema also admits `localhost` and `[::1]`, which the
- * bridge never binds and the client refuses), the bridge secret must resolve to at
- * least 32 characters, and the sender-id key to at least 32 bytes. A relay that started
- * anyway would look healthy and drop every WhatsApp message.
+ * PRESENT IS STRICT, AND ITS FAILURE IS WHATSAPP'S ALONE. A block that is there but cannot
+ * work is refused with a `WhatsAppConfigError` naming the field and the rule (never a value):
+ * the bridge URL must be exactly `http://127.0.0.1:<port>` (the schema also admits `localhost`
+ * and `[::1]`, which the bridge never binds and the client refuses), both secret refs must
+ * resolve, the bridge secret to at least 32 characters and the sender-id key to at least 32
+ * bytes, and the two must differ. The relay then runs WITHOUT WhatsApp (owner's decision
+ * 2026-11-24): one `relay.whatsapp_disabled` line, no loop, no bridge connection, every
+ * action for a WhatsApp chat answered PLATFORM_UNAVAILABLE, and Telegram served as ever.
  */
 import { CodeAttemptLimiter } from "../../chat-binding-codes.js";
 import { WHATSAPP_MIN_KEY_BYTES } from "../../identity.js";
@@ -36,13 +38,21 @@ export interface WhatsAppRuntimeConfig {
   codeAttemptsPerHour: number;
 }
 
-/** Why a present block cannot start. The message names the field and the rule, never a value. */
+/** Why a present block cannot work. `field` and `reason` (and the message) name the field and the rule, never a value. */
 export class WhatsAppConfigError extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly field: string;
+  readonly reason: string;
+  constructor(field: string, reason: string) {
+    super(`${field} ${reason}`);
     this.name = "WhatsAppConfigError";
+    this.field = field;
+    this.reason = reason;
   }
 }
+
+const BRIDGE_URL = "relay.whatsapp.bridge_url";
+const BRIDGE_SECRET = "relay.whatsapp.bridge_secret_ref";
+const SENDER_KEY = "relay.whatsapp.sender_id_secret_ref";
 
 export async function whatsappRuntimeConfig(
   block: WhatsAppProfileBlock | undefined,
@@ -53,27 +63,29 @@ export async function whatsappRuntimeConfig(
   try {
     bridgeUrl = whatsappBridgeUrl(block.bridge_url);
   } catch (error) {
-    throw new WhatsAppConfigError(error instanceof Error ? error.message : "relay.whatsapp.bridge_url is invalid");
+    const message = error instanceof Error ? error.message : "";
+    // whatsappBridgeUrl's own words, without the field name it starts with.
+    throw new WhatsAppConfigError(BRIDGE_URL, message.startsWith(`${BRIDGE_URL} `) ? message.slice(BRIDGE_URL.length + 1) : "is invalid");
   }
   const [secretRaw, keyRaw] = await Promise.all([
     resolveSecretRef(block.bridge_secret_ref).catch(() => {
-      throw new WhatsAppConfigError("relay.whatsapp.bridge_secret_ref could not be resolved");
+      throw new WhatsAppConfigError(BRIDGE_SECRET, "could not be resolved");
     }),
     resolveSecretRef(block.sender_id_secret_ref).catch(() => {
-      throw new WhatsAppConfigError("relay.whatsapp.sender_id_secret_ref could not be resolved");
+      throw new WhatsAppConfigError(SENDER_KEY, "could not be resolved");
     }),
   ]);
   const bridgeSecret = secretRaw.trim();
   if (bridgeSecret.length < 32 || /\s/.test(bridgeSecret)) {
-    throw new WhatsAppConfigError("relay.whatsapp.bridge_secret_ref must resolve to at least 32 characters with no whitespace");
+    throw new WhatsAppConfigError(BRIDGE_SECRET, "must resolve to at least 32 characters with no whitespace");
   }
   const senderKey = keyRaw.trim();
   if (Buffer.byteLength(senderKey) < WHATSAPP_MIN_KEY_BYTES) {
-    throw new WhatsAppConfigError(`relay.whatsapp.sender_id_secret_ref must resolve to at least ${WHATSAPP_MIN_KEY_BYTES} bytes`);
+    throw new WhatsAppConfigError(SENDER_KEY, `must resolve to at least ${WHATSAPP_MIN_KEY_BYTES} bytes`);
   }
   if (senderKey === bridgeSecret) {
     // One leaked value would then both reach the bridge and make every opaque id reversible by enumeration.
-    throw new WhatsAppConfigError("relay.whatsapp.sender_id_secret_ref must not resolve to the same value as bridge_secret_ref");
+    throw new WhatsAppConfigError(SENDER_KEY, "must not resolve to the same value as bridge_secret_ref");
   }
   return { bridgeUrl, bridgeSecret, senderKey, codeAttemptsPerHour: block.code_attempts_per_hour };
 }

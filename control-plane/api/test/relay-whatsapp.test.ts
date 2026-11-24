@@ -10,6 +10,7 @@ import type pg from "pg";
 import { issueChatBindingCode } from "../src/chat-binding-codes.js";
 import { buildJudgePrompt } from "../src/relay/group-judge.js";
 import { SILENCE_SENTINEL, addressedMark, whatsappMark } from "../src/relay/stay-silent.js";
+import { DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { WHATSAPP_WIRE_PLATFORM, rewriteMentions, whatsappSenderName } from "../src/relay/whatsapp/poller.js";
 import { WhatsAppConfigError, whatsappRuntimeConfig } from "../src/relay/whatsapp/runtime.js";
 import { FAKE_OWN } from "../tools/fake-whatsapp.js";
@@ -510,16 +511,16 @@ describe("the WhatsApp loop, end to end on the stand-in", { skip: SKIP }, () => 
     } finally { await done(); }
   });
 
-  test("the gate's own fixed replies are not WhatsApp lines: with the companion unreachable, a private message gets nothing from the relay, and the withholding is logged", async () => {
+  test("owner's decision 2026-11-24: with the companion unreachable, a private message gets the gate's line through the bridge, as plain text (the full matrix is relay-whatsapp-companion-down.test.ts)", async () => {
     const { relay, trip, gateway, done } = await scene();
     try {
       await bindPrivate(pool, trip, ALICE);
       gateway.close();
       await waitFor(() => !relay.connector.canReachProfile(trip.profile), 3000, "gateway gone");
       relay.fake.control.message({ chatId: ALICE, senderId: ALICE, text: "hello, are you there?", messageId: "WAW1" });
-      await relay.until("whatsapp.relay_reply_withheld", { reason: "not_a_whatsapp_fixed_line" });
-      console.log(`EVIDENCE spec "complete list": companion unreachable -> bridge sends=${JSON.stringify(relay.fake.control.sent())}; ${JSON.stringify(relay.events("whatsapp.relay_reply_withheld"))}`);
-      assert.deepEqual(relay.fake.control.sent(), []);
+      await relay.until("whatsapp.companion_notice", { sent: true });
+      console.log(`EVIDENCE companion unreachable (never announced) -> bridge sends=${JSON.stringify(sends(relay).map((s) => ({ to: s.chatId === ALICE ? "<the chat>" : "<other>", text: s.text })))}`);
+      assert.deepEqual(sends(relay).map((s) => [s.chatId, s.text]), [[ALICE, DEFAULT_STRINGS.companionPending]]);
     } finally { await done(); }
   });
 

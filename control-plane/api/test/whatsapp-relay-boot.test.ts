@@ -5,16 +5,23 @@
  *
  *   - no `relay.whatsapp` block: the relay serves, and the stand-in receives NO request;
  *   - a valid block: the relay asks the stand-in for its health, with the bearer secret;
- *   - a block that cannot work (`localhost`): the relay refuses to start, naming the field.
+ *   - a block that cannot work (a `localhost` URL, a ref that does not resolve, a short
+ *     secret or key, a sender key equal to the bridge secret): WhatsApp alone is disabled
+ *     (owner's decision 2026-11-24). The relay comes up and serves Telegram, logs one
+ *     `relay.whatsapp_disabled` line naming the field, contacts no bridge, and answers every
+ *     action for a WhatsApp chat PLATFORM_UNAVAILABLE.
  *
- * Telegram is pointed at a closed loopback port (TELEGRAM_API_ROOT), so nothing leaves
- * this machine. Only the child processes this file starts are ever stopped.
+ * Telegram is a loopback stand-in (TELEGRAM_API_ROOT) that records the methods called, so
+ * nothing leaves this machine. Only the child processes this file starts are ever stopped.
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
+import { createServer as createHttpServer, type Server } from "node:http";
+import { WebSocket } from "ws";
+import { makeUpgradeToken } from "../src/relay/protocol.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -22,7 +29,7 @@ import { fileURLToPath } from "node:url";
 import type pg from "pg";
 import { startFakeWhatsApp, type FakeWhatsApp } from "../tools/fake-whatsapp.js";
 import { testDatabaseUrl } from "./support/test-database.js";
-import { freshDatabase } from "./support/whatsapp-fixture.js";
+import { freshDatabase, mkWhatsappTrip, openBinding, waGroupAddress, waGroupId } from "./support/whatsapp-fixture.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -63,7 +70,47 @@ async function profileWith(whatsapp: Record<string, unknown> | null): Promise<Re
 
 interface Booted { stderr: () => string; exited: () => number | null; stop: () => Promise<void> }
 
-async function boot(profile: Record<string, unknown>): Promise<Booted> {
+const GATEWAY_SECRET = "boot-gateway-secret-boot-gateway";
+
+/** A loopback stand-in for the Telegram Bot API: answers every method, records which were called. */
+interface FakeTelegramApi { root: string; methods: string[]; close(): Promise<void> }
+async function startTelegramApi(): Promise<FakeTelegramApi> {
+  const methods: string[] = [];
+  const server: Server = createHttpServer((req, res) => {
+    const method = (req.url ?? "").split("?")[0]!.split("/").at(-1) ?? "";
+    methods.push(method);
+    const result = method === "getMe" ? { id: 4242, is_bot: true, first_name: "Boot", username: "boot_test_bot" }
+      : method === "getUpdates" ? []
+      : method === "sendMessage" ? { message_id: methods.length, chat: { id: 0 }, date: 0 }
+      : true;
+    const reply = () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, result }));
+    };
+    // A long poll that returns empty at once makes the poller back off; a short wait keeps it polling normally.
+    if (method === "getUpdates") setTimeout(reply, 200); else reply();
+  });
+  const port = await new Promise<number>((resolve) => server.listen(0, "127.0.0.1", () => resolve((server.address() as { port: number }).port)));
+  return {
+    root: `http://127.0.0.1:${port}`,
+    methods,
+    close: () => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }),
+  };
+}
+
+/** One outbound action from a gateway, as Hermes sends it; returns the outbound_result. */
+async function act(port: number, profile: string, action: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/relay`, { headers: { authorization: `Bearer ${makeUpgradeToken(profile, GATEWAY_SECRET, 300)}` } });
+  const frames: Record<string, unknown>[] = [];
+  ws.on("message", (raw) => { for (const line of String(raw).split("\n")) if (line.trim()) frames.push(JSON.parse(line)); });
+  await new Promise<void>((resolve, reject) => { ws.once("open", () => resolve()); ws.once("error", reject); });
+  ws.send(`${JSON.stringify({ type: "outbound", requestId: "req_boot", action })}\n`);
+  await until(() => frames.some((f) => f.type === "outbound_result"), 5000, "outbound_result");
+  ws.close();
+  return frames.find((f) => f.type === "outbound_result")!.result as Record<string, unknown>;
+}
+
+async function boot(profile: Record<string, unknown>, telegramRoot?: string): Promise<Booted> {
   const directory = await mkdtemp(join(tmpdir(), "kinerary-wa-relay-boot-"));
   const profilePath = join(directory, "architecture.json");
   await writeFile(profilePath, JSON.stringify(profile), "utf8");
@@ -74,12 +121,12 @@ async function boot(profile: Record<string, unknown>): Promise<Booted> {
       HOME: process.env.HOME ?? "/tmp",
       CONTROL_PLANE_ARCHITECTURE_PROFILE: profilePath,
       CONTROL_PLANE_DATABASE_URL: databaseUrl!,
-      BOOT_GATEWAY_SECRET: "boot-gateway-secret-boot-gateway",
+      BOOT_GATEWAY_SECRET: GATEWAY_SECRET,
       BOOT_TELEGRAM_TOKEN: "123456:boot-test-token",
       BOOT_BRIDGE_SECRET: BRIDGE_SECRET,
       BOOT_SENDER_KEY: SENDER_KEY,
-      // Telegram is a closed loopback port: nothing leaves this machine.
-      TELEGRAM_API_ROOT: `http://127.0.0.1:${await freePort()}`,
+      // Telegram is a loopback stand-in, or a closed loopback port: nothing leaves this machine.
+      TELEGRAM_API_ROOT: telegramRoot ?? `http://127.0.0.1:${await freePort()}`,
       RELAY_GATEWAY_WAIT_SECONDS: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -159,19 +206,54 @@ describe("AC-20: the real relay entrypoint starts WhatsApp only with a relay.wha
     } finally { await relay.stop(); }
   });
 
-  test("a block that cannot work refuses to start, naming the field and never a value, and contacts nothing", async () => {
-    for (const over of [{ bridge_url: fake.url.replace("127.0.0.1", "localhost") }, { sender_id_secret_ref: "env://BOOT_TELEGRAM_TOKEN" }]) {
+  // Owner's decision 2026-11-24: a WhatsApp block that cannot work disables WhatsApp, never the relay.
+  const unusable: Array<{ name: string; over: Record<string, unknown>; field: RegExp }> = [
+    { name: "a bridge_url the bridge never binds (localhost)", over: { bridge_url: "LOCALHOST" }, field: /^relay\.whatsapp\.bridge_url$/ },
+    { name: "a bridge secret ref that does not resolve", over: { bridge_secret_ref: "env://BOOT_NOT_SET" }, field: /^relay\.whatsapp\.bridge_secret_ref$/ },
+    { name: "a bridge secret that is too short", over: { bridge_secret_ref: "env://BOOT_TELEGRAM_TOKEN" }, field: /^relay\.whatsapp\.bridge_secret_ref$/ },
+    { name: "a sender-id key that is too short", over: { sender_id_secret_ref: "env://BOOT_TELEGRAM_TOKEN" }, field: /^relay\.whatsapp\.sender_id_secret_ref$/ },
+    { name: "a sender-id key equal to the bridge secret", over: { sender_id_secret_ref: "env://BOOT_BRIDGE_SECRET" }, field: /^relay\.whatsapp\.sender_id_secret_ref$/ },
+  ];
+  for (const bad of unusable) {
+    test(`${bad.name}: WhatsApp is disabled, the relay comes up and serves Telegram, no bridge is contacted, and a WhatsApp chat is PLATFORM_UNAVAILABLE`, async () => {
       fake.control.reset();
-      const relay = await boot(await profileWith(block(fake, over)));
+      const telegram = await startTelegramApi();
+      const { tripId } = await mkWhatsappTrip(pool);
+      const profileId = `gw-boot-${randomBytes(4).toString("hex")}`;
+      const waChat = waGroupId();
+      const tgChat = `-100${Math.floor(1e9 + Math.random() * 8e9)}`;
+      await openBinding(pool, { tripId, chatId: waChat, platform: "whatsapp", profile: profileId, transportAddress: waGroupAddress() });
+      await openBinding(pool, { tripId, chatId: tgChat, platform: "telegram", profile: profileId });
+      const over = bad.over.bridge_url === "LOCALHOST" ? { bridge_url: fake.url.replace("127.0.0.1", "localhost") } : bad.over;
+      const prof = await profileWith(block(fake, over));
+      const relay = await boot(prof, telegram.root);
       try {
-        await until(() => relay.exited() !== null, 30_000, "exit");
-        const line = relay.stderr().split("\n").find((l) => l.includes("relay.whatsapp_invalid")) ?? "";
-        console.log(`EVIDENCE AC-20 unusable block ${JSON.stringify(Object.keys(over))}: exit=${relay.exited()} line=${line}`);
-        assert.equal(relay.exited(), 1);
-        assert.match(line, /relay\.whatsapp\.(bridge_url|sender_id_secret_ref)/);
-        assert.ok(!relay.stderr().includes(BRIDGE_SECRET) && !relay.stderr().includes("boot-test-token"));
-        assert.deepEqual(fake.control.requests(), []);
-      } finally { await relay.stop(); }
-    }
-  });
+        await until(() => relay.stderr().includes('"event":"relay.ready"') || relay.exited() !== null, 30_000, "relay.ready");
+        assert.equal(relay.exited(), null, `the relay must not exit:\n${relay.stderr()}`);
+        await until(() => telegram.methods.includes("getUpdates"), 10_000, "Telegram polling");
+        const port = (prof.relay as { port: number }).port;
+        const waResult = await act(port, profileId, { op: "send", chat_id: waChat, content: "hello" });
+        const tgResult = await act(port, profileId, { op: "send", chat_id: tgChat, content: "hello" });
+        await new Promise((r) => setTimeout(r, 500));
+        const lines = relay.stderr().split("\n").filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as Record<string, unknown>);
+        const disabled = lines.filter((l) => l.event === "relay.whatsapp_disabled");
+        const ready = lines.find((l) => l.event === "relay.ready");
+        console.log(`EVIDENCE round 2 item 2, ${bad.name}: disabled=${JSON.stringify(disabled)}; ready=${JSON.stringify(ready)}; telegram methods=${JSON.stringify([...new Set(telegram.methods)])}; whatsapp send -> ${JSON.stringify(waResult)}; telegram send -> ${JSON.stringify(tgResult)}; bridge requests=${JSON.stringify(fake.control.requests())}`);
+        assert.equal(disabled.length, 1, "one line");
+        assert.match(String(disabled[0]!.field), bad.field);
+        assert.equal(typeof disabled[0]!.reason, "string");
+        assert.equal(ready?.polling, true);
+        assert.equal(ready?.whatsapp, false);
+        assert.deepEqual(waResult, { success: false, error: "PLATFORM_UNAVAILABLE" });
+        assert.equal(tgResult.success, true, "Telegram served");
+        assert.ok(telegram.methods.includes("sendMessage"));
+        assert.deepEqual(fake.control.requests(), [], "no bridge connection");
+        assert.ok(!relay.stderr().includes("whatsapp.loop_started"));
+        for (const secret of [BRIDGE_SECRET, SENDER_KEY, "boot-test-token"]) assert.ok(!relay.stderr().includes(secret), "never a value");
+      } finally {
+        await relay.stop();
+        await telegram.close();
+      }
+    });
+  }
 });
