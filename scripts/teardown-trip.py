@@ -23,7 +23,8 @@ found a step that quietly undoes itself. This is that run's order, as a command:
   3. gateway    hermes gateway uninstall (+ launchctl bootout if launchd lags)
   4. bridge     unload any LaunchAgent whose program lives in this trip's
                 directory (a Mac bridge under launchd; KeepAlive would restart
-                a killed pid) and delete its plist; then stop this trip's
+                a killed pid) and move its plist aside, into the trip's
+                directory (launch-agents-retired/); then stop this trip's
                 trip-mcp, by its pid file, after checking the pid really is
                 the listener on this trip's port
   4b. bridge route  when KINERARY_SHARED_BRIDGE_ROUTES_DIR is set and holds
@@ -453,21 +454,54 @@ def agent_loaded(label: str) -> bool:
                           capture_output=True, text=True).returncode == 0
 
 
+def agent_gone(label: str, tries: int = 10, pause: float = 0.5) -> bool:
+    """True once launchd no longer knows *label*. A bootout returns before the service
+    is gone from `launchctl print` (a KeepAlive agent is torn down asynchronously), so a
+    single look straight after it can say "loaded" for an agent that is leaving. That read
+    left a plist behind on two staging trips on 2026-11-23 (#651): the run ended
+    "something remains", and every re-plan still listed the agent."""
+    for attempt in range(tries):
+        if not agent_loaded(label):
+            return True
+        if attempt + 1 < tries:
+            time.sleep(pause)
+    return False
+
+
+def retire_bridge_plist(plist: Path, trip_dir: Path) -> Path | None:
+    """Take a booted-out agent's plist out of ~/Library/LaunchAgents. It moves into the
+    trip's own directory (`launch-agents-retired/`), which teardown renames into
+    retired-trips, so nothing is lost; with no directory to receive it, it is deleted
+    (backup() has already copied it). Returns where it went, None if deleted."""
+    if trip_dir.is_dir():
+        aside = trip_dir / "launch-agents-retired"
+        try:
+            aside.mkdir(exist_ok=True)
+            target = aside / plist.name
+            shutil.move(str(plist), str(target))
+            return target
+        except OSError:
+            pass  # could not move it aside: removing it is what matters, the backup has a copy
+    plist.unlink(missing_ok=True)
+    return None
+
+
 def unload_bridge_agents(trip_dir: Path) -> list[tuple[str, bool]]:
-    """Boot each of this trip's LaunchAgents out, then delete its plist so a reboot
-    or a login cannot load it again. (label, unloaded) per agent. An agent still
-    loaded after the bootout KEEPS its plist: deleting it would leave a running
-    agent with nothing left to name it or boot it out by. backup() has already
-    copied every plist this deletes."""
+    """Boot each of this trip's LaunchAgents out, then take its plist out of
+    ~/Library/LaunchAgents so a reboot or a login cannot load it again. (label,
+    unloaded) per agent. An agent still loaded after the bootout KEEPS its plist:
+    removing it would leave a running agent with nothing left to name it or boot it out
+    by. "Not loaded and no plist" is done: an agent is found by its plist, so with none
+    there is nothing to plan and nothing to do."""
     if not MACOS:
         return []
     done = []
     for label, plist in bridge_launch_agents(trip_dir):
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True)
-        if agent_loaded(label):
+        if not agent_gone(label):
             done.append((label, False))
             continue
-        plist.unlink(missing_ok=True)
+        retire_bridge_plist(plist, trip_dir)
         done.append((label, True))
     return done
 

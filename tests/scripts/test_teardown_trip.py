@@ -780,6 +780,7 @@ class BridgeLaunchAgents(unittest.TestCase):
             calls.append(args)
             return mock.Mock(returncode=0 if (args[1] == "print" and still_loaded) else (113 if args[1] == "print" else 0))
         with mock.patch.object(teardown, "LAUNCH_AGENTS", agents), mock.patch.object(teardown, "MACOS", True), \
+             mock.patch.object(teardown.time, "sleep"), \
              mock.patch.object(teardown.subprocess, "run", side_effect=run):
             return teardown.unload_bridge_agents(trip), calls
 
@@ -791,13 +792,53 @@ class BridgeLaunchAgents(unittest.TestCase):
         plist = self._agent(agents, "com.example.bridge.italy", str(trip / "mcp/run-bridge.sh"))
         return trip, agents, plist
 
-    def test_unloading_boots_out_then_deletes_the_plist(self):
+    def test_unloading_boots_out_then_moves_the_plist_into_the_trip_directory(self):
+        # #651: "present and not loaded" - the plist leaves LaunchAgents, and is kept.
         with tempfile.TemporaryDirectory() as tmp:
             trip, agents, plist = self._fixture(tmp)
+            body = plist.read_bytes()
             done, calls = self._unload(trip, agents, still_loaded=False)
             self.assertEqual(done, [("com.example.bridge.italy", True)])
             self.assertEqual(calls[0][:2], ["launchctl", "bootout"])
             self.assertTrue(calls[0][2].endswith("/com.example.bridge.italy"))
+            self.assertFalse(plist.exists())
+            self.assertEqual((trip / "launch-agents-retired" / plist.name).read_bytes(), body)
+            # nothing is left for the next plan to list
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents):
+                self.assertEqual(teardown.bridge_launch_agents(trip), [])
+
+    def test_a_plist_is_deleted_when_the_trip_directory_is_not_there_to_receive_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trip, agents, plist = self._fixture(tmp)
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents):
+                teardown.retire_bridge_plist(plist, trip / "nowhere")
+            self.assertFalse(plist.exists())
+            self.assertFalse((trip / "nowhere").exists())
+
+    def test_no_plist_and_not_loaded_is_done(self):
+        # #651: "absent" - nothing is planned, nothing is booted out, nothing fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            trip, agents, plist = self._fixture(tmp)
+            plist.unlink()
+            done, calls = self._unload(trip, agents, still_loaded=False)
+            self.assertEqual(done, [])
+            self.assertEqual(calls, [])
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents):
+                self.assertEqual(teardown.bridge_launch_agents(trip), [])
+
+    def test_an_agent_launchd_is_still_dropping_is_given_time_before_it_counts_as_loaded(self):
+        # The bootout returns first; `launchctl print` can say "loaded" for a moment after it.
+        with tempfile.TemporaryDirectory() as tmp:
+            trip, agents, plist = self._fixture(tmp)
+            prints = iter([0, 0, 113])
+            def run(args, **kw):
+                return mock.Mock(returncode=next(prints) if args[1] == "print" else 0)
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents), mock.patch.object(teardown, "MACOS", True), \
+                 mock.patch.object(teardown.time, "sleep") as sleep, \
+                 mock.patch.object(teardown.subprocess, "run", side_effect=run):
+                done = teardown.unload_bridge_agents(trip)
+            self.assertEqual(done, [("com.example.bridge.italy", True)])
+            self.assertEqual(sleep.call_count, 2)
             self.assertFalse(plist.exists())
 
     def test_an_agent_still_loaded_after_bootout_keeps_its_plist_and_is_reported(self):
@@ -806,6 +847,7 @@ class BridgeLaunchAgents(unittest.TestCase):
             done, _ = self._unload(trip, agents, still_loaded=True)
             self.assertEqual(done, [("com.example.bridge.italy", False)])
             self.assertTrue(plist.exists())
+            self.assertFalse((trip / "launch-agents-retired").exists())
 
     def test_off_macos_nothing_is_unloaded(self):
         with tempfile.TemporaryDirectory() as tmp:

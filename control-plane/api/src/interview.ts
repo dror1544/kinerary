@@ -2825,14 +2825,63 @@ export async function markAwaitingMachine(
  * the whole mechanism — run 7 got most questions twice because nothing
  * arbitrated between the router and the interviewer.
  */
-export async function claimFloor(db: pg.Pool, chatId: string): Promise<boolean> {
+export async function claimFloor(
+  db: pg.Pool,
+  chatId: string,
+  /**
+   * Refuse while this question has been answered or skipped in the meantime.
+   *
+   * The caller that hands the floor back to the organizer does so because a question "is already on their screen" -
+   * a fact it read from a view, some queries ago. An organizer who taps within those queries has answered it, and a
+   * floor handed to them for a question they have just answered is a floor nobody will ever take back: that is the
+   * nightly stall of 2026-11-24. The check is in the same statement as the claim, so no answer can land between them.
+   */
+  options: { unlessAnswered?: string } = {},
+): Promise<boolean> {
+  const guard = options.unlessAnswered !== undefined;
   const result = await db.query(
     `UPDATE control_plane.intake_sessions
         SET awaiting = 'person', awaiting_since = now()
-      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND awaiting = 'machine' AND expired_at IS NULL`,
-    [chatId],
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND awaiting = 'machine' AND expired_at IS NULL
+        ${guard ? "AND NOT (answers ? $2) AND NOT COALESCE(ui_state->'skipped' ? $2, false)" : ""}`,
+    guard ? [chatId, options.unlessAnswered] : [chatId],
   );
   return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Interpret-path interviews whose organizer has ANSWERED the question on their screen, and then heard nothing for
+ * `graceSeconds`: the floor is theirs, the last thing sent was `q:<id>`, and `<id>` is on record.
+ *
+ * A candidate list, not a verdict. The caller reads each session's view and leaves alone every state in which the
+ * floor is legitimately the organizer's although the last question has an answer (a multi-select still being
+ * ticked, a suggestion or a change waiting on a yes, an Other awaiting its text, the recap).
+ *
+ * Why this exists: the stall watchdog (`claimStalledAgentTurns`) needs an open agent turn, which the interpret path
+ * never has, and the tick scan lists only `awaiting = 'machine'`. A floor handed to the organizer in error therefore
+ * has no one left watching it.
+ */
+export async function listAnsweredButSilentChats(
+  db: pg.Pool,
+  graceSeconds: number,
+  limit = 25,
+): Promise<string[]> {
+  const rows = await db.query<{ telegram_chat_id: string }>(
+    `SELECT telegram_chat_id
+       FROM control_plane.intake_sessions
+      WHERE awaiting = 'person'
+        AND state = 'interviewing'
+        AND interpret_path = true
+        AND telegram_chat_id IS NOT NULL
+        AND expired_at IS NULL
+        AND awaiting_since < now() - make_interval(secs => $1)
+        AND ui_state->>'last_prompt' ~ '^q:[a-z_0-9]+$'
+        AND answers ? substr(ui_state->>'last_prompt', 3)
+      ORDER BY awaiting_since
+      LIMIT $2`,
+    [graceSeconds, limit],
+  );
+  return rows.rows.map((r) => r.telegram_chat_id);
 }
 
 // ── Phases ────────────────────────────────────────────────────────────────────

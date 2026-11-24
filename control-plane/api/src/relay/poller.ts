@@ -51,6 +51,7 @@ import {
   queueInboundMessage,
   claimSettledInboundBursts,
   listMachineAwaitingChats,
+  listAnsweredButSilentChats,
   submitAnswerForChat,
   isAnswered,
   setLanguageForChat,
@@ -1228,6 +1229,18 @@ async function applyInterviewCallback(
         text: `${askText(question, result.view.language)}\n\n✅ ${picked}`,
         replyMarkup: undefined,
       });
+    }
+    // THE FLOOR THIS TAP OWES A REPLY ON, read as it is now. `result.view` is built by the writer, which knows
+    // nothing about the floor: it says "person" whatever the session says. `respond` then took the floor to be the
+    // organizer's, said nothing, and - its lost-floor retry being keyed on that same field - gave up. The reply was
+    // left to the tick scan, and a scan that had read its view before this answer landed handed the floor to the
+    // organizer for the very question they had just answered: nobody was left to ask the next one (nightly
+    // 2026-11-24, #637). Said the way the skip and suggestion taps say it. Interpret path only: on the agent path
+    // the agent owns what follows an answer, and `applyDecision` having taken the floor is not a licence to speak.
+    if (await isInterpretPath(deps.db, decision.chatId)) {
+      const settled = await getSessionForChat(deps.db, decision.chatId);
+      await respond({ ...(settled.ok ? settled.view : result.view), awaiting: "machine" });
+      return;
     }
     await respond(result.view);
     return;
@@ -4337,6 +4350,69 @@ export async function advanceRouterOwnedQuestions(
   }
 }
 
+/**
+ * How long an organizer's answer may go unanswered before the router looks again. Longer than a slow model call and
+ * the settle windows, so a pass that is merely in flight is never mistaken for a stranded one.
+ */
+export const ANSWERED_SILENCE_SECONDS = 25;
+
+/**
+ * THE SAFETY NET for an interview that has gone quiet on an answer it holds.
+ *
+ * The shape: the floor is the organizer's, the last thing sent was `q:<id>`, and `<id>` is answered - they replied and
+ * nothing came back. Every other path has a watcher (the tick scan the machine's floor, the due-prompt ticker a
+ * scheduled prompt, the watchdog an open agent turn); this one had none, because the interpret path opens no turn and
+ * a floor that is the person's is listed by nobody. A floor mis-handed once therefore stayed mis-handed: the nightly
+ * e2e waited thirty minutes on it (2026-11-16, #637), and the automated organizer is the only reason anyone knew.
+ *
+ * It speaks only when the floor is the organizer's for nothing: the question is no longer an open one, and nothing
+ * else is waiting on them. Each state in which an answered `q:<id>` is still legitimately the last word is left
+ * alone: a multi-select still being ticked or an unsettled answer (the question is still open), an Other awaiting its
+ * words, a suggestion or a typed change waiting on a yes, the recap just shown, a message the interviewer owes, a
+ * document still being read. It takes the floor back and runs the ordinary pass, so the dedupe and the floor
+ * arbitration of `sendNextStep` apply to what it says as to any other message.
+ */
+export async function rescueAnsweredButSilent(
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+  graceSeconds: number = ANSWERED_SILENCE_SECONDS,
+): Promise<void> {
+  let chats: string[];
+  try {
+    chats = await listAnsweredButSilentChats(deps.db, graceSeconds);
+  } catch {
+    log(structuredLog("warn", "trip_bot.answered_silence_scan_failed", {}));
+    return;
+  }
+  for (const chatId of chats) {
+    try {
+      const result = await getSessionForChat(deps.db, chatId);
+      if (!result.ok) continue;
+      const { view } = result;
+      const answeredId = (view.lastPrompt ?? "").slice(2);
+      const stillOpen = view.nextQuestion?.id === answeredId
+        || view.pendingAsk?.id === answeredId
+        || view.optionalRemaining.some((q) => q.id === answeredId);
+      if (view.awaiting !== "person" || view.state !== "interviewing" || stillOpen) continue;
+      if (view.otherPending || view.pendingSay || view.recapMarker) continue;
+      if (Object.keys(view.suggestions).length > 0) continue;
+      if (await getOpenDraft(deps.db, view.sessionId)) continue;
+      if ((await hasPendingInbound(deps.db, chatId)) || (await isReadingDocument(deps.db, chatId))) continue;
+      await markAwaitingMachine(deps.db, chatId);
+      const fresh = await getSessionForChat(deps.db, chatId);
+      if (!fresh.ok) continue;
+      log(structuredLog("warn", "trip_bot.answered_silence_rescued", {
+        session_id: view.sessionId,
+        answered: answeredId,
+      }));
+      await sendNextStep(fresh.view, chatId, deps, strings);
+    } catch {
+      log(structuredLog("warn", "trip_bot.answered_silence_item_failed", {}));
+    }
+  }
+}
+
 export async function renderDueRouterPrompts(
   deps: TripBotPollerDeps,
   strings: DispatchStrings,
@@ -4364,10 +4440,13 @@ export async function renderDueRouterPrompts(
     try {
       const result = await getSessionForChat(deps.db, chatId);
       if (!result.ok) continue;
-      await sendNextStep(result.view, chatId, deps, strings);
+      const spoke = await sendNextStep(result.view, chatId, deps, strings);
+      // `sent` is what the pass returned, not a promise: a prompt claimed while the floor was the organizer's is
+      // refused at the guard and says nothing, and this line used to read the same either way (#637).
       log(structuredLog("info", "trip_bot.router_prompt_sent", {
         session_id: sessionId,
         state: result.view.state,
+        sent: spoke,
       }));
     } catch {
       log(structuredLog("warn", "trip_bot.router_prompt_failed", { session_id: sessionId }));
@@ -4716,6 +4795,19 @@ async function takeFloor(chatId: string, view: SessionView, deps: TripBotPollerD
     session_id: view.sessionId,
   }));
   return false;
+}
+
+/**
+ * Whether two reads of one interview differ in what the router would say next. A view is a few queries old by the
+ * time it is acted on; this is the cheap way to ask "has the interview moved on since?" without re-deriving the
+ * question. Anything that changes what is owed changes one of these.
+ */
+function viewMoved(before: SessionView, after: SessionView): boolean {
+  return before.nextQuestion?.id !== after.nextQuestion?.id
+    || before.pendingAsk?.id !== after.pendingAsk?.id
+    || before.state !== after.state
+    || before.phase !== after.phase
+    || (before.lastPrompt ?? "") !== (after.lastPrompt ?? "");
 }
 
 /**
@@ -5549,7 +5641,32 @@ export async function sendNextStep(
     //
     // Handing the floor back is also just true: we asked, they have not
     // answered, we are waiting on them.
-    if (onInterpretPath) await claimFloor(deps.db, chatId);
+    if (onInterpretPath) {
+      // ... UNLESS THE ORGANIZER HAS ANSWERED IT SINCE THIS VIEW WAS READ. The view is some queries old, and a fast
+      // tap lands in that gap (the nightly's automated organizer taps within milliseconds). Handing the floor to a
+      // person who has just answered the question on their screen leaves nobody to ask the next one: no scan lists
+      // a floor that is theirs, and no watchdog runs on this path. So the handback is refused, in the same
+      // statement, while the question it is about has an answer - and the pass is then run again on the session as
+      // it is now (nightly 2026-11-24, #637).
+      const onScreenQuestion = !offerOutstanding && question && question === view.nextQuestion ? question : null;
+      if (!onScreenQuestion) {
+        await claimFloor(deps.db, chatId);
+      } else if (!(await claimFloor(deps.db, chatId, { unlessAnswered: onScreenQuestion.id }))) {
+        const fresh = await getSessionForChat(deps.db, chatId);
+        if (fresh.ok && fresh.view.awaiting === "machine") {
+          if (viewMoved(view, fresh.view)) {
+            (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.dedupe_overtaken", {
+              session_id: view.sessionId,
+              prompt: promptKey,
+            }));
+            return sendNextStep(fresh.view, chatId, deps, _strings);
+          }
+          // Not answered in any way the view shows (a half-ticked set, an answer that does not settle): the
+          // handback stands, as it always did.
+          await claimFloor(deps.db, chatId);
+        }
+      }
+    }
     return false;
   }
 
@@ -5972,6 +6089,7 @@ export function startTripBotPoller(
         await flushSettledInboundBursts(deps, log);
         await advanceRouterOwnedQuestions(deps, strings, log);
         await renderDueRouterPrompts(deps, strings, log);
+        await rescueAnsweredButSilent(deps, strings, log);
         // A question or summary Telegram did not take, once its backoff has
         // passed (#225 item 9) - the scans above never re-send a summary.
         await retryFailedSteps(deps, strings, log);
