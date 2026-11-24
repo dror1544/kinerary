@@ -1,6 +1,6 @@
 # Trip photos and trip moments from the chats, Claude and ChatGPT
 
-Status: draft (2026-11-24; decisions 1–3 by Dror, design by the lead, awaiting approval) · Issue: none yet ·
+Status: approved (2026-11-24, by Dror: decisions 1–3 and L1–L4, "proceed") → Part A in build · Issue: none yet ·
 Track: video look · Size: L, built as two PRs (Part A, Part B) · Tier: High
 Security path: yes (Part A widens member write access in the trip connector; Part B has the relay keep and
 forward group photos nobody addressed to the bot) · Migration: no (trip SQLite columns only) ·
@@ -29,7 +29,7 @@ The family's photos and the stories around them live in the Telegram group and n
 3. **Through Claude and ChatGPT, every member may add photos and moments.** This matches what the site already
    lets them do. Everything else stays read-only for members.
 
-**Lead's choices inside those decisions, for approval:**
+**Lead's choices inside those decisions (approved with the spec):**
 
 - L1. The default moment mode is `ask_in_chat`, the mode where nothing a person said reaches the site without
   someone in the chat agreeing.
