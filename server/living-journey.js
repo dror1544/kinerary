@@ -295,6 +295,12 @@ function schema(db) {
   // The organizer's navigation app for every Go chip: Google Maps (the default) or Waze. A trip setting like the
   // two above. Additive, defaulted, idempotent.
   try { db.exec("ALTER TABLE trip_settings ADD COLUMN nav_app TEXT NOT NULL DEFAULT 'google' CHECK (nav_app IN ('google','waze'))"); } catch {}
+  // The trip's own logo (docs/specs/sprint-9/x-trip-logo.md). The file sits in the media directory, named
+  // logo-<sha256[0..16]>.png; the provisioner rewrites trip.config.json on every rebuild, which is why the choice
+  // lives here and not in the file. Additive, nullable, idempotent.
+  for (const column of ['logo_media_file', 'logo_hash', 'logo_updated_by', 'logo_updated_at']) {
+    try { db.exec(`ALTER TABLE trip_ui_settings ADD COLUMN ${column} TEXT`); } catch {}
+  }
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
   db.prepare('INSERT OR IGNORE INTO trip_settings (id, timezone) VALUES (1, NULL)').run();
 }
@@ -1005,8 +1011,11 @@ function heroPublicUrl(file) {
   return file ? `/api/ui/hero/${encodeURIComponent(file)}` : null;
 }
 
-function uiSettings(db) {
+// `effectiveLogo` is server/site-icons.js createEffectiveLogo(): the one answer to "which file is the logo".
+// A caller without one (a test of this module alone) reports no logo.
+function uiSettings(db, effectiveLogo) {
   const row = db.prepare('SELECT * FROM trip_ui_settings WHERE id = 1').get();
+  const logo = effectiveLogo ? effectiveLogo() : { file: null, hash: null, source: 'none' };
   return {
     design_variant: normalizeUiVariant(row?.design_variant),
     hero: {
@@ -1015,6 +1024,12 @@ function uiSettings(db) {
       mime: row?.hero_media_mime || null,
       focal_x: Number(row?.hero_focal_x ?? 0.5),
       focal_y: Number(row?.hero_focal_y ?? 0.45),
+    },
+    // The version in the URL is what makes a new logo a new address for every cache between here and the screen.
+    logo: {
+      url: logo.file ? `/api/trip/logo?v=${logo.hash}` : null,
+      source: logo.source,
+      updated_at: logo.source === 'upload' ? row?.logo_updated_at || null : null,
     },
     presentation_prefs: readJson(row?.presentation_prefs, {}),
     updated_at: row?.updated_at || null,
@@ -1324,7 +1339,7 @@ function moveDayRows(rows, { from, to, date, lodging, headline }) {
   return { items: moved, headline: headlineMoved };
 }
 
-function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, internal, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured, isOrganizer, featureOn }) {
+function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, effectiveLogo, authRequired, organizerOrAgentRequired, internal, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured, isOrganizer, featureOn }) {
   // The trip as it is now. server.js passes the effective config (the file
   // with the stop layer merged over it, server/trip-structure.js); a caller
   // that passes only `config` gets exactly that object, as before.
@@ -1366,7 +1381,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
 
   app.get('/api/ui-settings', authRequired, (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    res.json(uiSettings(db));
+    res.json(uiSettings(db, effectiveLogo));
   });
 
   // Trip-wide, DB-backed, live-mutable settings that are not UI presentation —
@@ -1497,12 +1512,12 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
       prefs,
       req.user.username
     );
-    res.json(uiSettings(db));
+    res.json(uiSettings(db, effectiveLogo));
   });
 
   app.post('/api/ui-settings/hero/revert', organizerOrAgentRequired, (_req, res) => {
     db.prepare("UPDATE trip_ui_settings SET hero_media_file = NULL, hero_media_original_name = NULL, hero_media_mime = NULL, hero_focal_x = 0.5, hero_focal_y = 0.45, updated_at = datetime('now') WHERE id = 1").run();
-    res.json(uiSettings(db));
+    res.json(uiSettings(db, effectiveLogo));
   });
 
   app.get('/api/ui/hero/:filename', authRequired, (req, res) => {
@@ -1979,7 +1994,7 @@ function create(options) {
       return result.report;
     },
     setRestorePoint: (author) => setRestorePoint(db, author),
-    uiSettings: () => uiSettings(db),
+    uiSettings: () => uiSettings(db, options.effectiveLogo),
     // For server/trip-structure.js: read the active plan, and change it the
     // way every Modern write does — a new immutable revision, projected into
     // the Classic tables (adopting Classic-written rows first). Callers run

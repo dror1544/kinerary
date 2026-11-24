@@ -378,7 +378,14 @@ export async function login(username: string, password: string) {
 
 export const getConfig = () => api<unknown>("/api/config").then((value) => configSchema.parse(value));
 export const getMe = () => api<CurrentUser>("/api/auth/me");
-export const getUiSettings = () => api<{ design_variant: "classic" | "modern"; hero: { url: string | null; focal_x: number; focal_y: number } }>("/api/ui-settings");
+/**
+ * The trip's logo as the site resolves it (server/site-icons.js createEffectiveLogo): an organizer's upload, else the
+ * trip file's `meta.logo`, else none. `url` carries `?v=<hash>`, so a new logo is a new address. Absent on a site from
+ * before the trip-logo release: read it as "none".
+ */
+export type TripLogo = { url: string | null; source: "upload" | "config" | "none"; updated_at: string | null };
+export type UiSettings = { design_variant: "classic" | "modern"; hero: { url: string | null; focal_x: number; focal_y: number }; logo?: TripLogo };
+export const getUiSettings = () => api<UiSettings>("/api/ui-settings");
 export const getToday = () => api<TodayContext>("/api/today");
 export const getItinerary = () => api<unknown>("/api/itinerary/active").then((value) => z.object({
   revision: z.string(),

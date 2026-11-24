@@ -105,6 +105,7 @@ import {
   getPhotos,
   getToday,
   getUiSettings,
+  type UiSettings,
   getLoginRoster,
   resetParticipantPassword,
   login,
@@ -319,6 +320,26 @@ function tripLogoUrl(value?: string) {
   }
 }
 
+/**
+ * The logo the header shows (docs/specs/sprint-9/x-trip-logo.md): the one the site resolved (`ui.logo.url`: an
+ * organizer's upload, else the trip file's logo), then a `meta.logo` that is itself an address (an https URL or a
+ * /path, which is all the header ever read it as), then the Kinerary mark.
+ */
+export function headerLogoSource(settings: Pick<UiSettings, "logo"> | undefined, configLogo?: string) {
+  if (settings?.logo?.url) return runtimeUrl(settings.logo.url);
+  return tripLogoUrl(configLogo) || brandMark;
+}
+
+/**
+ * The sign-in page draws before any session, so it asks the public logo route directly and falls back to the
+ * Kinerary mark when the trip has none (404) or the image does not load.
+ */
+export function LoginLogo() {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <img className="login-logo" src={brandLogo} alt="Kinerary" />;
+  return <img className="login-logo is-trip-logo" src={runtimeUrl("/api/trip/logo")} alt="" onError={() => setFailed(true)} />;
+}
+
 function extraLinkLabel(link: NonNullable<ItineraryItem["extra_links"]>[number], lang: Lang) {
   return text(link.label, lang) || text(link.title, lang) || text(link.name, lang) || "Extra";
 }
@@ -373,7 +394,7 @@ function LoginScreen() {
   return (
     <main className="login-shell">
       <section className="login-panel" aria-label="Sign in">
-        <img className="login-logo" src={brandLogo} alt="Kinerary" />
+        <LoginLogo />
         <h1>{copy(lang,"Open your trip","כניסה לטיול")}</h1>
         <p>{copy(lang,"Sign in to see your trip.","היכנסו לצפייה בטיול שלכם.")}</p>
         {roster.length > 0 ? (
@@ -760,7 +781,7 @@ function videoTabLabel(tab: VideoTab, lang: Lang) {
 /** The header of the video layout: logo and title, "<place> · <tab>", the signed-in user and More. */
 export function VideoHero({ config, settings, lang, placePhaseId, pageName, pageKey, active, openVideoTab, openMenu, openAccount, currentUser }: {
   config?: TripConfig;
-  settings?: { hero: { url: string | null; focal_x: number; focal_y: number } };
+  settings?: UiSettings;
   lang: Lang;
   placePhaseId: string;
   /** What the page is called after the dot: the tab, or the module when one is open. */
@@ -776,7 +797,7 @@ export function VideoHero({ config, settings, lang, placePhaseId, pageName, page
 }) {
   const place = text(config?.phases?.find((phase) => phase.id === placePhaseId)?.title, lang);
   const { photo, unavailable } = useHeroPhoto(heroCandidates(config, settings?.hero.url, placePhaseId));
-  const heroLogo = tripLogoUrl(config?.meta?.logo) || brandMark;
+  const heroLogo = headerLogoSource(settings, config?.meta?.logo);
   const heroLogoAlt = config?.meta?.logoAlt || config?.meta?.title || "Trip";
   const backgroundPosition = `${(settings?.hero.focal_x ?? 0.5) * 100}% ${(settings?.hero.focal_y ?? 0.45) * 100}%`;
   // Scroll-linked header (hero-scroll.ts): shrinks to a compact bar going down, stretches when pulled at the top.
@@ -2697,6 +2718,84 @@ function HeroPictureControl({ lang }: { lang: Lang }) {
   );
 }
 
+/**
+ * The trip's logo, changed from a file (docs/specs/sprint-9/x-trip-logo.md): organizer-only at the server
+ * (`POST` and `DELETE /api/ui-settings/logo`, behind the `trip_logo` switch). A preview of what the site shows now, "Choose
+ * image", and "Use the Kinerary logo" to take an upload away. Rendered by the caller only when the switch is on.
+ */
+export function TripLogoControl({ lang }: { lang: Lang }) {
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState("");
+  const queryClient = useQueryClient();
+  const ui = useQuery({ queryKey: ["ui"], queryFn: getUiSettings });
+  const logo = ui.data?.logo;
+
+  async function send(method: "POST" | "DELETE", body?: FormData) {
+    setBusy(true);
+    setProblem("");
+    try {
+      const token = tokenStore.get();
+      const response = await fetch(runtimeUrl("/api/ui-settings/logo"), {
+        method,
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        body,
+      });
+      if (!response.ok) {
+        setProblem(response.status === 413
+          ? copy(lang, "That image is larger than 8 MB.", "התמונה גדולה מ-8 מגה-בייט.")
+          : response.status === 400
+            ? copy(lang, "That file is not an image the site can use. Choose a PNG, JPEG, WebP or GIF.", "הקובץ אינו תמונה שהאתר יכול להשתמש בה. בחרו PNG, JPEG, WebP או GIF.")
+            : response.status === 409
+              ? copy(lang, "The trip logo is not turned on for this trip.", "לוגו הטיול אינו פעיל בטיול הזה.")
+              : copy(lang, "Could not change the logo. Please try again.", "לא ניתן לשנות את הלוגו. נסו שוב."));
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: ["ui"] });
+    } catch {
+      setProblem(copy(lang, "Could not change the logo. Please try again.", "לא ניתן לשנות את הלוגו. נסו שוב."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function choose(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    const body = new FormData();
+    body.set("logo", file);
+    void send("POST", body);
+  }
+
+  return (
+    <div className="trip-logo-control">
+      <h4>{copy(lang, "Trip logo", "לוגו הטיול")}</h4>
+      <div className="trip-logo-row">
+        <img className="trip-logo-preview" src={logo?.url ? runtimeUrl(logo.url) : brandMark} alt={logo?.url ? copy(lang, "The trip's logo", "לוגו הטיול") : copy(lang, "The Kinerary logo", "הלוגו של Kinerary")} />
+        <p className="trip-logo-note">
+          {logo?.source === "upload"
+            ? copy(lang, "Your uploaded logo is showing in the header, on the sign-in page and as the app icon.", "הלוגו שהעליתם מופיע בכותרת, בדף הכניסה וכסמל האפליקציה.")
+            : logo?.source === "config"
+              ? copy(lang, "The logo that came with the trip is showing.", "מוצג הלוגו שהגיע עם הטיול.")
+              : copy(lang, "The Kinerary logo is showing.", "מוצג הלוגו של Kinerary.")}
+        </p>
+      </div>
+      {problem && <p role="alert">{problem}</p>}
+      <label className="upload-control">
+        <Upload size={18} />
+        <span>{busy ? copy(lang, "Uploading…", "מעלה…") : copy(lang, "Choose image", "בחירת תמונה")}</span>
+        <input type="file" aria-label={copy(lang, "Choose image", "בחירת תמונה")} accept="image/png,image/jpeg,image/webp,image/gif" onChange={choose} disabled={busy} />
+      </label>
+      {logo?.source === "upload" && (
+        <button type="button" className="secondary-action" disabled={busy} onClick={() => void send("DELETE")}>
+          {copy(lang, "Use the Kinerary logo", "שימוש בלוגו של Kinerary")}
+        </button>
+      )}
+      <p className="trip-logo-hint">{copy(lang, "A phone that already has the app installed keeps its old icon; a new install gets the new one.", "בטלפון שכבר מותקנת בו האפליקציה הסמל הישן נשאר; התקנה חדשה תקבל את הסמל החדש.")}</p>
+    </div>
+  );
+}
+
 /** Everyone on the trip. On the classic More page, and on the video layout's Account page (#612). */
 function TravellerList({ config, currentUser, lang }: { config?: TripConfig; currentUser?: CurrentUser; lang: Lang }) {
   return (
@@ -2767,6 +2866,7 @@ export function OrganizerSettings({ config, isOrganizer, lang }: { config?: Trip
       <section className="organizer-tools" aria-labelledby="os-look">
         <h3 id="os-look">{copy(lang,"Trip look","מראה הטיול")}</h3>
         <HeroPictureControl lang={lang} />
+        {featureOn(config, "trip_logo") ? <TripLogoControl lang={lang} /> : null}
       </section>
     </section>
   );
@@ -2996,6 +3096,14 @@ export default function App() {
     document.documentElement.lang = lang;
     document.documentElement.dir = lang === "he" ? "rtl" : "ltr";
   }, [lang]);
+
+  // An installed app is called for its trip, not "Kinerary" (the manifest does the same for Android and desktop;
+  // iOS reads this tag at the moment a person adds the site to the home screen).
+  const tripTitle = config.data?.meta?.title;
+  useEffect(() => {
+    const tag = document.querySelector('meta[name="apple-mobile-web-app-title"]');
+    if (tag && tripTitle?.trim()) tag.setAttribute("content", [...tripTitle.trim()].slice(0, 12).join("").trim());
+  }, [tripTitle]);
 
   useEffect(() => {
     if (me.data) { const { dashboard_url: _dashboard, ...stored } = me.data; localStorage.setItem("trip-user", JSON.stringify(stored)); } // dashboard_url is per trip and per session: memory only

@@ -1145,8 +1145,20 @@ const hotelPlaces = createHotelPlaces({
   bookingById: (id) => db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(id) || null,
 });
 
+// The trip's logo (docs/specs/sprint-9/x-trip-logo.md): an organizer's upload, else meta.logo, else none. The one
+// resolver behind GET /api/trip/logo, the PWA icons and GET /api/ui-settings. The upload's row is read on each call
+// (the table is created by livingJourney.create below; nothing asks before the server is listening).
+const siteIcons = require('./site-icons');
+const effectiveLogo = siteIcons.createEffectiveLogo({
+  tripDir: TRIP_DIR,
+  mediaDir: MEDIA_DIR,
+  getUpload: () => db.prepare('SELECT logo_media_file AS file, logo_hash AS hash FROM trip_ui_settings WHERE id = 1').get(),
+  getConfigLogo: () => TRIP_CONFIG.meta?.logo,
+});
+
 const journey = livingJourney.create({
   hotelPlaces,
+  effectiveLogo,
   db,
   // The FILE: what the original plan is imported from at first boot.
   config: TRIP_CONFIG,
@@ -1257,6 +1269,60 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
     Number.isFinite(focalY) ? Math.max(0, Math.min(1, focalY)) : 0.45,
     req.user.username
   );
+  res.json(journey.uiSettings());
+});
+
+// ── The trip's logo (docs/specs/sprint-9/x-trip-logo.md) ─────────────────────
+// Organizer-or-agent writes (the companion's agent key can, as it can the hero; the organizer check for a person
+// asking the companion lives in its skill). Order matters: WHO may (403) is answered before the switch (409), and both
+// before a byte of the upload is read, so a refused request never touches the disk. The upload is held in memory,
+// re-encoded by sharp (server/site-icons.js normalizeLogoUpload) and only the re-encoded PNG is ever stored or served.
+const logoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024, files: 1, fields: 4, parts: 6 } });
+function tripLogoSwitchOn(_req, res, next) {
+  if (featureOn('trip_logo')) return next();
+  res.status(409).json({ error: 'feature_off' });
+}
+function readLogoUpload(req, res, next) {
+  logoUpload.single('logo')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'file_too_large' });
+    return res.status(400).json({ error: 'invalid_image' });
+  });
+}
+function removeLogoFile(name) {
+  // Only a name this feature wrote: the media directory also holds the private hero pictures.
+  if (typeof name !== 'string' || !siteIcons.UPLOAD_NAME.test(name)) return;
+  try { fs.unlinkSync(path.join(MEDIA_DIR, name)); } catch (err) { if (err.code !== 'ENOENT') console.warn(`trip logo: could not remove ${name}: ${err.message}`); }
+}
+app.post('/api/ui-settings/logo', organizerOrAgentRequired, tripLogoSwitchOn, readLogoUpload, async (req, res) => {
+  let png;
+  try { png = await siteIcons.normalizeLogoUpload(req.file && req.file.buffer); }
+  catch { return res.status(400).json({ error: 'invalid_image' }); }
+  const hash = crypto.createHash('sha256').update(png).digest('hex').slice(0, 16);
+  const name = `logo-${hash}.png`;
+  const previous = db.prepare('SELECT logo_media_file AS file FROM trip_ui_settings WHERE id = 1').get()?.file;
+  // Written under a temporary name and renamed, so the public route never serves half a file.
+  const temporary = path.join(MEDIA_DIR, `.${name}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(temporary, png);
+    fs.renameSync(temporary, path.join(MEDIA_DIR, name));
+    db.prepare("UPDATE trip_ui_settings SET logo_media_file = ?, logo_hash = ?, logo_updated_by = ?, logo_updated_at = datetime('now') WHERE id = 1")
+      .run(name, hash, req.user.username);
+  } catch (err) {
+    try { fs.unlinkSync(temporary); } catch {}
+    console.error(`trip logo: could not store the upload: ${err.message}`);
+    return res.status(500).json({ error: 'store_failed' });
+  }
+  // The same image twice is the same file: the previous one goes only when it is a different one.
+  if (previous && previous !== name) removeLogoFile(previous);
+  res.json(journey.uiSettings());
+});
+
+app.delete('/api/ui-settings/logo', organizerOrAgentRequired, tripLogoSwitchOn, (req, res) => {
+  const previous = db.prepare('SELECT logo_media_file AS file FROM trip_ui_settings WHERE id = 1').get()?.file;
+  db.prepare("UPDATE trip_ui_settings SET logo_media_file = NULL, logo_hash = NULL, logo_updated_by = ?, logo_updated_at = NULL WHERE id = 1")
+    .run(req.user.username);
+  removeLogoFile(previous);
   res.json(journey.uiSettings());
 });
 
@@ -1638,32 +1704,22 @@ app.get('/api/config/versions/:version', authRequired, (req, res) => {
   res.json({ version: row.version, created_at: row.created_at, hash: row.hash, content });
 });
 
-require('./site-icons').registerSiteIcons(app, {
-  tripDir: TRIP_DIR, siteDir: SITE_DIR, getLogo: () => TRIP_CONFIG.meta?.logo,
+siteIcons.registerSiteIcons(app, {
+  tripDir: TRIP_DIR, siteDir: SITE_DIR, effectiveLogo,
+  // The same public projection /api/config/roster hands out, not the raw file.
+  getTitle: () => publicConfig(TRIP_CONFIG).meta?.title,
 });
 
-// Image extensions only. meta.logo is a config value, and realpath containment
-// alone still lets it name trip.config.json, .env or a script that sits INSIDE
-// the trip directory; the extension allow-list is what stops that.
-const LOGO_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp']);
-
 app.get('/api/trip/logo', (_req, res) => {
-  const logoFile = TRIP_CONFIG.meta?.logo;
-  if (!logoFile || typeof logoFile !== 'string') return res.status(404).end();
-  // Public on purpose: the login page and the trivia TV screen draw it before
-  // any login. So the file must (1) resolve INSIDE the trip directory, symlinks
-  // followed (same check as site-icons.js) and (2) be an image by extension.
-  let logoPath;
-  try {
-    const root = fs.realpathSync(TRIP_DIR);
-    logoPath = fs.realpathSync(path.resolve(root, logoFile));
-    if (!logoPath.startsWith(root + path.sep)) return res.status(404).end();
-  } catch { return res.status(404).end(); }
-  const ext = path.extname(logoPath).toLowerCase();
-  if (!LOGO_EXTENSIONS.has(ext)) return res.status(404).end();
+  // Public on purpose: the login page and the trivia TV screen draw it before any login. The resolver decides what
+  // the file is (an upload we re-encoded, inside the media directory; or meta.logo, inside the trip directory and an
+  // image by extension) and never takes a name from the request — `?v=` is only a cache key and selects nothing.
+  const logo = effectiveLogo();
+  if (!logo.file) return res.status(404).end();
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  if (ext === '.svg') res.setHeader('Content-Security-Policy', 'sandbox');
-  res.sendFile(logoPath);
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  if (path.extname(logo.file).toLowerCase() === '.svg') res.setHeader('Content-Security-Policy', 'sandbox');
+  res.sendFile(logo.file);
 });
 
 // ── AUTH ──────────────────────────────────────────────────────────────────────

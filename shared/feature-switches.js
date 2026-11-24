@@ -67,6 +67,14 @@ const FEATURE_SWITCHES = Object.freeze([
     surfaces: Object.freeze(['relay', 'control_plane']),
     memberVisible: false,
   }),
+  // The trip's own logo (docs/specs/sprint-9/x-trip-logo.md). memberVisible because the site's organizer row reads
+  // features.trip_logo, and #567 S2 serves only member-visible names. Display of a stored logo never depends on it.
+  Object.freeze({
+    name: 'trip_logo',
+    summary: 'An organizer can set the trip\'s logo (website, companion, Claude/ChatGPT upload link); shown in the header, login page, favicon and installed-app icon',
+    surfaces: Object.freeze(['site', 'companion']),
+    memberVisible: true,
+  }),
 ]);
 
 // Fail loud at load: a malformed registry is a code bug, not a runtime state.
