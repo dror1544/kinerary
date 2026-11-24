@@ -19,7 +19,7 @@ export function redact(value: unknown): unknown {
   return value;
 }
 
-export function structuredLog(level: "info" | "warn" | "error", event: string, fields: Record<string, unknown>): string {
+export function structuredLog(level: "debug" | "info" | "warn" | "error", event: string, fields: Record<string, unknown>): string {
   const safe = redact(fields) as Record<string, unknown>;
   // level and event are the log reader's index into a line, so a caller field
   // of the same name must not be able to forge them.

@@ -18,6 +18,7 @@ import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-
 import { GoogleIdTokenClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
 import { LogMailer, ResendMailer, type Mailer } from "./mailer.js";
 import { checkBotIdentity } from "./telegram-mini-app.js";
+import { resolveOperatorNoticesChatId } from "./operator-chats.js";
 import { createBotCheckRound, createMiniAppStatus, withMiniAppReadiness } from "./mini-app-status.js";
 
 const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
@@ -45,6 +46,11 @@ let signup: SignupDependencies | undefined;
 // operator notification to the same chat as the signup DM. One configured
 // operator, one chat id, resolved once.
 let operatorChatId: string | undefined;
+// Where `operator_*` notices are SENT when the profile names a separate ops chat
+// (signup.operator_notices_chat_id_secret_ref; issue #649). Deliberately not
+// `operatorChatId`: that one is the super-admin's chat, which the approval DM and
+// the enqueue gate use, and which must not move.
+let operatorNoticesChatId: string | undefined;
 if (profile.signup) {
   const signupConfig = profile.signup;
   const [botToken, actionSecret, webhookSecret, superAdminChatId] = await Promise.all([
@@ -60,6 +66,7 @@ if (profile.signup) {
   // guarantee its own test asserts: an invalid profile must never reach a
   // constructed provider.
   operatorChatId = superAdminChatId;
+  operatorNoticesChatId = await resolveOperatorNoticesChatId(signupConfig, superAdminChatId, (line) => process.stderr.write(`${line}\n`));
   const notification = validateBeforeProvider(profile, () => createNotificationAdapter(profile.adapters.messaging, {
     telegram: superAdminChatId ? { botToken, superAdminChatId, db: pool, log: (line) => process.stderr.write(`${line}\n`), apiRoot: telegramRoot } : undefined,
   }));
@@ -342,7 +349,7 @@ if (outboxNotification && outboxBotToken) {
       // nothing logged. The resolver prefers what the deployment states and
       // otherwise asks the bot itself (getMe on the signup token), cached.
       // `publicOrigin` is for the unlink link in the Mini App sign-in notice.
-      { resolveBotUsername, publicOrigin: portal?.publicOrigin ?? null },
+      { resolveBotUsername, publicOrigin: portal?.publicOrigin ?? null, ...(operatorNoticesChatId ? { operatorNoticesChatId } : {}) },
     )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {
