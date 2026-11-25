@@ -8,7 +8,9 @@ import { fileURLToPath } from "node:url";
 // and no module of it can be handed a chat id. Source-level pins, because these are properties of what is imported and
 // what is written, not of any one run.
 const src = (name: string) => readFileSync(fileURLToPath(new URL(`../src/${name}`, import.meta.url)), "utf8");
-const NEW_MODULES = ["plan-change-poller.ts", "plan-change-line.ts", "trip-audience.ts", "runtime-upstream.ts"];
+// group-photo*.ts are the second user of the same road (docs/specs/sprint-9/x-trip-group-photo.md): they use the targeted outbox and the
+// gateway exactly as the group line does, and are held to the same pins.
+const NEW_MODULES = ["plan-change-poller.ts", "plan-change-line.ts", "trip-audience.ts", "runtime-upstream.ts", "group-photo-poller.ts", "group-photo.ts"];
 
 describe("the group line stays out of the relay (AC-29)", () => {
   test("none of its modules imports from relay/ or names a relay connector", () => {
@@ -34,11 +36,11 @@ describe("no chat id is an input to a targeted row", () => {
     assert.match(source, /VALUES \(\$1, \$2, \$3, NULL, \$4::jsonb, NULL, \$3, 'control-plane', 'pending', \$5, \$6, \$7\)/);
   });
 
-  test("only the poller enqueues a targeted message: no route, tool or other module calls enqueueTripMessage", () => {
+  test("only the two pollers enqueue a targeted message (the group line's, and the group photo's): no route, tool or other module calls enqueueTripMessage", () => {
     const callers = readdirSync(fileURLToPath(new URL("../src/", import.meta.url)), { recursive: true, encoding: "utf8" })
       .filter((file) => file.endsWith(".ts") && file !== "trip-audience.ts")
       .filter((file) => /\benqueueTripMessage\s*\(/.test(src(file)));
-    assert.deepEqual(callers, ["plan-change-poller.ts"]);
+    assert.deepEqual(callers.sort(), ["group-photo-poller.ts", "plan-change-poller.ts"]);
   });
 
   test("the dispatcher's targeted path reads the chat from confirmAudience, never from row.recipient", () => {
@@ -46,6 +48,34 @@ describe("no chat id is an input to a targeted row", () => {
     const targeted = source.slice(source.indexOf("async function dispatchTargetedRow"));
     assert.ok(!/\.recipient/.test(targeted), "dispatchTargetedRow reads recipient");
     assert.match(targeted, /chatId: audience\.chatId/);
+  });
+});
+
+describe("the group photo's poller and reporter send the control-plane key to the runtime gateway and nowhere else (K2)", () => {
+  const codeOf = (name: string) => src(name).split("\n").filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join("\n");
+  for (const name of ["group-photo-poller.ts", "group-photo.ts"]) {
+    test(`${name}: every URL it builds starts at runtimeOrigin, it never follows a redirect, and it names no trip-site address`, () => {
+      const code = codeOf(name);
+      const urls = code.match(/`\$\{(?:deps\.runtimeOrigin|origin)[^`]*`/g) ?? [];
+      assert.equal(urls.length, 1, `${name} builds one URL: ${urls.join(" | ")}`);
+      assert.match(urls[0]!, /\/internal\/t\/\$\{encodeURIComponent\(tripId\)\}\/group-photo\/(claim|result)`$/);
+      assert.match(code, /redirect: "manual"/);
+      assert.ok(!/upstreamOrigin|upstreamBasePath|private_url|api\/internal\/control-plane/.test(code), "no trip-site address or route is built here");
+    });
+  }
+  test("the poller's readiness check is the same lookup the gateway uses, and its origin is never read", () => {
+    const poller = src("group-photo-poller.ts");
+    assert.match(poller, /runtimeUpstreamFor\(deps\.db, tripId, deps\.upstreamHostSuffixes, deps\.upstreamAllowedHosts\)/);
+    assert.ok(!/ready\.(upstream|routeRef|tripKey)/.test(poller));
+  });
+  test("the dispatcher's group-photo path calls setChatPhoto only after the rights check, on the chat confirmAudience gave", () => {
+    const source = src("outbox-dispatcher.ts");
+    const photo = source.slice(source.indexOf("async function dispatchGroupPhotoRow"));
+    assert.ok(!/\.recipient/.test(photo), "reads recipient");
+    assert.match(photo, /const audience = await confirmAudience\(db, row\)/);
+    assert.ok(photo.indexOf("mayChangeGroupPhoto(member)") > 0 && photo.indexOf("mayChangeGroupPhoto(member)") < photo.indexOf("setChatPhoto(audience.chatId"), "the rights check comes first");
+    assert.equal((photo.match(/setChatPhoto\(/g) ?? []).length, 1, "one call site");
+    assert.ok(!/chat_?id\s*[:=]\s*(row|payload)/i.test(photo), "no chat id is taken from the row's payload");
   });
 });
 

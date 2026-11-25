@@ -23,6 +23,8 @@ const DESTROY = { readOnlyHint: false, destructiveHint: true, openWorldHint: fal
 const NO_PLAN_CHANGE_LINES = Object.freeze({ changed: false, message: 'This trip does not have plan-change lines.' });
 // What the trip-logo tools answer, with nothing changed, for a trip whose trip_logo switch is off.
 const NO_TRIP_LOGO = Object.freeze({ changed: false, message: 'The trip logo is not turned on for this trip.' });
+// What the group-photo tools answer, with nothing requested, for a trip whose trip_group_photo switch is off.
+const NO_GROUP_PHOTO = Object.freeze({ changed: false, status: 'feature_off', message: 'The Telegram group photo is not turned on for this trip.' });
 const bookingType = z.enum(['flight', 'hotel', 'car', 'attraction', 'other']);
 
 // Other people's records reach the assistant as name and colour only. Issue
@@ -147,7 +149,7 @@ function labelLostFound(rows) {
     ? Object.assign({ source: LOST_FOUND_SOURCE }, r, { source: LOST_FOUND_SOURCE }) : r));
 }
 
-function registerTools(mcp, site, { write = true, origin, memberWrites = false } = {}) {
+function registerTools(mcp, site, { write = true, origin, memberWrites = false, features } = {}) {
   // Every tool's one output path: the site's answer, with the tag block made
   // visible or dropped (visibleTags above); and its one error path, toolError.
   const ok = data => ({ content: [{ type: 'text', text: JSON.stringify(visibleTags(data), null, 2) }] });
@@ -281,6 +283,44 @@ function registerTools(mcp, site, { write = true, origin, memberWrites = false }
       if (config?.features?.trip_logo !== true) return NO_TRIP_LOGO;
       const settings = await writeCall(() => site.del('/api/ui-settings/logo'));
       return { changed: true, logo: settings.logo };
+    });
+
+  // ── The trip group's Telegram photo (docs/specs/sprint-9/x-trip-group-photo.md) ────────────────────────────────────
+  // ORGANIZER ONLY: both tools are listed only on a write connection (an organizer's), and the site's routes refuse anyone
+  // else again (403). A trip without the `trip_group_photo` switch is told so and nothing is requested. The request is
+  // ASYNCHRONOUS: the control plane checks the bot's rights in the group and sets the photo within about two minutes, so the
+  // honest first answer is "requested"; only get_group_photo_status says what happened. The tool never takes a chat id.
+  // LISTED only for a trip that has the switch (AC-4): the connector builds its tools per request and `features` is the public
+  // config's block, so a trip without it never sees them. `features` absent (a caller that did not say) lists them, and each
+  // tool still reads /api/config when called and answers feature_off, so a stale list can only ever ask for nothing.
+  const groupPhotoListed = features === undefined || (features && features.trip_group_photo === true);
+  if (groupPhotoListed) tool('set_group_photo_from_logo', 'Set the Telegram group photo from the trip logo',
+    'Ask the trip\'s bot to make the trip logo the photo of the trip\'s Telegram group. Only when the organizer asked for it: never as a side effect of changing the logo. '
+    + 'The bot can only do it if it is an admin of the group with the "Change group info" right; the control plane checks that first. This only REQUESTS it, and the result comes about two minutes later: '
+    + 'call get_group_photo_status and report what it says, never "done" before it does. If the trip does not have this feature, nothing is requested and the answer says so: relay that plainly.',
+    WRITE, {},
+    async () => {
+      const config = await site.get('/api/config');
+      if (config?.features?.trip_group_photo !== true) return NO_GROUP_PHOTO;
+      try {
+        return { requested: true, ...(await writeCall(() => site.post('/api/group-photo', {}))) };
+      } catch (err) {
+        // The site refuses at once when the trip has no logo: that is an answer, not a fault.
+        if (err && err.status === 422 && err.code === 'no_logo') {
+          return { requested: false, status: 'no_logo', message: 'This trip has no logo yet. Add one first, then ask again.' };
+        }
+        throw err;
+      }
+    });
+
+  if (write && groupPhotoListed) tool('get_group_photo_status', 'Read the Telegram group photo request',
+    'What happened to the latest request to set the Telegram group photo from the trip logo: status is none, pending, sending, done, bot_lacks_rights, no_group, no_logo, failed or expired, with a message to relay in plain words. '
+    + 'Report exactly that status: "done" only when it says done. If the trip does not have this feature, the answer says so.',
+    READ, {},
+    async () => {
+      const config = await site.get('/api/config');
+      if (config?.features?.trip_group_photo !== true) return NO_GROUP_PHOTO;
+      return site.get('/api/group-photo');
     });
 
   tool('delete_booking', 'Delete a booking',

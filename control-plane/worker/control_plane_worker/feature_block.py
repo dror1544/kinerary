@@ -50,6 +50,7 @@ REGISTERED_SWITCHES: tuple[str, ...] = (
     "trip_logo",
     "chat_photos_to_album",
     "trip_moments_capture",
+    "trip_group_photo",
 )
 
 # The subset of REGISTERED_SWITCHES whose registry entry says `memberVisible: true`:
@@ -63,6 +64,7 @@ MEMBER_VISIBLE_SWITCHES: tuple[str, ...] = (
     "trip_logo",
     "chat_photos_to_album",
     "trip_moments_capture",
+    "trip_group_photo",
 )
 
 FEATURES_KEY = "features"

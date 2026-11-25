@@ -21,6 +21,7 @@ import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { featureOn } from "./features";
+import { GroupPhotoControl } from "./group-photo";
 import { GroupLineToggle } from "./group-line";
 import { ChatPhotosSettings } from "./chat-photos";
 import { hasGoChip, mapUrlFor, navUrlFor, wazeUrlFor } from "./nav-links";
@@ -2743,8 +2744,10 @@ function HeroPictureControl({ lang }: { lang: Lang }) {
  * (`POST` and `DELETE /api/ui-settings/logo`, behind the `trip_logo` switch). A preview of what the site shows now, "Choose
  * image", and "Use the Kinerary logo" to take an upload away. Rendered by the caller only when the switch is on.
  */
-export function TripLogoControl({ lang }: { lang: Lang }) {
+export function TripLogoControl({ lang, groupPhoto = false }: { lang: Lang; groupPhoto?: boolean }) {
   const [busy, setBusy] = useState(false);
+  // A logo was just uploaded in this view: the page offers the Telegram group photo too (docs/specs/sprint-9/x-trip-group-photo.md).
+  const [justUploaded, setJustUploaded] = useState(false);
   const [problem, setProblem] = useState("");
   const queryClient = useQueryClient();
   const ui = useQuery({ queryKey: ["ui"], queryFn: getUiSettings });
@@ -2771,6 +2774,7 @@ export function TripLogoControl({ lang }: { lang: Lang }) {
         return;
       }
       await queryClient.invalidateQueries({ queryKey: ["ui"] });
+      setJustUploaded(method === "POST");
     } catch {
       setProblem(copy(lang, "Could not change the logo. Please try again.", "לא ניתן לשנות את הלוגו. נסו שוב."));
     } finally {
@@ -2812,6 +2816,7 @@ export function TripLogoControl({ lang }: { lang: Lang }) {
         </button>
       )}
       <p className="trip-logo-hint">{copy(lang, "A phone that already has the app installed keeps its old icon; a new install gets the new one.", "בטלפון שכבר מותקנת בו האפליקציה הסמל הישן נשאר; התקנה חדשה תקבל את הסמל החדש.")}</p>
+      {groupPhoto ? <GroupPhotoControl lang={lang} offer={justUploaded} hasLogo={Boolean(logo?.url)} /> : null}
     </div>
   );
 }
@@ -2892,7 +2897,7 @@ export function OrganizerSettings({ config, isOrganizer, lang }: { config?: Trip
       <section className="organizer-tools" aria-labelledby="os-look">
         <h3 id="os-look">{copy(lang,"Trip look","מראה הטיול")}</h3>
         <HeroPictureControl lang={lang} />
-        {featureOn(config, "trip_logo") ? <TripLogoControl lang={lang} /> : null}
+        {featureOn(config, "trip_logo") ? <TripLogoControl lang={lang} groupPhoto={featureOn(config, "trip_group_photo")} /> : null}
       </section>
     </section>
   );

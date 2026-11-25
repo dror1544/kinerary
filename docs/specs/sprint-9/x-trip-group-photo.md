@@ -38,8 +38,10 @@ Nothing in the product calls `setChatPhoto` today.
   to `setChatPhoto`, and the request reads `bot_lacks_rights` with the instruction above.
 - AC-3 Given no open group binding for the trip, then the request reads `no_group`. Given no logo, the request
   is refused at once with `no_logo`.
-- AC-4 Given a member's JWT, then 403. Given the switch off, then 409 `feature_off`, and neither the offer nor
-  the tools appear.
+- AC-4 Given a member's JWT, then 403. Given the switch off, then 409 `feature_off`. The website offer is not
+  drawn, and the trip connector does not list the tools. The companion bridge (`mcp/mcp.js`) is one process that
+  does not know the trip when it lists its tools, so its tools stay listed. They answer `feature_off` and request
+  nothing, as the trip-logo tools do (x-trip-logo.md AC-9). Amended by the lead on 2026-11-25, at build time.
 - AC-5 Given a request, then the chat is resolved by the control plane from the trip's own open
   `telegram_chat_bindings` row and re-checked at send time (`trip-audience.ts`). No caller supplies a chat id.
 - AC-6 Given Telegram answers an error (rate limit, photo rejected), then the request reads `failed` with

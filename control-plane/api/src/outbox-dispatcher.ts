@@ -8,6 +8,11 @@ import { SIGN_IN_NOTICE_TYPE, signInNoticeText } from "./telegram-mini-app.js";
 import { CONNECTION_NOTICE_TYPE, whatsappConnectionNoticeText } from "./chat-binding-codes.js";
 import { confirmAudience, skippedLine } from "./trip-audience.js";
 import { renderPlanChangeLine, type PlanChange } from "./plan-change-line.js";
+import type { GroupPhotoApi } from "./adapters/telegram.js";
+import {
+  GROUP_PHOTO_TYPE, describeTelegramFailure, mayChangeGroupPhoto, settleGroupPhoto, whyNotAllowed,
+  type GroupPhotoOutcome, type GroupPhotoReporter,
+} from "./group-photo.js";
 
 interface OutboxRow {
   id: string;
@@ -236,6 +241,17 @@ export interface DispatchOptions {
    * organizer actually receives it.
    */
   groupBindingToken?: string | null;
+  /**
+   * What a `trip_group_photo` row needs (group-photo.ts): Telegram's three calls, the way back to the trip's site, and
+   * whether the switch is still on. ABSENT means this process cannot set a group photo, and a row of that type ends `failed`
+   * with a log line saying so (never `skipped` as if it had no words, never sent): the poller is started only when this is
+   * present, so a row can reach that branch only if someone configured one without the other.
+   */
+  groupPhoto?: {
+    api: GroupPhotoApi;
+    report: GroupPhotoReporter;
+    switchOn: (tripId: string) => Promise<boolean>;
+  };
 }
 
 export async function dispatchPendingTripNotifications(
@@ -388,6 +404,9 @@ async function dispatchTargetedRow(
     );
     return false;
   };
+  // Its own road: the audience is confirmed inside it, because a vanished group is an ANSWER here (`no_group`, reported to
+  // the site), not just a skipped row.
+  if (row.notification_type === GROUP_PHOTO_TYPE) return dispatchGroupPhotoRow(db, row, log, options);
   const audience = await confirmAudience(db, row);
   if (!audience.ok) return skip(audience.reason);
   const text = messageTextFor(row, options);
@@ -414,4 +433,88 @@ async function dispatchTargetedRow(
     [row.id],
   );
   return true;
+}
+
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/**
+ * One `trip_group_photo` row (spec x-trip-group-photo.md, AC-2, AC-5, AC-6). Returns whether the photo was set.
+ *
+ * ORDER, and each step ends the row on its own terms:
+ *   1. the switch, read now: a trip switched off since the claim gets nothing;
+ *   2. the audience, from the binding row and from nothing on the outbox row but its id (confirmAudience): a group that is
+ *      gone or belongs to another trip is `no_group`;
+ *   3. the bot's own rights, from Telegram: ONLY `creator`, or `administrator` with `can_change_info`, goes on. Anything
+ *      else is `bot_lacks_rights` and setChatPhoto is never called;
+ *   4. setChatPhoto with the bytes the site gave.
+ * A Telegram error (a rate limit, a rejected photo, no network) is retried exactly as any outbox send is, up to
+ * max_attempts, and only the last one is `failed`, with Telegram's own words. Every end writes its OUTCOME onto the row,
+ * drops the photo bytes from it, and settles the request: the site is told once every group's row has an outcome.
+ */
+async function dispatchGroupPhotoRow(
+  db: pg.Pool,
+  row: OutboxRow,
+  log: (line: string) => void,
+  options?: DispatchOptions,
+): Promise<boolean> {
+  const requestId = typeof row.payload?.request_id === "number" ? row.payload.request_id : null;
+  const requestKey = payloadString(row, "request_key");
+  const end = async (state: "sent" | "skipped" | "failed", outcome: GroupPhotoOutcome): Promise<boolean> => {
+    await db.query(
+      `UPDATE control_plane.notification_outbox
+       SET state = $2, sent_at = CASE WHEN $2 = 'sent' THEN now() ELSE sent_at END, updated_at = now(),
+           payload = (COALESCE(payload, '{}'::jsonb) - 'photo_base64') || jsonb_build_object('result', $3::jsonb)
+       WHERE id = $1`,
+      [row.id, state, JSON.stringify(outcome)],
+    );
+    log(structuredLog(outcome.status === "done" ? "info" : "warn", "outbox.group_photo_ended", { notification_id: row.id, status: outcome.status }));
+    if (options?.groupPhoto && row.trip_id && requestId !== null && requestKey) {
+      await settleGroupPhoto(db, options.groupPhoto.report, row.trip_id, requestKey, requestId, log);
+    }
+    return state === "sent";
+  };
+
+  const gp = options?.groupPhoto;
+  if (!gp || !row.trip_id || requestId === null || !requestKey) {
+    log(structuredLog("error", "outbox.group_photo_unconfigured", { notification_id: row.id, effect: "the request cannot be answered" }));
+    return end("failed", { status: "failed", detail: "The control plane could not set the photo." });
+  }
+  if (!(await gp.switchOn(row.trip_id))) {
+    return end("skipped", { status: "failed", detail: "The feature was switched off before the photo was sent." });
+  }
+  const audience = await confirmAudience(db, row);
+  if (!audience.ok) {
+    log(skippedLine(row.id, row.target, audience.reason));
+    return end("skipped", { status: "no_group", detail: null });
+  }
+  const encoded = payloadString(row, "photo_base64");
+  const png = encoded ? Buffer.from(encoded, "base64") : null;
+  if (!png || png.length < PNG_MAGIC.length || !png.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+    return end("failed", { status: "failed", detail: "The logo could not be read." });
+  }
+  try {
+    const botId = await gp.api.botId();
+    const member = await gp.api.getChatMember(audience.chatId, botId);
+    if (!mayChangeGroupPhoto(member)) {
+      return end("skipped", { status: "bot_lacks_rights", detail: whyNotAllowed(member) });
+    }
+    await gp.api.setChatPhoto(audience.chatId, png);
+  } catch (error) {
+    log(structuredLog("error", "outbox.dispatch_failed", {
+      safe_error_code: "GROUP_PHOTO_SEND_FAILED",
+      notification_id: row.id,
+      ...(error instanceof Error && error.name === "TelegramApiError" ? { telegram_status: (error as { httpStatus?: number }).httpStatus } : {}),
+    }));
+    if (row.attempt + 1 >= row.max_attempts) {
+      await db.query("UPDATE control_plane.notification_outbox SET attempt = attempt + 1 WHERE id = $1", [row.id]);
+      await end("failed", { status: "failed", detail: describeTelegramFailure(error) });
+      return false;
+    }
+    await db.query(
+      "UPDATE control_plane.notification_outbox SET state = 'pending', attempt = attempt + 1, updated_at = now() WHERE id = $1",
+      [row.id],
+    );
+    return false;
+  }
+  return end("sent", { status: "done", detail: null });
 }

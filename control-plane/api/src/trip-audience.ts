@@ -11,7 +11,7 @@ import { isPrivateChatId } from "./identity.js";
  * that the chat still belonged to the trip. A TARGETED row has no recipient (a CHECK in the database), only a trip and a
  * target; the chat is resolved from the trip's own open `telegram_chat_bindings` rows, and the dispatcher re-reads the
  * binding at the moment of sending (`confirmAudience`). No caller passes a chat id in, and nothing outside the control
- * plane can create a targeted row: `enqueueTripMessage` below is the only writer, and it is called by the poller.
+ * plane can create a targeted row: `enqueueTripMessage` below is the only writer, and it is called by the two pollers (plan-change-poller.ts, group-photo-poller.ts; plan-change-boundary.test.ts pins the list).
  *
  * `trip_group` is the only target built in this slice. `trip_organizer` is in the database's CHECK so a later release
  * (the morning briefing, flight alerts) does not need a migration, but nothing here resolves it: it resolves to nobody,

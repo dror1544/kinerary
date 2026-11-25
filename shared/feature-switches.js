@@ -90,6 +90,15 @@ const FEATURE_SWITCHES = Object.freeze([
     surfaces: Object.freeze(['relay', 'site', 'companion']),
     memberVisible: true,
   }),
+  // The bot sets the trip group's Telegram photo from the trip logo (docs/specs/sprint-9/x-trip-group-photo.md). On request
+  // only, and only after the bot's own rights in the bound group are checked. memberVisible because the site's offer after a
+  // logo change reads features.trip_group_photo, and #567 S2 serves only member-visible names.
+  Object.freeze({
+    name: 'trip_group_photo',
+    summary: 'An organizer can ask the bot to set the trip group\'s Telegram photo from the trip logo (website offer, companion, Claude/ChatGPT); the control plane checks the bot\'s rights first and reports the real result',
+    surfaces: Object.freeze(['site', 'companion', 'control_plane']),
+    memberVisible: true,
+  }),
 ]);
 
 // Fail loud at load: a malformed registry is a code bug, not a runtime state.
