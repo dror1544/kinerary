@@ -43,6 +43,7 @@ export const claimSchema = z.union([
     request: z.object({
       id: z.number().int().min(1),
       attempt: z.number().int().min(1).max(10),
+      claim_token: z.string().regex(/^[0-9a-f]{24}$/),
       logo_hash: z.string().max(64),
       requested_at: z.string().refine((value) => !Number.isNaN(Date.parse(value)), "not a time"),
     }),
@@ -123,6 +124,19 @@ async function readSwitch(deps: GroupPhotoPollerDeps, tripId: string, log: (line
 export const requestKeyFor = (tripId: string, requestId: number, requestedAt: string) =>
   `group-photo:${tripId}:${requestId}:${Date.parse(requestedAt)}`;
 
+/** Ends, without sending, every row of this site request that was queued under an older key and is still waiting. */
+async function supersedeOlderRows(db: pg.Pool, tripId: string, requestId: number, newKey: string, log: (line: string) => void): Promise<void> {
+  const ended = await db.query(
+    `UPDATE control_plane.notification_outbox
+     SET state = 'skipped', updated_at = now(),
+         payload = (payload - 'photo_base64') || jsonb_build_object('superseded_by', $4::text)
+     WHERE trip_id = $1 AND notification_type = $2 AND state = 'pending'
+       AND payload->>'request_id' = $3::text AND payload->>'request_key' IS DISTINCT FROM $4`,
+    [tripId, GROUP_PHOTO_TYPE, String(requestId), newKey],
+  );
+  if ((ended.rowCount ?? 0) > 0) log(structuredLog("info", "group_photo_poll.superseded", { trip_id: tripId, request_id: requestId, rows: ended.rowCount }));
+}
+
 async function pollTrip(deps: GroupPhotoPollerDeps, tripId: string, log: (line: string) => void): Promise<"enqueued" | "answered" | "none" | "failed"> {
   const fail = (code: string) => {
     log(structuredLog("warn", "group_photo_poll.failed", { trip_id: tripId, safe_error_code: code }));
@@ -140,7 +154,7 @@ async function pollTrip(deps: GroupPhotoPollerDeps, tripId: string, log: (line: 
 
   const answer = async (status: "no_group" | "failed", detail: string | null) => {
     try {
-      await deps.report(tripId, { request_id: request.id, status, detail });
+      await deps.report(tripId, { request_id: request.id, claim_token: request.claim_token, status, detail });
       log(structuredLog("info", "group_photo.reported", { trip_id: tripId, request_id: request.id, status }));
       return "answered" as const;
     } catch (error) {
@@ -165,6 +179,7 @@ async function pollTrip(deps: GroupPhotoPollerDeps, tripId: string, log: (line: 
         request_id: request.id,
         request_key: requestKey,
         attempt: request.attempt,
+        claim_token: request.claim_token,
         logo_hash: request.logo_hash,
         content_type: photo.content_type,
         photo_base64: photo.base64,
@@ -175,12 +190,23 @@ async function pollTrip(deps: GroupPhotoPollerDeps, tripId: string, log: (line: 
     return "failed";
   }
   if (written > 0) {
+    // A NEWER claim of the same site request (the organizer asked again, so its instant, and maybe its logo, changed) makes the
+    // older rows of that request that have not been sent stale: they end superseded and are never sent, so the group is not
+    // sent two photos for one request and the older one cannot land after the newer. A row already being sent cannot be taken
+    // back (see dispatchGroupPhotoRow), and the site's token check keeps its answer from being taken for this claim.
+    await supersedeOlderRows(deps.db, tripId, request.id, requestKey, log);
     log(structuredLog("info", "group_photo_poll.enqueued", { trip_id: tripId, request_id: request.id, groups: written }));
     return "enqueued";
   }
   // Nothing written: this request is already in the outbox (claimed again after a report that never arrived). Its rows hold
-  // the outcome, so say it again; a row still waiting to be sent will report itself.
-  const settled = await settleGroupPhoto(deps.db, deps.report, tripId, requestKey, request.id, log);
+  // the outcome, so say it again, for THIS claim; a row still waiting to be sent is moved onto this claim's token, so it
+  // reports for the claim the site now holds out.
+  await deps.db.query(
+    `UPDATE control_plane.notification_outbox SET payload = jsonb_set(payload, '{claim_token}', to_jsonb($4::text))
+     WHERE trip_id = $1 AND notification_type = $2 AND state = 'pending' AND payload->>'request_key' = $3`,
+    [tripId, GROUP_PHOTO_TYPE, requestKey, request.claim_token],
+  );
+  const settled = await settleGroupPhoto(deps.db, deps.report, tripId, requestKey, request.id, request.claim_token, log);
   return settled === "reported" ? "answered" : settled === "unreported" ? "failed" : "none";
 }
 

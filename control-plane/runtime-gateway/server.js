@@ -390,10 +390,11 @@ async function groupPhoto(req, res, tripId, action) {
     if (!given || typeof given !== "object" || Array.isArray(given)) return json(res, 400, { error: "INVALID_REQUEST" });
     const detail = given.detail ?? null;
     if (!Number.isInteger(given.request_id) || given.request_id < 1 || !GROUP_PHOTO_RESULTS.has(given.status)
+      || typeof given.claim_token !== "string" || !/^[0-9a-f]{24}$/.test(given.claim_token)
       || (detail !== null && (typeof detail !== "string" || detail.length > 300))) {
       return json(res, 400, { error: "INVALID_REQUEST" });
     }
-    body = { tripId, request_id: given.request_id, status: given.status, detail };
+    body = { tripId, request_id: given.request_id, claim_token: given.claim_token, status: given.status, detail };
   } else {
     req.resume(); // nothing is read from a claim
   }

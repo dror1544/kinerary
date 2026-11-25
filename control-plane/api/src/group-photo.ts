@@ -29,6 +29,8 @@ export interface GroupPhotoOutcome {
 
 export interface GroupPhotoReport extends GroupPhotoOutcome {
   request_id: number;
+  /** The identity of the claim being answered, exactly as the site handed it out. The site refuses an answer for any other claim. */
+  claim_token: string;
 }
 
 export type GroupPhotoReporter = (tripId: string, report: GroupPhotoReport) => Promise<void>;
@@ -68,8 +70,9 @@ export function describeTelegramFailure(error: unknown): string {
 }
 
 /**
- * Posts the answer to the gateway, which hands it to the trip's site with that trip's key. 404 and 409 mean the site has
- * already settled this request (finished, or no longer there): nothing more to do, not an error. Anything else throws a
+ * Posts the answer to the gateway, which hands it to the trip's site with that trip's key. 404 and 409 mean the site will not
+ * take it: the request is finished, gone, or the claim has been overtaken (a stale token). Nothing more can be done with it,
+ * so it is not an error here; the request comes back to be claimed again, and the answer is made again with the new claim. Anything else throws a
  * code, never an address or a key, and the caller records that the report is still owed.
  */
 export function createGroupPhotoReporter(options: {
@@ -85,7 +88,7 @@ export function createGroupPhotoReporter(options: {
       response = await doFetch(`${origin}/internal/t/${encodeURIComponent(tripId)}/group-photo/result`, {
         method: "POST",
         headers: { "x-api-key": options.exchangeKey, "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({ request_id: report.request_id, status: report.status, detail: report.detail }),
+        body: JSON.stringify({ request_id: report.request_id, claim_token: report.claim_token, status: report.status, detail: report.detail }),
         // The control-plane key rides this request: it is never forwarded to wherever a redirect points.
         redirect: "manual",
         signal: AbortSignal.timeout(REPORT_TIMEOUT_MS),
@@ -132,7 +135,8 @@ export function foldOutcomes(outcomes: readonly (GroupPhotoOutcome | null)[]): G
 }
 
 /**
- * Reports a request's answer, once every one of its rows has an outcome. Returns `waiting` while a row has none (the
+ * Reports a request's answer, once every one of its rows has an outcome, for the claim `claimToken` (the newest the poller
+ * was handed: a re-claim moves it onto the rows still waiting, and the caller passes the one in force). Returns `waiting` while a row has none (the
  * dispatcher will call this again when it finishes it), `reported` when the site has the answer, and `unreported` when the
  * report failed (logged by code; the site puts the request back after ten minutes, the poller claims it again, finds the
  * rows already decided, and calls this again: nothing is sent twice).
@@ -143,6 +147,7 @@ export async function settleGroupPhoto(
   tripId: string,
   requestKey: string,
   requestId: number,
+  claimToken: string,
   log: (line: string) => void = () => {},
 ): Promise<"waiting" | "reported" | "unreported"> {
   const rows = await db.query<OutcomeRow>(
@@ -153,7 +158,7 @@ export async function settleGroupPhoto(
   const folded = foldOutcomes(rows.rows.map((row) => readOutcome(row.result)));
   if (!folded) return "waiting";
   try {
-    await report(tripId, { request_id: requestId, status: folded.status, detail: folded.detail });
+    await report(tripId, { request_id: requestId, claim_token: claimToken, status: folded.status, detail: folded.detail });
     log(structuredLog("info", "group_photo.reported", { trip_id: tripId, request_id: requestId, status: folded.status }));
     return "reported";
   } catch (error) {

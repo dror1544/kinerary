@@ -14,6 +14,7 @@
 // at most three times, then failed. Nothing here loops: every transition is a bounded one.
 
 const fs = require('node:fs');
+const { randomBytes } = require('node:crypto');
 const sharp = require('sharp');
 
 const SWITCH = 'trip_group_photo';
@@ -22,6 +23,7 @@ const EXPIRES_AFTER = '-24 hours';
 const SENDING_TIMEOUT = '-10 minutes';
 const MAX_CLAIMS = 3;
 const MAX_DETAIL = 300;
+const CLAIM_TOKEN = /^[0-9a-f]{24}$/;
 /** What the control plane may report. `pending`, `sending` and `expired` are the site's own words, never taken from it. */
 const REPORTABLE = new Set(['done', 'bot_lacks_rights', 'no_group', 'no_logo', 'failed']);
 const FINISHED = new Set(['done', 'bot_lacks_rights', 'no_group', 'no_logo', 'failed', 'expired']);
@@ -49,9 +51,12 @@ function schema(db) {
       detail TEXT,
       claimed_at TEXT,
       claims INTEGER NOT NULL DEFAULT 0,
-      finished_at TEXT
+      finished_at TEXT,
+      claim_token TEXT
     );
   `);
+  // The same pattern as the other tables: a table made before the column existed gains it.
+  try { db.exec('ALTER TABLE trip_group_photo_requests ADD COLUMN claim_token TEXT'); } catch { /* already there */ }
 }
 
 // Telegram's own words, kept short, with no control characters (they are shown to an organizer and logged nowhere else).
@@ -105,6 +110,8 @@ function create({ db, effectiveLogo, featureOn }) {
       `UPDATE trip_group_photo_requests SET status = 'pending'
        WHERE status = 'sending' AND claimed_at < datetime('now', ?)`,
     ).run(SENDING_TIMEOUT);
+    // A request that went back to pending belongs to nobody: the claim that stalled can no longer answer for it.
+    db.prepare("UPDATE trip_group_photo_requests SET claim_token = NULL WHERE status = 'pending' AND claim_token IS NOT NULL").run();
   });
 
   const request = (username) => {
@@ -114,7 +121,7 @@ function create({ db, effectiveLogo, featureOn }) {
     // Two requests in a row are one: the one that has not run yet takes the newer asker and the newer logo.
     const waiting = db.prepare("SELECT id FROM trip_group_photo_requests WHERE status = 'pending' ORDER BY id DESC LIMIT 1").get();
     if (waiting) {
-      db.prepare("UPDATE trip_group_photo_requests SET logo_hash = ?, requested_by = ?, requested_at = datetime('now'), claims = 0, detail = NULL WHERE id = ?")
+      db.prepare("UPDATE trip_group_photo_requests SET logo_hash = ?, requested_by = ?, requested_at = datetime('now'), claims = 0, detail = NULL, claim_token = NULL WHERE id = ?")
         .run(logo.hash || '', username, waiting.id);
       return { row: byId.get(waiting.id) };
     }
@@ -149,34 +156,48 @@ function create({ db, effectiveLogo, featureOn }) {
       finish(row.id, 'failed', 'The logo file could not be read.');
       return null;
     }
-    // render() was async: only the caller whose update lands owns the request.
+    // render() was async: only the caller whose update lands owns the request. The token is the claim's identity: the
+    // control plane carries it back with its result, and a result with any other token (an older claim that stalled, the
+    // request since re-asked) is refused.
+    const claimToken = randomBytes(12).toString('hex');
     const taken = db.prepare(
-      "UPDATE trip_group_photo_requests SET status = 'sending', claimed_at = datetime('now'), claims = claims + 1, logo_hash = ? WHERE id = ? AND status = 'pending'",
-    ).run(logo.hash || row.logo_hash, row.id);
+      "UPDATE trip_group_photo_requests SET status = 'sending', claimed_at = datetime('now'), claims = claims + 1, logo_hash = ?, claim_token = ? WHERE id = ? AND status = 'pending'",
+    ).run(logo.hash || row.logo_hash, claimToken, row.id);
     if (taken.changes !== 1) return null;
     const claimed = byId.get(row.id);
     return {
-      request: { id: claimed.id, attempt: claimed.claims, logo_hash: claimed.logo_hash, requested_at: iso(claimed.requested_at) },
+      request: { id: claimed.id, attempt: claimed.claims, claim_token: claimToken, logo_hash: claimed.logo_hash, requested_at: iso(claimed.requested_at) },
       photo: { content_type: 'image/png', base64: png.toString('base64') },
     };
   };
 
-  /** The control plane's answer. Returns { status: <http>, body }. */
+  /**
+   * The control plane's answer. Returns { http, body }. It is taken only for the claim that is out NOW: the request must be
+   * `sending` and the token must be the one the claim handed out. Anything else is 409 and changes nothing: a request that is
+   * pending (nobody has it), and a late answer from a claim that stalled and was overtaken (the request since re-asked, or
+   * handed out again) must never mark a request done whose current logo was not sent.
+   */
   const report = (body) => {
     const id = body && body.request_id;
     const status = body && body.status;
-    if (!Number.isInteger(id) || id < 1 || !REPORTABLE.has(status) || (body.detail !== undefined && body.detail !== null && typeof body.detail !== 'string')) {
+    const claimToken = body && body.claim_token;
+    if (!Number.isInteger(id) || id < 1 || !REPORTABLE.has(status) || typeof claimToken !== 'string' || !CLAIM_TOKEN.test(claimToken)
+      || (body.detail !== undefined && body.detail !== null && typeof body.detail !== 'string')) {
       return { http: 400, body: { error: 'INVALID_REQUEST' } };
     }
     sweep();
     const row = byId.get(id);
     if (!row) return { http: 404, body: { error: 'NOT_FOUND' } };
+    if (row.claim_token !== claimToken) return { http: 409, body: { error: 'STALE_CLAIM' } };
     if (FINISHED.has(row.status)) {
       // Said twice (a re-report after a lost answer) is fine; a different word for a finished request is not.
       return row.status === status ? { http: 200, body: { ok: true } } : { http: 409, body: { error: 'ALREADY_FINISHED' } };
     }
-    finish(id, status, cleanDetail(body.detail));
-    return { http: 200, body: { ok: true } };
+    if (row.status !== 'sending') return { http: 409, body: { error: 'NOT_OUT' } };
+    const done = db.prepare(
+      "UPDATE trip_group_photo_requests SET status = ?, detail = ?, finished_at = datetime('now') WHERE id = ? AND status = 'sending' AND claim_token = ?",
+    ).run(status, cleanDetail(body.detail), id, claimToken);
+    return done.changes === 1 ? { http: 200, body: { ok: true } } : { http: 409, body: { error: 'STALE_CLAIM' } };
   };
 
   /**

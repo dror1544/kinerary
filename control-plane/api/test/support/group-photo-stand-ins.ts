@@ -164,7 +164,7 @@ export async function startPhotoGateway(callerKey: string, siteOrigin: () => str
       const upstream = await fetch(`${siteOrigin()}/api/internal/control-plane/group-photo/${action}`, {
         method: "POST",
         headers: { "x-api-key": tripKey(tripId), "content-type": "application/json" },
-        body: JSON.stringify(action === "result" ? { tripId, request_id: given.request_id, status: given.status, detail: given.detail ?? null } : { tripId }),
+        body: JSON.stringify(action === "result" ? { tripId, request_id: given.request_id, claim_token: given.claim_token, status: given.status, detail: given.detail ?? null } : { tripId }),
         redirect: "manual",
       });
       res.writeHead(upstream.status, { "content-type": "application/json" });

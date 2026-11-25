@@ -18,6 +18,7 @@ const EXCHANGE = "exchange-key";
 const LEGACY = "legacy-key-do-not-use";
 const PORTAL = "https://app.example.test";
 const CAP = 3 * 1024 * 1024;
+const TOKEN = "0123456789abcdef01234567";
 const CLAIM = { request: { id: 7, attempt: 1, logo_hash: "0123456789abcdef", requested_at: "2026-12-03T10:00:00Z" }, photo: { content_type: "image/png", base64: "AAAA" } };
 
 const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${server.address().port}`)));
@@ -95,19 +96,20 @@ test("claim: the site is POSTed with the trip's own derived key and a body built
   assert.ok(![EXCHANGE, LEGACY, MASTER].includes(seen.key));
 });
 
-test("result: only request_id, status and detail are forwarded, with the path's trip id", async () => {
+test("result: only request_id, claim_token, status and detail are forwarded, with the path's trip id", async () => {
   const gw = await startGateway();
   reset();
-  const response = await post(gw, TRIP_D, "result", { body: { request_id: 7, status: "bot_lacks_rights", detail: "administrator without can_change_info", tripId: "trip_someoneelse01", extra: 1 } });
+  const response = await post(gw, TRIP_D, "result", { body: { request_id: 7, claim_token: TOKEN, status: "bot_lacks_rights", detail: "administrator without can_change_info", tripId: "trip_someoneelse01", extra: 1 } });
   assert.equal(response.status, 200);
-  assert.deepEqual(JSON.parse(trips[TRIP_D].seen[0].body), { tripId: TRIP_D, request_id: 7, status: "bot_lacks_rights", detail: "administrator without can_change_info" });
+  assert.deepEqual(JSON.parse(trips[TRIP_D].seen[0].body), { tripId: TRIP_D, request_id: 7, claim_token: TOKEN, status: "bot_lacks_rights", detail: "administrator without can_change_info" });
   assert.equal(trips[TRIP_D].seen[0].url, "/api/internal/control-plane/group-photo/result");
 });
 
 test("result: a body that is not a closed-set report is 400 and nothing reaches the trip", async () => {
   const gw = await startGateway();
   reset();
-  for (const bad of [{}, { request_id: 7 }, { request_id: "7", status: "done" }, { request_id: 0, status: "done" }, { request_id: 7, status: "expired" }, { request_id: 7, status: "pending" }, { request_id: 7, status: "done", detail: 5 }, { request_id: 7, status: "failed", detail: "x".repeat(301) }, [], "done"]) {
+  const ok = { request_id: 7, claim_token: TOKEN, status: "done" };
+  for (const bad of [{}, { request_id: 7 }, { ...ok, request_id: "7" }, { ...ok, request_id: 0 }, { ...ok, status: "expired" }, { ...ok, status: "pending" }, { ...ok, detail: 5 }, { ...ok, status: "failed", detail: "x".repeat(301) }, { request_id: 7, status: "done" }, { ...ok, claim_token: 5 }, { ...ok, claim_token: "short" }, { ...ok, claim_token: "Z".repeat(24) }, [], "done"]) {
     assert.equal((await post(gw, TRIP_D, "result", { body: bad })).status, 400, JSON.stringify(bad));
   }
   const notJson = await fetch(`${gw.origin}/internal/t/${TRIP_D}/group-photo/result`, { method: "POST", headers: { "x-api-key": EXCHANGE, "content-type": "application/json" }, body: "{nope" });
@@ -119,7 +121,7 @@ test("no key, a wrong key, a trip's own key and the legacy key are all 401 and n
   const gw = await startGateway();
   reset();
   for (const key of [null, "nope", derive(TRIP_D), LEGACY]) {
-    for (const action of ["claim", "result"]) assert.equal((await post(gw, TRIP_D, action, { key, body: { request_id: 7, status: "done" } })).status, 401, `${key} ${action}`);
+    for (const action of ["claim", "result"]) assert.equal((await post(gw, TRIP_D, action, { key, body: { request_id: 7, claim_token: TOKEN, status: "done" } })).status, 401, `${key} ${action}`);
   }
   assert.deepEqual(trips[TRIP_D].seen, []);
 });

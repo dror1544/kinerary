@@ -43,6 +43,8 @@ const internal = (path, { key = EXCHANGE_KEY, trip = TRIP_ID, body = {} } = {}) 
   headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}) },
   body: JSON.stringify({ ...(trip ? { tripId: trip } : {}), ...body }),
 });
+// A result carries the claim's own identity back (request id and claim token), as the control plane's reporter does.
+const report = (claimed, status, detail) => internal('/result', { body: { request_id: claimed.request.id, claim_token: claimed.request.claim_token, status, ...(detail === undefined ? {} : { detail }) } });
 const requestPhoto = (token, extra = {}) => api('/api/group-photo', { method: 'POST', token, body: {}, ...extra });
 const status = async (token) => (await api('/api/group-photo', { token })).json();
 let db;
@@ -129,11 +131,12 @@ describe('the group photo, switch on', () => {
     const body = await res.json();
     // The keys the control plane's poller takes (control-plane/api/src/group-photo-poller.ts claimSchema; pinned there too).
     assert.deepEqual(Object.keys(body).sort(), ['photo', 'request']);
-    assert.deepEqual(Object.keys(body.request).sort(), ['attempt', 'id', 'logo_hash', 'requested_at']);
+    assert.deepEqual(Object.keys(body.request).sort(), ['attempt', 'claim_token', 'id', 'logo_hash', 'requested_at']);
     assert.deepEqual(Object.keys(body.photo).sort(), ['base64', 'content_type']);
     assert.ok(!Number.isNaN(Date.parse(body.request.requested_at)));
     assert.equal(body.request.id, rows()[0].id);
     assert.equal(body.request.attempt, 1);
+    assert.match(body.request.claim_token, /^[0-9a-f]{24}$/);
     assert.match(body.request.logo_hash, /^[0-9a-f]{16}$/);
     assert.equal(body.photo.content_type, 'image/png');
     const bytes = Buffer.from(body.photo.base64, 'base64');
@@ -146,31 +149,66 @@ describe('the group photo, switch on', () => {
     assert.deepEqual(await (await internal('/claim')).json(), { request: null });
   });
 
-  test('a result: the control plane\'s answer is only taken for a request that is out, from a closed set, and detail is clipped', async () => {
-    const id = rows()[0].id;
+  test('a result: only for a request that is out, with the claim\'s own token, from a closed set, and detail is clipped', async () => {
+    const out = rows()[0];
+    const id = out.id;
+    const token1 = out.claim_token;
+    assert.match(token1, /^[0-9a-f]{24}$/, 'the claim left its token on the row');
     for (const bad of [{ request_id: id, status: 'pending' }, { request_id: id, status: 'sending' }, { request_id: id, status: 'expired' }, { request_id: id, status: 'surprise' }, { request_id: 'x', status: 'done' }, { status: 'done' }]) {
-      assert.equal((await internal('/result', { body: bad })).status, 400, JSON.stringify(bad));
+      assert.equal((await internal('/result', { body: { claim_token: token1, ...bad } })).status, 400, JSON.stringify(bad));
     }
-    assert.equal((await internal('/result', { body: { request_id: id + 100, status: 'done' } })).status, 404);
-    assert.equal((await internal('/result', { key: 'nope', body: { request_id: id, status: 'done' } })).status, 401);
-    assert.equal(rows()[0].status, 'sending');
+    for (const bad of [{ request_id: id, status: 'done' }, { request_id: id, status: 'done', claim_token: 5 }, { request_id: id, status: 'done', claim_token: 'zz' }]) {
+      assert.equal((await internal('/result', { body: bad })).status, 400, `no usable claim token: ${JSON.stringify(bad)}`);
+    }
+    assert.equal((await internal('/result', { body: { request_id: id + 100, status: 'done', claim_token: token1 } })).status, 404);
+    assert.equal((await internal('/result', { key: 'nope', body: { request_id: id, status: 'done', claim_token: token1 } })).status, 401);
+    assert.equal((await internal('/result', { body: { request_id: id, status: 'done', claim_token: 'f'.repeat(24) } })).status, 409, 'another claim\'s token');
+    assert.equal(rows()[0].status, 'sending', 'none of those moved it');
     const long = `${'x'.repeat(400)}\u0007\n`;
-    const res = await internal('/result', { body: { request_id: id, status: 'failed', detail: long } });
+    const res = await internal('/result', { body: { request_id: id, claim_token: token1, status: 'failed', detail: long } });
     assert.equal(res.status, 200);
     const seen = await status(token);
     assert.equal(seen.status, 'failed');
     assert.equal(seen.request.detail.length, 300);
     assert.doesNotMatch(seen.request.detail, /[\u0000-\u001f]/);
     // The same word again is harmless; a different one for a finished request is refused.
-    assert.equal((await internal('/result', { body: { request_id: id, status: 'failed' } })).status, 200);
-    assert.equal((await internal('/result', { body: { request_id: id, status: 'done' } })).status, 409);
+    assert.equal((await internal('/result', { body: { request_id: id, claim_token: token1, status: 'failed' } })).status, 200);
+    assert.equal((await internal('/result', { body: { request_id: id, claim_token: token1, status: 'done' } })).status, 409);
     assert.equal((await status(token)).status, 'failed');
+  });
+
+  test('a result is refused for a request that is still pending, and for a claim that has been overtaken (stall, new logo, re-ask)', async () => {
+    await putLogo(token, await png(80, 80, '#ff0000'));
+    await requestPhoto(token);
+    const pendingRow = rows().at(-1);
+    // A pending row: nobody has it, so nobody can answer for it, whatever token they bring.
+    assert.equal((await internal('/result', { body: { request_id: pendingRow.id, claim_token: 'a'.repeat(24), status: 'done' } })).status, 409);
+    assert.equal(rows().at(-1).status, 'pending');
+    // The control plane takes it, then stalls past ten minutes. A new logo and a re-ask follow.
+    const old = await (await internal('/claim')).json();
+    db.prepare("UPDATE trip_group_photo_requests SET claimed_at = datetime('now', '-11 minutes') WHERE id = ?").run(old.request.id);
+    await putLogo(token, await png(80, 80, '#00ff00'));
+    assert.equal((await requestPhoto(token)).status, 202);
+    assert.equal(rows().at(-1).status, 'pending');
+    // The old claim's late "done" must not mark the re-ask done: the new logo was never sent.
+    assert.equal((await report(old, 'done')).status, 409);
+    assert.equal(rows().at(-1).status, 'pending');
+    assert.equal((await status(token)).status, 'pending');
+    // Handed out again, it has a new token; the old one still does nothing, the new one does.
+    const fresh = await (await internal('/claim')).json();
+    assert.equal(fresh.request.id, old.request.id);
+    assert.notEqual(fresh.request.claim_token, old.request.claim_token);
+    assert.equal((await report(old, 'done')).status, 409);
+    assert.equal(rows().at(-1).status, 'sending');
+    assert.deepEqual(await pixel(Buffer.from(fresh.photo.base64, 'base64'), 320, 320), [0, 255, 0]);
+    assert.equal((await report(fresh, 'done')).status, 200);
+    assert.equal((await status(token)).status, 'done');
   });
 
   test('AC-2 (words): bot_lacks_rights reads with the instruction a person can act on', async () => {
     await requestPhoto(token);
     const claimed = await (await internal('/claim')).json();
-    assert.equal((await internal('/result', { body: { request_id: claimed.request.id, status: 'bot_lacks_rights', detail: 'administrator without can_change_info' } })).status, 200);
+    assert.equal((await report(claimed, 'bot_lacks_rights', 'administrator without can_change_info')).status, 200);
     const seen = await status(token);
     assert.equal(seen.status, 'bot_lacks_rights');
     assert.equal(seen.message, 'Make the bot an admin with "Change group info", then ask again.');
@@ -179,12 +217,12 @@ describe('the group photo, switch on', () => {
   test('AC-3: no_group reads as such, and AC-1: done reads as done', async () => {
     await requestPhoto(token);
     let claimed = await (await internal('/claim')).json();
-    await internal('/result', { body: { request_id: claimed.request.id, status: 'no_group' } });
+    await report(claimed, 'no_group');
     assert.equal((await status(token)).status, 'no_group');
     assert.match((await status(token)).message, /no telegram group/i);
     await requestPhoto(token);
     claimed = await (await internal('/claim')).json();
-    await internal('/result', { body: { request_id: claimed.request.id, status: 'done' } });
+    await report(claimed, 'done');
     const seen = await status(token);
     assert.equal(seen.status, 'done');
     assert.match(seen.message, /group's photo is now the trip logo/i);
@@ -199,7 +237,7 @@ describe('the group photo, switch on', () => {
     assert.equal(rows().length, before + 1, 'the second request replaced the first, which had not run');
     const claimed = await (await internal('/claim')).json();
     assert.deepEqual(await pixel(Buffer.from(claimed.photo.base64, 'base64'), 320, 320), [0, 0, 255]);
-    await internal('/result', { body: { request_id: claimed.request.id, status: 'done' } });
+    await report(claimed, 'done');
   });
 
   test('AC-7: a logo replaced AFTER the request and before it is taken is the one sent (the old file is gone), and the request records the hash actually sent', async () => {
@@ -211,7 +249,7 @@ describe('the group photo, switch on', () => {
     assert.deepEqual(await pixel(Buffer.from(claimed.photo.base64, 'base64'), 320, 320), [0, 255, 0]);
     assert.notEqual(claimed.request.logo_hash, askedWith);
     assert.equal(rows().at(-1).logo_hash, claimed.request.logo_hash);
-    await internal('/result', { body: { request_id: claimed.request.id, status: 'done' } });
+    await report(claimed, 'done');
   });
 
   test('AC-7: a request made while another is already out waits its turn: one at a time, and the newest logo is the last one sent', async () => {
@@ -224,11 +262,11 @@ describe('the group photo, switch on', () => {
     assert.equal(second.status, 'pending');
     assert.notEqual(second.request.id, first.request.id, 'the one in flight cannot be taken back, so this is a new request');
     assert.deepEqual(await (await internal('/claim')).json(), { request: null }, 'not while the first is out');
-    await internal('/result', { body: { request_id: first.request.id, status: 'done' } });
+    await report(first, 'done');
     const next = await (await internal('/claim')).json();
     assert.equal(next.request.id, second.request.id);
     assert.deepEqual(await pixel(Buffer.from(next.photo.base64, 'base64'), 320, 320), [0, 0, 255], 'the newest logo goes last, so it is the group\'s photo in the end');
-    await internal('/result', { body: { request_id: next.request.id, status: 'done' } });
+    await report(next, 'done');
   });
 
   test('AC-7: a request older than 24 hours that never ran is expired, and is never sent', async () => {

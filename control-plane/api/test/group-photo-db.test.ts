@@ -27,6 +27,8 @@ const KEY = "test-exchange-key-not-a-real-one";
 const GROUP = "-1001000000011";
 const GROUP_2 = "-1001000000022";
 const CLAIM_AT = "2026-12-03T10:00:00Z";
+const TOKEN_A = "aaaaaaaaaaaaaaaaaaaaaaaa";
+const TOKEN_B = "bbbbbbbbbbbbbbbbbbbbbbbb";
 
 let pool: pg.Pool;
 let site: StubPhotoSite;
@@ -37,7 +39,7 @@ let tripId: string;
 let logs: string[];
 
 const claimAnswer = (id = 7, over: Record<string, unknown> = {}) => ({
-  request: { id, attempt: 1, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT },
+  request: { id, attempt: 1, claim_token: TOKEN_A, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT },
   photo: { content_type: "image/png", base64: TINY_PNG_BASE64 },
   ...over,
 });
@@ -60,6 +62,7 @@ const rows = async () => (await pool.query<{ id: string; state: string; attempt:
   "SELECT id, state, attempt, target, recipient, binding_id, payload, dedupe_key FROM control_plane.notification_outbox WHERE notification_type = 'trip_group_photo' ORDER BY created_at, id",
 )).rows;
 const reported = () => site.results.map((r) => ({ id: r.body.request_id, status: r.body.status, detail: r.body.detail }));
+const tokensReported = () => site.results.map((r) => r.body.claim_token);
 const admin = { status: "administrator", can_change_info: true };
 
 describe("the trip group's photo (control plane)", { skip }, () => {
@@ -117,6 +120,7 @@ describe("the trip group's photo (control plane)", { skip }, () => {
     assert.deepEqual(set.photo, Buffer.from(TINY_PNG_BASE64, "base64"), "the bytes the site gave arrive as the multipart file");
     assert.equal(set.photoName, "logo.png");
     assert.deepEqual(reported(), [{ id: 7, status: "done", detail: null }]);
+    assert.deepEqual(tokensReported(), [TOKEN_A], "the result carries the claim's own token back");
     const [done] = await rows();
     assert.equal(done!.state, "sent");
     assert.deepEqual(done!.payload.result, { status: "done", detail: null });
@@ -177,7 +181,7 @@ describe("the trip group's photo (control plane)", { skip }, () => {
       telegram.calls.length = 0; site.results.length = 0;
       telegram.members.set(GROUP, member);
       // A fresh request each time (a different instant), the way a second ask is.
-      site.claimAnswers.push(claimAnswer(100 + trace.length, { request: { id: 100 + trace.length, attempt: 1, logo_hash: "0123456789abcdef", requested_at: `2026-12-03T1${trace.length}:00:00Z` } }));
+      site.claimAnswers.push(claimAnswer(100 + trace.length, { request: { id: 100 + trace.length, attempt: 1, claim_token: TOKEN_A, logo_hash: "0123456789abcdef", requested_at: `2026-12-03T1${trace.length}:00:00Z` } }));
       await poll(); await dispatch();
       trace.push(`bot is: ${label}`);
       for (const call of telegram.calls) trace.push(`  Bot API <- ${call.method}${call.chatId ? ` chat_id=<the bound group>${call.chatId === GROUP ? "" : " (WRONG CHAT)"}` : ""}${call.userId ? ` user_id=<the bot>${call.userId === BOT_ID ? "" : " (WRONG USER)"}` : ""}${call.photo ? ` photo=${call.photo.length} bytes` : ""}`);
@@ -222,7 +226,7 @@ describe("the trip group's photo (control plane)", { skip }, () => {
   // ── AC-5 ──────────────────────────────────────────────────────────────────────────────────────────────────────────
   test("AC-5: the chat is the trip's own binding's, whatever the site's answer says; no chat id is in the row's payload", async () => {
     telegram.members.set("-100999", admin);
-    site.claimAnswers.push(claimAnswer(7, { chat_id: "-100999", request: { id: 7, attempt: 1, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT, chat_id: "-100999" } }));
+    site.claimAnswers.push(claimAnswer(7, { chat_id: "-100999", request: { id: 7, attempt: 1, claim_token: TOKEN_A, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT, chat_id: "-100999" } }));
     await poll(); await dispatch();
     assert.deepEqual(telegram.calls.filter((c) => c.method !== "getMe").map((c) => c.chatId), [GROUP, GROUP]);
     assert.ok(!JSON.stringify((await rows())[0]!.payload).includes("-100"), "no chat id anywhere in the payload");
@@ -311,10 +315,11 @@ describe("the trip group's photo (control plane)", { skip }, () => {
     assert.ok(logs.some((line) => line.includes("group_photo.report_failed")));
     // Ten minutes on, the site puts the request back and the poller is handed it again (same request, second attempt).
     gateway.failResults = false;
-    site.claimAnswers.push(claimAnswer(7, { request: { id: 7, attempt: 2, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT } }));
+    site.claimAnswers.push(claimAnswer(7, { request: { id: 7, attempt: 2, claim_token: TOKEN_B, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT } }));
     assert.deepEqual(await poll(), { polled: 1, enqueued: 0, answered: 1, failed: 0 });
     assert.equal(telegram.count("setChatPhoto"), 1, "still one");
     assert.deepEqual(reported(), [{ id: 7, status: "done", detail: null }]);
+    assert.deepEqual(tokensReported(), [TOKEN_B], "answered for the claim the site holds out NOW, not the one that was lost");
     assert.equal((await rows()).length, 1);
   });
 
@@ -329,7 +334,7 @@ describe("the trip group's photo (control plane)", { skip }, () => {
   test("AC-7: a second request (a different instant) is a new one, with its own row, and its own photo", async () => {
     site.claimAnswers.push(claimAnswer());
     await poll(); await dispatch();
-    site.claimAnswers.push(claimAnswer(8, { request: { id: 8, attempt: 1, logo_hash: "fedcba9876543210", requested_at: "2026-12-03T11:00:00Z" } }));
+    site.claimAnswers.push(claimAnswer(8, { request: { id: 8, attempt: 1, claim_token: TOKEN_A, logo_hash: "fedcba9876543210", requested_at: "2026-12-03T11:00:00Z" } }));
     await poll(); await dispatch();
     assert.equal(telegram.count("setChatPhoto"), 2);
     assert.deepEqual(reported().map((r) => r.id), [7, 8]);
@@ -352,10 +357,10 @@ describe("the trip group's photo (control plane)", { skip }, () => {
 
   test("the contract with the site: the poller's schema takes exactly the keys tests/group-photo-site.test.js pins the site's claim to", () => {
     // Restated on purpose. The site's test asserts the claim's keys are these, and this fails if the schema stops matching.
-    const site = { request: { id: 7, attempt: 1, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT }, photo: { content_type: "image/png", base64: TINY_PNG_BASE64 } };
+    const site = { request: { id: 7, attempt: 1, claim_token: TOKEN_A, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT }, photo: { content_type: "image/png", base64: TINY_PNG_BASE64 } };
     assert.equal(claimSchema.safeParse(site).success, true);
     assert.equal(claimSchema.safeParse({ request: null }).success, true);
-    for (const missing of ["id", "attempt", "logo_hash", "requested_at"] as const) {
+    for (const missing of ["id", "attempt", "claim_token", "logo_hash", "requested_at"] as const) {
       const { [missing]: _gone, ...rest } = site.request;
       assert.equal(claimSchema.safeParse({ ...site, request: rest }).success, false, `${missing} is required`);
     }
@@ -364,6 +369,55 @@ describe("the trip group's photo (control plane)", { skip }, () => {
     // A key the site adds later is dropped, never forwarded.
     const parsed = claimSchema.parse({ ...site, request: { ...site.request, chat_id: "-100" } });
     assert.equal(JSON.stringify(parsed).includes("-100"), false);
+  });
+
+  // ── Claim identity and supersession (boundary review of #664: F2, F3) ─────────────────────────────────────────────
+  test("F2: a request handed out again while its row waits moves the row onto the NEW claim's token, so the answer is for the claim the site holds out", async () => {
+    site.claimAnswers.push(claimAnswer());
+    await poll();
+    site.claimAnswers.push(claimAnswer(7, { request: { id: 7, attempt: 2, claim_token: TOKEN_B, logo_hash: "0123456789abcdef", requested_at: CLAIM_AT } }));
+    assert.deepEqual(await poll(), { polled: 1, enqueued: 0, answered: 0, failed: 0 });
+    assert.equal((await rows())[0]!.payload.claim_token, TOKEN_B);
+    await dispatch();
+    assert.deepEqual(tokensReported(), [TOKEN_B]);
+  });
+
+  test("F3: a newer claim of the same site request (another instant) ends the older unsent row as superseded: one setChatPhoto, the newer photo, one answer", async () => {
+    const pngWith = (tail: string) => Buffer.concat([Buffer.from(TINY_PNG_BASE64, "base64"), Buffer.from(tail)]).toString("base64");
+    site.claimAnswers.push(claimAnswer(7, { photo: { content_type: "image/png", base64: pngWith("-first") } }));
+    await poll();
+    site.claimAnswers.push(claimAnswer(7, {
+      request: { id: 7, attempt: 1, claim_token: TOKEN_B, logo_hash: "fedcba9876543210", requested_at: "2026-12-03T11:00:00Z" },
+      photo: { content_type: "image/png", base64: pngWith("-second") },
+    }));
+    assert.equal((await poll()).enqueued, 1);
+    const all = await rows();
+    assert.equal(all.length, 2);
+    const [older, newer] = all;
+    assert.equal(older!.state, "skipped");
+    assert.equal("photo_base64" in older!.payload, false, "the older photo is not kept");
+    assert.equal(older!.payload.superseded_by, newer!.payload.request_key);
+    assert.equal(newer!.state, "pending");
+    assert.equal(await dispatch(), 1);
+    assert.equal(telegram.count("setChatPhoto"), 1, "one photo into the group, not two");
+    assert.ok(telegram.calls.find((c) => c.method === "setChatPhoto")!.photo!.toString("latin1").endsWith("-second"), "the newer one");
+    assert.deepEqual(reported(), [{ id: 7, status: "done", detail: null }]);
+    assert.deepEqual(tokensReported(), [TOKEN_B]);
+    assert.equal(await dispatch(), 0);
+    assert.equal(telegram.count("setChatPhoto"), 1);
+  });
+
+  test("F3: a row that was read for sending and superseded meanwhile is not sent (its state is re-read before Telegram is asked)", async () => {
+    site.claimAnswers.push(claimAnswer());
+    await poll();
+    // The dispatcher has selected the row; before it reaches Telegram, a newer claim supersedes it (switchOn runs in between).
+    const supersede = async () => {
+      await pool.query("UPDATE control_plane.notification_outbox SET state = 'skipped' WHERE notification_type = 'trip_group_photo'");
+      return true;
+    };
+    assert.equal(await dispatch(options({ switchOn: supersede })), 0);
+    assert.equal(telegram.calls.length, 0, "nothing was asked of Telegram");
+    assert.deepEqual(site.results, [], "and nothing was answered for a request a newer claim now owns");
   });
 
   test("foldOutcomes: waits for every row; all done is done; a send failure outranks missing rights outranks no group", () => {
@@ -413,7 +467,7 @@ describe("the trip group's photo (control plane)", { skip }, () => {
   test("a site that answers nonsense, or is not reachable, is a logged code and nothing is queued", async () => {
     site.claimAnswers.push({ request: { id: "x" } });
     assert.deepEqual(await poll(), { polled: 1, enqueued: 0, answered: 0, failed: 1 });
-    site.claimAnswers.push({ request: { id: 7, attempt: 1, logo_hash: "h", requested_at: CLAIM_AT }, photo: { content_type: "image/svg+xml", base64: "PHN2Zz4=PHN2Zz4=" } });
+    site.claimAnswers.push({ request: { id: 7, attempt: 1, claim_token: TOKEN_A, logo_hash: "h", requested_at: CLAIM_AT }, photo: { content_type: "image/svg+xml", base64: "PHN2Zz4=PHN2Zz4=" } });
     assert.equal((await poll()).failed, 1);
     assert.deepEqual(await rows(), []);
     const bad = await pollGroupPhotosOnce(deps({ exchangeKey: "not-the-key" }));
@@ -432,7 +486,7 @@ describe("the trip group's photo (control plane)", { skip }, () => {
     site.claimAnswers.push(claimAnswer());
     await poll(); await dispatch();
     telegram.photoError = { status: 400, description: "Bad Request: nope" };
-    site.claimAnswers.push(claimAnswer(9, { request: { id: 9, attempt: 1, logo_hash: "h", requested_at: "2026-12-04T10:00:00Z" } }));
+    site.claimAnswers.push(claimAnswer(9, { request: { id: 9, attempt: 1, claim_token: TOKEN_A, logo_hash: "h", requested_at: "2026-12-04T10:00:00Z" } }));
     await poll(); await dispatch(); await dispatch(); await dispatch();
     const text = logs.join("\n");
     for (const secret of [KEY, BOT_TOKEN, GROUP, telegram.root, gateway.origin, site.origin]) assert.ok(!text.includes(secret), `a log line carries ${secret.slice(0, 12)}…`);

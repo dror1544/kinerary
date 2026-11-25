@@ -459,6 +459,8 @@ async function dispatchGroupPhotoRow(
 ): Promise<boolean> {
   const requestId = typeof row.payload?.request_id === "number" ? row.payload.request_id : null;
   const requestKey = payloadString(row, "request_key");
+  // Read before anything changes the payload: `end` below rewrites it, and the token must be the claim this row was sent under.
+  const claimToken = payloadString(row, "claim_token");
   const end = async (state: "sent" | "skipped" | "failed", outcome: GroupPhotoOutcome): Promise<boolean> => {
     await db.query(
       `UPDATE control_plane.notification_outbox
@@ -468,8 +470,10 @@ async function dispatchGroupPhotoRow(
       [row.id, state, JSON.stringify(outcome)],
     );
     log(structuredLog(outcome.status === "done" ? "info" : "warn", "outbox.group_photo_ended", { notification_id: row.id, status: outcome.status }));
-    if (options?.groupPhoto && row.trip_id && requestId !== null && requestKey) {
-      await settleGroupPhoto(db, options.groupPhoto.report, row.trip_id, requestKey, requestId, log);
+    if (options?.groupPhoto && row.trip_id && requestId !== null && requestKey && claimToken) {
+      // The row's own claim token is the one the poller last moved onto it (group-photo-poller.ts), so the answer is for the
+      // claim the site holds out now; the site refuses any other.
+      await settleGroupPhoto(db, options.groupPhoto.report, row.trip_id, requestKey, requestId, claimToken, log);
     }
     return state === "sent";
   };
@@ -492,12 +496,19 @@ async function dispatchGroupPhotoRow(
   if (!png || png.length < PNG_MAGIC.length || !png.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
     return end("failed", { status: "failed", detail: "The logo could not be read." });
   }
+  // Still waiting? A newer claim of the same request may have ended this row (superseded) since it was read: then nothing is
+  // sent. A row already past this line is being sent and cannot be taken back.
+  const current = await db.query<{ state: string }>("SELECT state FROM control_plane.notification_outbox WHERE id = $1", [row.id]);
+  if (current.rows[0]?.state !== "pending") return false;
   try {
     const botId = await gp.api.botId();
     const member = await gp.api.getChatMember(audience.chatId, botId);
     if (!mayChangeGroupPhoto(member)) {
       return end("skipped", { status: "bot_lacks_rights", detail: whyNotAllowed(member) });
     }
+    // AT-LEAST-ONCE. A setChatPhoto that succeeded in Telegram but whose answer never reached us (a timeout) is retried like any
+    // failed send, so the same photo may be set twice. That is harmless (the group ends with the same photo), bounded by
+    // max_attempts, and cheaper than the alternative of never retrying a send whose outcome is unknown.
     await gp.api.setChatPhoto(audience.chatId, png);
   } catch (error) {
     log(structuredLog("error", "outbox.dispatch_failed", {
