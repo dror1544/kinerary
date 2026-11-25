@@ -106,6 +106,15 @@ describe("the star scenario", () => {
     assert.match(STAR_SCENARIO.text.return_date!, /^9 בדצמבר 2027$/);
   });
 
+  test("it describes its rental car in words for the car follow-up, on the scenario's own dates, with no ISO date", () => {
+    const car = STAR_SCENARIO.carBooking;
+    assert.ok(car, "the star organizer answers the rental-car question with a booking");
+    assert.match(car!, /רכב שכור/);
+    assert.match(car!, /2 בדצמבר 2027/);
+    assert.match(car!, /9 בדצמבר 2027/);
+    assert.ok(!/\d{4}-\d{2}-\d{2}/.test(car!), "never an ISO date");
+  });
+
   test("both flights the fixture expects on the site are given in the interview", () => {
     const spoken = `${STAR_SCENARIO.text.phases} ${STAR_SCENARIO.text.travel_anchors}`;
     for (const ref of (spec as unknown as { expect_anchor_text: string[] }).expect_anchor_text) {

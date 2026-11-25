@@ -155,6 +155,16 @@ export const architectureProfileSchema = z.object({
      * an outbound one. Required when adapters.messaging is "telegram".
      */
     super_admin_chat_id_secret_ref: secretReference.optional(),
+    /**
+     * Optional. Where the `operator_*` NOTICES go (provisioning approved / complete /
+     * failed): a Telegram group or channel containing the bot, so monitoring
+     * does not land in the super-admin's own chat with the bot. Unset: notices go
+     * to the super-admin chat, as before. The approval DM with its buttons is NOT
+     * affected and stays on `super_admin_chat_id_secret_ref`. The relay also
+     * reads this value and stays silent in that chat. Use the group's `-100…` id:
+     * Telegram changes a group's id when it is upgraded to a supergroup.
+     */
+    operator_notices_chat_id_secret_ref: secretReference.optional(),
     action_secret_ref: secretReference,
     action_ttl_seconds: z.number().int().min(60).max(86400).default(3600),
     signup_rate_limit_cooldown_seconds: z.number().int().min(0).max(86400).default(3600),

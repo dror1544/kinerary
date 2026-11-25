@@ -1056,6 +1056,13 @@ export const MORE_CALLBACK_DATA = "c:more";
 /** "I don't have one" — skip the document offer and start the questions. */
 export const NO_DOCUMENT_CALLBACK_DATA = "c:nodoc";
 
+/**
+ * The rental-car question's two shortcuts (Dror, 2026-11-21): "No rental car" and "Not booked yet". Both say the same
+ * thing to the interview - nothing to file, and never ask again - and differ only in the words the organizer sees.
+ */
+export const NO_CAR_CALLBACK_DATA = "c:nocar";
+export const CAR_LATER_CALLBACK_DATA = "c:carlater";
+
 /** `t:<questionId>:<optionId>` — one tick of a multi-select. */
 export function toggleCallbackData(questionId: string, optionId: string): string {
   return `t:${questionId}:${optionId}`;
@@ -1117,6 +1124,7 @@ export type ParsedCallback =
   | { kind: "finish" }
   | { kind: "more" }
   | { kind: "no_document" }
+  | { kind: "no_car"; choice: "none" | "later" }
   | { kind: "switch"; tripId: string }
   | { kind: "conflict"; conflictId: string; choice: "keep" | "replace" }
   | { kind: "correction"; proposalId: string; choice: "approve" | "reject" }
@@ -1181,6 +1189,8 @@ export function parseCallbackData(data: string): ParsedCallback {
   if (data === FINISH_CALLBACK_DATA) return { kind: "finish" };
   if (data === MORE_CALLBACK_DATA) return { kind: "more" };
   if (data === NO_DOCUMENT_CALLBACK_DATA) return { kind: "no_document" };
+  if (data === NO_CAR_CALLBACK_DATA) return { kind: "no_car", choice: "none" };
+  if (data === CAR_LATER_CALLBACK_DATA) return { kind: "no_car", choice: "later" };
 
   // Matched before the generic shapes below so a trip id's underscore cannot
   // be mistaken for one of them.
@@ -1346,6 +1356,17 @@ export function renderQuestion(
   // One question put once per thing it is about: "gluten-free — who is that for?"
   const text = fromRecord.subject ? `${fromRecord.subject} — ${body}` : body;
   return { text, replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
+}
+
+/**
+ * The rental-car question's own buttons, one per row, to sit above the bookings question's "Skip" and "Finished".
+ * Built here, with the other keyboards, so the poller only decides WHEN to ask.
+ */
+export function carShortcutRows(language: Language = DEFAULT_LANGUAGE): InlineButton[][] {
+  return [
+    [{ text: uiString("noRentalCar", language), callback_data: NO_CAR_CALLBACK_DATA }],
+    [{ text: uiString("carNotBookedYet", language), callback_data: CAR_LATER_CALLBACK_DATA }],
+  ];
 }
 
 /** Telegram's limit is 4096; the question and the buttons' copy need room too. */

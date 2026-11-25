@@ -1248,6 +1248,19 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
     });
   });
 
+  test("the ops chat option silences only the ops chat: another unbound group is still told so (#649)", async () => {
+    await withFixture(async (fix) => {
+      const ops = "-1002000555";
+      const silent = await dispatchUpdate(fix.pool, joinUpdate(ops), undefined, undefined, { id: "8463178587" }, { opsChatId: ops });
+      assert.equal(silent.kind, "ignore");
+      const other = await dispatchUpdate(fix.pool, joinUpdate("-1002000556"), undefined, undefined, { id: "8463178587" }, { opsChatId: ops });
+      assert.equal(other.kind, "reply");
+      // Without the option the same join is answered, which is the behaviour the option exists to switch off.
+      const unset = await dispatchUpdate(fix.pool, joinUpdate(ops), undefined, undefined, { id: "8463178587" });
+      assert.equal(unset.kind, "reply");
+    });
+  });
+
   test("a promotion to admin is not a second arrival", async () => {
     // Re-introducing on every permissions change would be noise in a live
     // family group.

@@ -285,6 +285,47 @@ test("operator rows carry identifiers and a safe error code the organizer copy w
   }
 });
 
+test("operator notices go to the configured ops chat (worker-shaped rows too), organizer copies do not, and unset changes nothing (#649)", { skip }, async () => {
+  const OPS_GROUP = "-1009999";
+  for (const noticesChat of [OPS_GROUP, undefined]) {
+    const pool = testPool();
+    const client = await pool.connect();
+    try {
+      await resetDb(client);
+      await applyMigrations(client, migrationsDir);
+    } finally { client.release(); }
+    try {
+      const tripId = await insertTrip(pool);
+      const context = { trip_id: tripId, trip_title: "Rome 2026", trip_slug: "rome-2026", organizer: "Dana" };
+      // Addressed to the super admin at enqueue time, as the API (approved) and the worker (complete, failed) both do.
+      await insertOutboxRow(pool, tripId, "operator_provisioning_approved", "super-admin-chat", {
+        ...context, plan_id: "plan_abc", plan_digest: "sha256:deadbeef", release_id: "rel_1", approved_by: "user_1",
+      });
+      await insertOutboxRow(pool, tripId, "operator_provisioning_complete", "super-admin-chat", { ...context, private_url: "https://rome.example.test" });
+      await insertOutboxRow(pool, tripId, "operator_provisioning_failed", "super-admin-chat", { ...context, safe_error_code: "DEPLOY_FAILED" });
+      await insertOutboxRow(pool, tripId, "provisioning_failed", "organizer-chat", { safe_error_code: "DEPLOY_FAILED" });
+
+      const notification = new FakeNotificationAdapter();
+      assert.equal(await dispatchPendingTripNotifications(
+        pool, notification, () => {}, noticesChat ? { operatorNoticesChatId: noticesChat } : undefined,
+      ), 4);
+
+      const sentTo = (needle: string) => notification.messageCalls.filter((c) => c.text.includes(needle)).map((c) => c.chatId);
+      const expected = noticesChat ?? "super-admin-chat";
+      assert.deepEqual(sentTo("Provisioning approved"), [expected]);
+      assert.deepEqual(sentTo("Provisioning complete"), [expected]);
+      assert.deepEqual(sentTo("Provisioning failed").filter((c) => c !== "organizer-chat"), [expected]);
+      // The organizer's own copy stays with the organizer, whatever the ops chat is.
+      assert.equal(notification.messageCalls.filter((c) => c.chatId === "organizer-chat").length, 1);
+      const states = await pool.query("SELECT state FROM control_plane.notification_outbox WHERE trip_id = $1", [tripId]);
+      assert.deepEqual([...new Set(states.rows.map((r) => r.state))], ["sent"]);
+    } finally {
+      const cleanup = await pool.connect();
+      try { await resetDb(cleanup); } finally { cleanup.release(); await pool.end(); }
+    }
+  }
+});
+
 test("an unrecognized operator_ type is skipped, not retried forever", { skip }, async () => {
   const pool = testPool();
   const client = await pool.connect();

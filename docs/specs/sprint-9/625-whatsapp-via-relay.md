@@ -300,7 +300,12 @@ written down).
   owner is told once, naming the group's title or the traveller and never a number: in
   the owner's connected WhatsApp private chat when there is one; otherwise through the
   existing outbox to the owner's Telegram private chat when there is one; otherwise only
-  the dashboard list shows it. The owner's own `me` connection is not announced to them.
+  the dashboard list shows it. The owner's own first `me` connection is not announced to
+  them. One that replaces an earlier WhatsApp connection of theirs on the trip is: the
+  notice says the connection was replaced and, when known, gives the new number's last
+  four digits, and goes to the chat that was replaced when it can still be reached, else
+  Telegram, else the dashboard (Dror, 2026-11-23: a code sent from someone else's phone
+  would otherwise give the owner's role with no word to the owner).
 - AC-19 Given the gateway reconciler (`gateway_reconcile.py`, `FACTS_SQL`), then an open
   WhatsApp private binding of the trip's owner counts as the organizer's private chat
   when it decides whether a trip's companion is current, so a trip whose organizer uses
@@ -659,7 +664,10 @@ HMAC-SHA256(key, canonical id).
 These are sent by the relay's WhatsApp loop, do not pass `checkScope`, and are the
 complete list: the fixed reply to a code attempt (AC-8, AC-10, AC-11); the introduction
 (AC-10, AC-28); the traveller exchange's questions and its result (AC-29); the two fixed
-lines of AC-30 and AC-31; the owner's notice in the owner's own private chat (AC-18).
+lines of AC-30 and AC-31; the owner's notice in the owner's own private chat (AC-18), and
+to the replaced chat (AC-18); and the one-line "temporarily unavailable" notice Telegram
+already sends when the trip's companion cannot be reached, with Telegram's wording and
+rate limit (Dror, 2026-11-24: silence would look broken).
 Remove and teardown send nothing.
 
 **Open exchanges.** The traveller exchange of AC-29 is the only conversation the relay
@@ -706,7 +714,12 @@ Architecture profile, `relay.whatsapp` (absent = feature not present): `bridge_u
 read by the API as well), `code_ttl_seconds`, `code_attempts_per_hour`. `bridge_url`
 passes a new validator that accepts loopback addresses only (`telegramApiRoot` is not
 reused: it accepts https to any host). How a containerised relay shares loopback with the
-bridge is the deployment's concern. The bridge's session directory is the bridge's own
+bridge is the deployment's concern. A `relay.whatsapp` block that cannot work (a bridge URL
+other than `http://127.0.0.1:<port>`, a secret reference that does not resolve, a secret or
+key that is too short, or a sender-id key equal to the bridge secret) disables WhatsApp
+only: the relay logs one line naming the field and the reason, never the value, starts no
+WhatsApp loop and no bridge connection, answers every WhatsApp action
+`PLATFORM_UNAVAILABLE`, and serves Telegram as usual (Dror, 2026-11-24). The bridge's session directory is the bridge's own
 argument and holds a credential: it lives in the deployment's state, mode 0700, never in
 this repository. Starting and pairing the bridge is deployment work (`kinerary-deploy`);
 this repository ships the generic package and a runbook section in `docs/`.
@@ -747,8 +760,10 @@ traveller reaches it. The invitation email is a new `PortalMail` kind in
 
 ### Lock order
 
-- Code redemption: code row `FOR UPDATE`, then the open binding for the chat
-  `FOR UPDATE`, then the binding insert. Where two binding rows are closed in one
+- Code redemption: code row `FOR UPDATE`, then the issuer's own membership row
+  `FOR SHARE` (so a member's removal cannot commit between the entitlement check and
+  the binding; `removeMember` locks memberships and then bindings, the same direction),
+  then the open binding for the chat `FOR UPDATE`, then the binding insert. Where two binding rows are closed in one
   transaction (AC-8, AC-9) they are locked in `chat_id` order.
 - No-code bindings (AC-28, AC-29): the open binding for the chat `FOR UPDATE`, then an
   insert that selects the trip only if it is not retired. That leaves the residual race
@@ -955,6 +970,15 @@ Tests are written first, from the criteria.
    messages to know when it is addressed stays required (AC-10), because the other people
    in a group agreed to nothing. A WhatsApp paragraph in the published privacy policy is
    deferred until a group outside family and friends is to be bound.
+
+9. **A replaced owner connection is announced (2026-11-23).** Raised by S2's boundary
+   review: an owner's `me` code sent from another phone connects that phone as the owner,
+   and the owner was told nothing. AC-18 now announces a replacement to the owner.
+
+10. **Two S3b choices (2026-11-24).** A WhatsApp chat whose companion cannot be reached gets
+   Telegram's one-line "temporarily unavailable" notice, not silence. A WhatsApp
+   misconfiguration disables WhatsApp only and never stops the relay, so Telegram keeps
+   working.
 
 **Still open, none blocks the build on staging:**
 

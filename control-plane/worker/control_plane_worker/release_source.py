@@ -56,6 +56,34 @@ def _safe_directory(repo_root: str) -> list[str]:
     return [arg for path in sorted(paths) for arg in ("-c", f"safe.directory={path}")]
 
 
+def _dangling_worktree_gitdir(repo_root: str) -> str | None:
+    """The `gitdir:` a linked worktree's `.git` file points at, when that path is
+    not reachable from here; None for anything else (a normal clone, a worktree
+    whose pointer resolves, a `.git` that cannot be read).
+
+    A linked worktree's `.git` is a FILE reading `gitdir: <main>/.git/worktrees/<name>`,
+    an absolute path on the machine that made it. The worker sees the checkout through a
+    bind mount, and the main repository is not part of that mount, so every git call
+    answers "not a git repository" (#650). That says nothing of the cause, and it fails
+    only for a release not yet cached, which hid it."""
+    dot_git = os.path.join(repo_root, ".git")
+    if not os.path.isfile(dot_git):
+        return None
+    try:
+        with open(dot_git, encoding="utf-8") as fh:
+            first = fh.readline().strip()
+    except OSError:
+        return None
+    if not first.startswith("gitdir:"):
+        return None
+    gitdir = first[len("gitdir:"):].strip()
+    if not gitdir:
+        return None
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.join(repo_root, gitdir)
+    return None if os.path.isdir(gitdir) else gitdir
+
+
 def _git(repo_root: str, *args: str, binary: bool = False):
     result = subprocess.run(
         ["git", *_safe_directory(repo_root), "-C", repo_root, *args],
@@ -63,6 +91,15 @@ def _git(repo_root: str, *args: str, binary: bool = False):
         check=False,
     )
     if result.returncode != 0:
+        dangling = _dangling_worktree_gitdir(repo_root)
+        if dangling is not None:
+            raise ReleaseSourceError(
+                f"the release repo {repo_root} is a linked git worktree whose git directory "
+                f"({dangling}) is not reachable from here, so git cannot read it. Mount the main "
+                "clone (WORKER_REPO_ROOT_HOST in compose.local.yml) instead of the worktree, or "
+                "also mount the main clone's .git directory at that same path.",
+                "RELEASE_REPO_IS_LINKED_WORKTREE",
+            )
         detail = result.stderr.decode("utf-8", "replace").strip()[-300:]
         raise ReleaseSourceError(f"git {args[0]} failed: {detail}", "RELEASE_REVISION_UNAVAILABLE")
     return result.stdout if binary else result.stdout.decode("utf-8")

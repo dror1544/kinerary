@@ -42,6 +42,11 @@ export interface Scenario {
    * asks as a question: the travellers question is already answered.
    */
   tapOffers?: string[];
+  /**
+   * What the organizer WRITES when the interview asks about a rental car (2026-11-21): a booking in words. Absent,
+   * the organizer taps "No rental car" - the default, so a run is never left waiting on a question it cannot answer.
+   */
+  carBooking?: string;
 }
 
 /**
@@ -132,6 +137,9 @@ export const STAR_SCENARIO: Scenario = {
   choice: { trip_type: "family", bot_gender: "female", bot_tone: "warm", trip_pace: "easygoing" },
   multi: {},
   typedChoice: { trip_type: "טיול זוגות ולא משפחה, נהיה שני זוגות" },
+  // The one car the scenario collects at Frankfurt is booked, and said in words when asked: the car follow-up has to
+  // file it as a `car` booking beside the two flights. The e2e reports it (`rental car:` line), it does not judge it.
+  carBooking: "כן, יש לנו רכב שכור אחד מחברת Sixt, איסוף בנמל התעופה של פרנקפורט ב-2 בדצמבר 2027 והחזרה שם ב-9 בדצמבר 2027, מספר אישור SX-90417",
 };
 
 /**

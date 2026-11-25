@@ -28,6 +28,7 @@ import { createDatabasePool } from "../database.js";
 import { modelRunnerFromEnv } from "../model-runner.js";
 import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
+import { resolveOperatorNoticesChatId } from "../operator-chats.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
 import { gatewayKeyMasterProblem, type GatewayKeyMode } from "./protocol.js";
@@ -128,6 +129,11 @@ interface Runtime {
    * bot: it names a Telegram user, not a bot. Absent disables `/model`.
    */
   superAdminSubjectDigest?: string;
+  /**
+   * From `signup.operator_notices_chat_id_secret_ref`, resolved: the ops group the
+   * relay never answers in. Absent when the profile does not name one.
+   */
+  opsChatId?: string;
   /**
    * From `relay.multiplex_gateway_id`. Absent means routing is exact and a
    * trip with no gateway of its own is reported unreachable rather than
@@ -308,6 +314,25 @@ async function serveRuntime(path: string): Promise<Runtime> {
     }
   }
 
+  // The ops chat the relay stays silent in. Named but unresolvable is said loudly
+  // (error level, with the effect): the relay still serves interviews, but it would
+  // answer in the ops group, and nothing else would show that.
+  let opsChatId: string | undefined;
+  if (profile.signup?.operator_notices_chat_id_secret_ref) {
+    try {
+      const superAdminChatId = profile.signup.super_admin_chat_id_secret_ref
+        ? await resolveSecretRef(profile.signup.super_admin_chat_id_secret_ref).catch(() => undefined)
+        : undefined;
+      opsChatId = await resolveOperatorNoticesChatId(profile.signup, superAdminChatId, log);
+    } catch (error) {
+      log(structuredLog("error", "relay.ops_chat_unresolved", {
+        safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        effect: "the relay is NOT silent in the operator-notices group",
+      }));
+    }
+  }
+  log(structuredLog("info", "relay.ops_chat", { configured: Boolean(opsChatId) }));
+
   return {
     gatewaySecrets: resolved,
     gatewayKeyMasters: masters,
@@ -323,6 +348,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
     multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
     ...(whatsapp ? { whatsapp } : {}),
+    ...(opsChatId ? { opsChatId } : {}),
     ...(profile.signup?.super_admin_subject_digest
       ? { superAdminSubjectDigest: profile.signup.super_admin_subject_digest }
       : {}),
@@ -563,6 +589,7 @@ async function main(): Promise<void> {
       media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl, log },
       documentStore,
       superAdminSubjectDigest: runtime.superAdminSubjectDigest,
+      ...(runtime.opsChatId ? { opsChatId: runtime.opsChatId } : {}),
       // The switchable runner computed above, so a super admin's `/model`
       // override reaches the trip bot poller too — not a fresh
       // `modelRunnerFromEnv()` that would silently ignore it. Undefined unless

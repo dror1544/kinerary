@@ -400,6 +400,13 @@ export const DEFAULT_STRINGS: DispatchStrings = {
 /** Router configuration that varies per deployment rather than per update. */
 export interface DispatchOptions {
   /**
+   * The operator-notices chat (`signup.operator_notices_chat_id_secret_ref`): a
+   * group the bot sits in only to POST build notices. Every update from it is
+   * ignored - no reply, no "bind this group" help, no join greeting, no routing -
+   * so the relay is silent where the operator reads monitoring. Absent: no chat is special.
+   */
+  opsChatId?: string;
+  /**
    * The Hermes profile that serves written interview answers. Absent means no
    * interviewer is reachable, and the router answers those messages itself.
    */
@@ -628,6 +635,24 @@ async function unboundDmTripList(
   return { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined };
 }
 
+/** The chat an update came from, whatever its kind; null when it names none. */
+function chatIdOfUpdate(update: TelegramUpdate): string | null {
+  const u = update as {
+    message?: { chat?: { id?: unknown } };
+    edited_message?: { chat?: { id?: unknown } };
+    my_chat_member?: { chat?: { id?: unknown } };
+    callback_query?: { message?: { chat?: { id?: unknown } } };
+  };
+  const id = u.message?.chat?.id ?? u.edited_message?.chat?.id ?? u.my_chat_member?.chat?.id
+    ?? u.callback_query?.message?.chat?.id;
+  return id === undefined || id === null || id === "" ? null : String(id);
+}
+
+function updateKindOf(update: TelegramUpdate): string {
+  const u = update as unknown as Record<string, unknown>;
+  return ["message", "edited_message", "my_chat_member", "callback_query"].find((k) => u[k] !== undefined) ?? "other";
+}
+
 export async function dispatchUpdate(
   db: pg.Pool,
   update: TelegramUpdate,
@@ -636,6 +661,14 @@ export async function dispatchUpdate(
   botIdentity: BotIdentity = {},
   options: DispatchOptions = {},
 ): Promise<DispatchDecision> {
+  // First of all, before the callback, join and migration branches: adding the bot
+  // to the ops group is itself an update, and would otherwise be answered with the
+  // "I was added to a group" greeting.
+  if (options.opsChatId && chatIdOfUpdate(update) === options.opsChatId) {
+    // The id is not logged: it is deployment data (hard rule 6 keeps it out of the repo; the log is no better).
+    log(structuredLog("debug", "relay.ops_chat_ignored", { update_kind: updateKindOf(update) }));
+    return { kind: "ignore", reason: "OPS_CHAT" };
+  }
   if (update.callback_query) return dispatchCallback(db, update, log, options.modelRunner);
 
   // Added to a group. If that group is already bound to a trip, this is the

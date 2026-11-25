@@ -324,6 +324,12 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
   en: {
     skip: "⤼ Skip this one",
     finish: "🏁 Finished",
+    // THE RENTAL CAR, asked once before the summary when the bookings carry none (Dror, 2026-11-21). It leads the
+    // bookings question, the way the typed-flights line does; the two buttons are the shortcuts for the two answers
+    // that file nothing. Typed in words they work the same.
+    carOwedLead: "One more thing before I put your summary together: is there a rental car booked for the trip? If there is, tell me where and when you pick it up, the company, and the confirmation number (whatever you have) — or tap one of the buttons below.",
+    noRentalCar: "🚫 No rental car",
+    carNotBookedYet: "⏳ Not booked yet",
     multiDone: "✔️ Done",
     other: "✏️ Other…",
     otherPrompt: "Tell me briefly what it is:",
@@ -835,6 +841,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
   he: {
     skip: "⤼ דלג על זו",
     finish: "🏁 סיים",
+    carOwedLead: "עוד דבר אחד לפני הסיכום: הזמנתם רכב שכור לטיול? אם כן, כתבו לי איפה ומתי אוספים אותו, מאיזו חברה, ומה מספר האישור (מה שיש לכם) — או לחצו על אחד הכפתורים.",
+    noRentalCar: "🚫 אין רכב שכור",
+    carNotBookedYet: "⏳ עוד לא הזמנו",
     multiDone: "✔️ סיימתי",
     other: "✏️ משהו אחר…",
     otherPrompt: "ספרו לי בקצרה מה זה:",
