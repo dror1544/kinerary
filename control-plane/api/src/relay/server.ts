@@ -210,7 +210,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
   // WhatsApp chat answers PLATFORM_UNAVAILABLE (the connector has no client); Telegram as ever.
   let whatsapp: WhatsAppRuntimeConfig | null = null;
   try {
-    whatsapp = await whatsappRuntimeConfig(relay.whatsapp, resolveSecretRef);
+    whatsapp = await whatsappRuntimeConfig(relay.whatsapp, resolveSecretRef, relay.whatsapp_invalid);
   } catch (error) {
     whatsappDisabled(error);
   }

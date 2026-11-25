@@ -57,7 +57,10 @@ const SENDER_KEY = "relay.whatsapp.sender_id_secret_ref";
 export async function whatsappRuntimeConfig(
   block: WhatsAppProfileBlock | undefined,
   resolveSecretRef: (ref: string) => Promise<string>,
+  /** The loader's note that a present block failed the profile schema (config.ts `setAsideInvalidWhatsapp`): refused here like any other. */
+  invalid?: { field: string; reason: string },
 ): Promise<WhatsAppRuntimeConfig | null> {
+  if (invalid) throw new WhatsAppConfigError(invalid.field, invalid.reason);
   if (!block) return null;
   let bridgeUrl: string;
   try {

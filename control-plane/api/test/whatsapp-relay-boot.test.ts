@@ -213,6 +213,13 @@ describe("AC-20: the real relay entrypoint starts WhatsApp only with a relay.wha
     { name: "a bridge secret that is too short", over: { bridge_secret_ref: "env://BOOT_TELEGRAM_TOKEN" }, field: /^relay\.whatsapp\.bridge_secret_ref$/ },
     { name: "a sender-id key that is too short", over: { sender_id_secret_ref: "env://BOOT_TELEGRAM_TOKEN" }, field: /^relay\.whatsapp\.sender_id_secret_ref$/ },
     { name: "a sender-id key equal to the bridge secret", over: { sender_id_secret_ref: "env://BOOT_BRIDGE_SECRET" }, field: /^relay\.whatsapp\.sender_id_secret_ref$/ },
+    // Blocks the profile SCHEMA refuses (boundary review of #655, F1): each of these used to exit the relay with ZodError
+    // before Telegram was polled. They now go the same way as the runtime refusals above.
+    { name: "a bridge_url on the LAN (schema)", over: { bridge_url: "http://10.1.2.3:4398" }, field: /^relay\.whatsapp\.bridge_url$/ },
+    { name: "an https bridge_url (schema)", over: { bridge_url: "https://bridge.example.org" }, field: /^relay\.whatsapp\.bridge_url$/ },
+    { name: "a missing number (schema)", over: { number: undefined }, field: /^relay\.whatsapp\.number$/ },
+    { name: "an unknown key (schema)", over: { bridge_secret: "boot-literal-value" }, field: /^relay\.whatsapp$/ },
+    { name: "a code lifetime out of range (schema)", over: { code_ttl_seconds: 5 }, field: /^relay\.whatsapp\.code_ttl_seconds$/ },
   ];
   for (const bad of unusable) {
     test(`${bad.name}: WhatsApp is disabled, the relay comes up and serves Telegram, no bridge is contacted, and a WhatsApp chat is PLATFORM_UNAVAILABLE`, async () => {
