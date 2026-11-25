@@ -29,6 +29,27 @@ export function unwrap(message) {
   return current ?? {};
 }
 
+/**
+ * The disappearing-message timer (seconds, 0 = off) a raw library message says its chat has, or
+ * undefined when it says nothing. A timer-setting notice states it outright; a real message states it
+ * by carrying `contextInfo.expiration` (absent = the chat has none). A reply sent without the chat's
+ * timer is shown by WhatsApp with a "(!) sent from an old version" marker.
+ */
+export function expirationOf(message) {
+  if (!message || typeof message !== "object") return undefined;
+  const content = unwrap(message);
+  const proto = content.protocolMessage ?? message.protocolMessage;
+  if (proto) {
+    const isSetting = proto.type === 3 || proto.type === "EPHEMERAL_SETTING";
+    if (!isSetting) return undefined;
+    const seconds = Number(proto.ephemeralExpiration?.toString?.() ?? proto.ephemeralExpiration ?? 0);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  }
+  if (!textOf(content) && !mediaOf(content)) return undefined;
+  const seconds = Number(contextOf(content).expiration ?? 0);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+}
+
 function contextOf(content) {
   for (const value of Object.values(content)) {
     if (value && typeof value === "object" && value.contextInfo) return value.contextInfo;

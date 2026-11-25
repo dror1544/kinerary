@@ -15,6 +15,7 @@
  */
 import { createIdResolver, idKind, isGroupId, isMessageId, normalizeId } from "./ids.js";
 import {
+  expirationOf,
   createEventLog,
   createMessageStore,
   extractMessage,
@@ -85,6 +86,15 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   let sendQueue = Promise.resolve();
   const sentIds = new Set();
   const metadataCache = new Map(); // chatId -> { md, at }
+  // chatId -> disappearing-message seconds (0 = off), as the chat last said. A reply must carry the
+  // chat's timer, or WhatsApp shows it with a "(!) sent from an old version" marker.
+  const chatTimers = new Map();
+  function learnTimer(chatId, seconds) {
+    if (!chatId || seconds === undefined) return;
+    chatTimers.delete(chatId);
+    chatTimers.set(chatId, seconds);
+    while (chatTimers.size > 1024) chatTimers.delete(chatTimers.keys().next().value);
+  }
   const addedSeen = new Map();
   const counters = { delivered: 0, skipped: {} };
 
@@ -125,6 +135,13 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
     }
   };
 
+  async function timerChatOf(msg) {
+    const raw = normalizeId(msg?.key?.remoteJid);
+    if (isGroupId(raw)) return raw;
+    const { lid } = await resolver.resolve(msg?.key?.remoteJid, msg?.key?.remoteJidAlt);
+    return lid;
+  }
+
   async function onUpsert({ messages, type } = {}) {
     // `notify` is live. The library delivers what arrived while the bridge was
     // disconnected as `append` (offline nodes), so a binding code sent during a
@@ -145,18 +162,28 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
         }
       }
       let result;
+      let timer;
       try {
         result = await extractMessage(msg, { resolver, own });
+        timer = expirationOf(msg?.message);
       } catch (err) {
         log("extract_error", { code: errorCode(err) });
         skip("extract_error");
         continue;
       }
       if ("skip" in result) {
+        if (timer !== undefined) {
+          try {
+            learnTimer(await timerChatOf(msg), timer);
+          } catch {
+            // A timer we cannot place is relearned from the chat's next message.
+          }
+        }
         skip(result.skip);
         continue;
       }
       const event = result.event;
+      learnTimer(event.chatId, timer);
       store.remember(event.chatId, msg);
       // The echo of our own /send is not news to the relay.
       if (event.fromMe && sentIds.has(event.messageId)) {
@@ -188,7 +215,10 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   }
 
   async function onGroupsUpdate(updates) {
-    for (const u of updates ?? []) metadataCache.delete(normalizeId(u?.id));
+    for (const u of updates ?? []) {
+      metadataCache.delete(normalizeId(u?.id));
+      if (u && "ephemeralDuration" in u) learnTimer(normalizeId(u.id), Number(u.ephemeralDuration) > 0 ? Number(u.ephemeralDuration) : 0);
+    }
     for (const event of groupEventsFromUpdates(updates)) events.push(event);
   }
 
@@ -425,6 +455,13 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
       if (ids.length) content.mentions = ids;
     }
     const options = {};
+    let seconds = chatTimers.get(chatId);
+    if (seconds === undefined && kind === "group") {
+      const { md } = await groupMetadata(chatId);
+      const d = Number(md?.ephemeralDuration ?? 0);
+      seconds = Number.isFinite(d) && d > 0 ? d : 0;
+    }
+    if (seconds > 0) options.ephemeralExpiration = seconds;
     let quoted = false;
     if (typeof body.replyTo === "string") {
       // A reply quotes only a message of THIS chat: the store is keyed by chat.
