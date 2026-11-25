@@ -1548,7 +1548,7 @@ function changesHeld(held: BuildInterpretPromptArgs["heldLists"]): boolean {
  * The examples are in both languages an interview is held in. They are
  * illustrations: the model is told never to copy their values.
  */
-export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): string[] {
+export function changeSection(held: BuildInterpretPromptArgs["heldLists"], waiting: readonly string[] = []): string[] {
   if (!held || !changesHeld(held)) return [];
   // PER FAMILY. An operation is a change to something HELD, and the model was taught all of them as soon as either
   // list held anything: with the travellers answered and no stop yet, it read "we sleep at Hotel X in A" as
@@ -1663,6 +1663,33 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `  "שנה את האקונה לנגויה"   (change Hakone to Nagoya) is the same "choose" as above.`,
     ] : []),
     ``,
+    ...waitingChangeSection(waiting),
+  ];
+}
+
+/**
+ * A change is waiting for the person's yes or no (#666). The lists above show what
+ * is HELD, which is not what the waiting change would make, and a message that says
+ * "no, it stays 17 May" restates exactly the held value: with nothing to differ from,
+ * the reader found nothing to change and returned no operation, and the waiting
+ * change stayed. Told what is waiting, it returns the operation that restates the
+ * held value, which cancels the waiting change like any other that undoes it.
+ */
+function waitingChangeSection(waiting: readonly string[]): string[] {
+  if (waiting.length === 0) return [];
+  return [
+    `A CHANGE IS WAITING FOR THEIR YES OR NO`,
+    `It is NOT applied: the lists above still show what is HELD. If they said yes, it would do this:`,
+    ...waiting,
+    ``,
+    `If the message says NO to it — "no, keep it", "no, Kyoto stays until 25 September",`,
+    `"לא, נשארים בקיוטו עד ה-25 בספטמבר" — or restates what is HELD for`,
+    `something the waiting change would alter, return the operation that sets that thing to the HELD`,
+    `value (the update_stop with the held end date, say), EVEN THOUGH the list above already shows it:`,
+    `restating it is how the waiting change is cancelled. Do the same for each held value they restate.`,
+    `A message that gives yet another value is an operation with that value, as always. A message that`,
+    `is about something else entirely is not an operation.`,
+    ``,
   ];
 }
 
@@ -1689,6 +1716,11 @@ export interface BuildInterpretPromptArgs {
    * answer is proposed as it always was.
    */
   heldLists?: { stops: readonly HeldItem[]; travellers: readonly HeldItem[] };
+  /**
+   * What the change waiting for the person's yes or no would do, one line per operation (`describeWaitingOps`).
+   * Read only with `heldLists`; absent when nothing waits.
+   */
+  waitingChange?: readonly string[];
   /**
    * The question actually on the organizer's screen, if any.
    *
@@ -1905,7 +1937,7 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     widened ? `Questions (answered already or not):` : `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
-    ...changeSection(args.heldLists),
+    ...changeSection(args.heldLists, args.waitingChange),
     ...(args.correctable?.length
       ? [
           widened

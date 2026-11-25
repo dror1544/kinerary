@@ -1138,3 +1138,71 @@ export function heldRefLists(answers: AnswerStore): { stops: HeldItem[]; travell
     });
   return { stops: of("phases", "stop"), travellers: of("travelers", "traveller") };
 }
+
+// ── A change is waiting, and a "no" is typed (#666) ──────────────────────────
+
+/** The most operations the reader is shown for a waiting change; the rest are counted. */
+const WAITING_SHOWN_OPS = 12;
+
+/**
+ * What the waiting change would do, one line per operation, for the reader's
+ * prompt. The operations are already clean (`parseOps` ran on them), and
+ * `JSON.stringify` keeps each on one line.
+ */
+export function describeWaitingOps(ops: readonly Op[]): string[] {
+  const lines = ops.slice(0, WAITING_SHOWN_OPS).map((op) => `- ${JSON.stringify(op).slice(0, 400)}`);
+  if (ops.length > WAITING_SHOWN_OPS) lines.push(`- … and ${ops.length - WAITING_SHOWN_OPS} more operations like these`);
+  return lines;
+}
+
+/**
+ * Does the message OPEN with a refusal — "לא, רגע — עד 17 במאי", "no, keep it",
+ * "nope", "no wait"? A refusal is the word on its own, or followed by a pause
+ * (punctuation) or by a word that says "hold on". "לא יודע" and "לא בטוח" are
+ * not it — there the "no" negates the next word, not the change — and neither is
+ * a word that merely begins with the letters ("now", "נו").
+ */
+export function leadsWithNo(text: string): boolean {
+  const trimmed = text.normalize("NFKC").replace(/^[^\p{L}\p{N}]+/u, "").toLowerCase();
+  return /^(?:לא|no|nope|nah)(?![\p{L}\p{N}])(?:\s*[,.:;!–—-]|\s*$|\s+(?:רגע|שנייה|שניה|עצרו|עצור|תעצרו|wait|hold on|stop|actually|sorry|תודה)(?![\p{L}\p{N}]))/u.test(trimmed);
+}
+
+/** Every whole number in a string, as numbers ("2027-05-17" -> 2027, 5, 17). */
+function numbersIn(text: string): number[] {
+  return (text.match(/\d+/g) ?? []).map(Number);
+}
+
+/**
+ * Does the message carry a number that is not what is HELD for the things the
+ * waiting change would alter? Then it is a DIFFERENT value, not a restatement,
+ * and a "no" with it is a correction to be read, never a plain cancel. Only the
+ * held values of the fields the waiting operations set count: a date's day and
+ * year (never its month - "5 במאי" is not "17 May" because May is month 5), an
+ * age. So "no, until 5 May" and "no, until 10 May" - the stay's own start day -
+ * do not read as "it stays 17 May", and another stop's dates do not either.
+ * When in doubt the answer is "new", which leaves the message to the reader
+ * exactly as before. Code cannot read words for a different place or name; that
+ * stays the reader's job, and this is only the floor under the date and the age.
+ */
+export function carriesNewValue(text: string, held: AnswerStore, waiting: readonly Op[]): boolean {
+  const known = new Set<number>();
+  for (const op of waiting) {
+    if (op.op === "choose" || !("target" in op) || !("fields" in op)) continue;
+    const family = familyOf(op.op);
+    const list = listOf(held, questionOf(family));
+    const found = resolveRef(list, op.target, family);
+    const entry = found.kind === "resolved" ? list[found.index] : null;
+    if (!isRecord(entry)) continue;
+    for (const key of Object.keys(op.fields)) {
+      const value = (entry as Entry)[key];
+      const date = typeof value === "string" ? /^(\d{4})-\d{2}-(\d{2})$/.exec(value) : null;
+      if (date) {
+        known.add(Number(date[1]));
+        known.add(Number(date[2]));
+      } else if (typeof value === "number") {
+        known.add(value);
+      }
+    }
+  }
+  return numbersIn(text).some((n) => !known.has(n));
+}
