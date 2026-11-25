@@ -37,6 +37,7 @@ import {
   flightsOwedLead,
   getSessionForChat,
   nextPhase,
+  noteTypedFlightsForChat,
   queueInboundMessage,
   setFinishRequestedForChat,
   type AnswerStore,
@@ -137,6 +138,70 @@ describe("a confirmation is not a flight (#646)", () => {
 
   test("the same code typed twice, once as a confirmation and once as a flight, is a flight", () => {
     assert.deepEqual(flightDesignatorsIn("אישור GU-4471; and the flight GU-4471"), ["GU4471"]);
+  });
+});
+
+// #667 — found in the #654/#660 test run, 2026-11-25: "GU-4471 זה מספר האישור של
+// המלון" logged typed_flights_noted ["GU4471"]. #646's veto read only the words
+// BEFORE the code; here the confirmation word comes after it.
+describe("a confirmation named AFTER the code is not a flight either (#667)", () => {
+  test("the exact test-run message: nothing is noted", () => {
+    assert.deepEqual(flightDesignatorsIn("GU-4471 זה מספר האישור של המלון"), []);
+  });
+
+  test("Hebrew and English, the code first and the confirmation word after it", () => {
+    for (const text of [
+      "GU-4471 זה מספר האישור של המלון",
+      "GU-4471 זה האישור של המלון",
+      "GU4471 הוא מספר ההזמנה במלון",
+      "GU-4471 זו האסמכתא של הלינה",
+      "GU-4471 - אישור המלון",
+      "GU-4471, מספר האישור של הדירה",
+      "GU-4471 is the hotel confirmation number",
+      "GU-4471 is the confirmation",
+      "GU-4471 is my booking reference for the hotel",
+      "GU-4471 conf. for the stay",
+      "GU-4471 is the confirmation number.",
+    ]) {
+      assert.deepEqual(flightDesignatorsIn(text), [], text);
+    }
+  });
+
+  test("a code that names a hotel or a stay right after it is not a flight", () => {
+    for (const text of ["GU-4471 למלון Grand Union", "GU-4471 for the hotel", "GU4471 של הלינה בלובליאנה"]) {
+      assert.deepEqual(flightDesignatorsIn(text), [], text);
+    }
+  });
+
+  test("real flights survive: a confirmation word after a flight that is about the flight or about another code", () => {
+    assert.deepEqual(flightDesignatorsIn("LY5143 אישור הטיסה XR7T2Q"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("טיסה LY5143, אישור ABC123"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("LY5143 confirmation XR7T2Q"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("LY5143 is the flight, confirmation XR7T2Q"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("flight LY5143 and the hotel confirmation GU-4471"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("LY5143 מתל אביב ללובליאנה"), ["LY5143"]);
+  });
+
+  test("real flights survive: the next thing said is a hotel, a stay or a booking - not what the code IS", () => {
+    for (const text of [
+      "טיסה LY5143, מלון Grand Hotel Union",
+      "we fly LY5143, hotel is the Hilton",
+      "LY5143 - Hotel Union",
+      "LY5143 מלון Grand Union בלובליאנה",
+      "טיסה LY5143, אישור המלון GU-4471",
+      "flight LY5143, hotel confirmation GU-4471",
+      "LY5143 אישור המלון: GU-4471",
+      "LY5143 זו ההזמנה שלנו",
+      "LY5143 is our reservation",
+      "LY5143 is our booking",
+    ]) {
+      assert.deepEqual(flightDesignatorsIn(text), ["LY5143"], text);
+    }
+  });
+
+  test("the A4 text still yields exactly the two flights", () => {
+    assert.deepEqual(flightDesignatorsIn(LJUBLJANA_TEXT), ["LY5143", "LY5144"]);
+    assert.deepEqual(flightDesignatorsIn(`${LJUBLJANA_TEXT}.`), ["LY5143", "LY5144"]);
   });
 });
 
@@ -570,6 +635,50 @@ describe("a hotel's confirmation typed beside two flights is not asked about as 
       );
       const store = await answersForChat(pool, chatId);
       assert.deepEqual(flightsOwed(store!.answers, store!.ui), []);
+    });
+  });
+});
+
+// #667 — the same hotel confirmation typed on its own, label after the code,
+// once the reader has already filed it on the stay.
+describe("a code a held stay already carries as its confirmation is not noted as a flight (#667)", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  const stops = [{
+    name: "לובליאנה", name_en: "Ljubljana", start: "2027-05-10", end: "2027-05-17",
+    accommodation: { name: "Grand Hotel Union", confirmation: "GU-4471" },
+  }];
+
+  async function holdTheStay(pool: pg.Pool, chatId: string): Promise<void> {
+    await answerRequiredExcept(pool, chatId, ["phases"]);
+    await pool.query(
+      `UPDATE control_plane.intake_sessions
+          SET answers = answers || jsonb_build_object('phases', $2::jsonb),
+              language = 'he', awaiting = 'person', phase = 'optional',
+              ui_state = jsonb_build_object('last_prompt', 'optional_offer', 'offered_more', true, 'car_asked', true)
+        WHERE telegram_chat_id = $1`,
+      [chatId, JSON.stringify({ kind: "structured", schema_version: 3, data: stops })],
+    );
+  }
+
+  test("the hotel's confirmation typed before its label: nothing is noted, nothing is asked", async () => {
+    await withInterview(async (pool, chatId) => {
+      await holdTheStay(pool, chatId);
+      const telegram = new Recorder();
+      const logs: string[] = [];
+      await say(pool, chatId, "GU-4471 זה מספר האישור של המלון", telegram, runnerProposing(), logs);
+      const store = await answersForChat(pool, chatId);
+      assert.deepEqual(store!.ui.typedFlights ?? [], [], "not noted");
+      assert.ok(!logs.some((l) => l.includes("typed_flights_noted")), `no noted line - ${JSON.stringify(logs)}`);
+      assert.ok(telegram.sent.every((m) => !m.text.includes("GU4471") && !m.text.includes("GU-4471")));
+    });
+  });
+
+  test("a bare code equal to the held stay's confirmation, with no label at all, is not a flight; a real flight beside it still is", async () => {
+    await withInterview(async (pool, chatId) => {
+      await holdTheStay(pool, chatId);
+      const noted = await noteTypedFlightsForChat(pool, chatId, "GU-4471 and our flight LY5143");
+      assert.deepEqual(noted, ["LY5143"]);
+      const store = await answersForChat(pool, chatId);
+      assert.deepEqual(store!.ui.typedFlights, ["LY5143"]);
     });
   });
 });

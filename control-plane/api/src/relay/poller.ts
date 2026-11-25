@@ -101,7 +101,17 @@ import {
   typedChoiceAnswer,
   applyPendingChangeForChat,
 } from "../interview.js";
-import { draftDigest, heldRefLists, parseOps, questionOfOp, stopsAnsweredByOps, type Op } from "../typed-changes.js";
+import {
+  carriesNewValue,
+  describeWaitingOps,
+  draftDigest,
+  heldRefLists,
+  leadsWithNo,
+  parseOps,
+  questionOfOp,
+  stopsAnsweredByOps,
+  type Op,
+} from "../typed-changes.js";
 import {
   cancelDraft,
   getDraft,
@@ -3548,6 +3558,7 @@ async function runInterpretPath(
   const interpretationId = claim.fresh ? claim.id : claim.row.id;
   let proposals: ProposedAnswer[];
   let malformed = 0;
+  let readerSaidNothing = false;
   let ops: Op[] | undefined;
   let opsError: string | undefined;
   let unclear: { questionId: string; why: string }[] = [];
@@ -3716,6 +3727,9 @@ async function runInterpretPath(
       onScreen,
       messageIds,
       heldLists: held,
+      // A change waits for their yes or no: the reader is told what it would do, so "no, it stays 17 May" - which
+      // restates the HELD value and so changes nothing against it - comes back as the operation that cancels it (#666).
+      ...(waiting && waiting.status === "pending" ? { waitingChange: describeWaitingOps(waiting.ops) } : {}),
       // The summary (or the "more, or the summary?" offer) is what the organizer
       // is looking at: what they type is then something to ADD or CHANGE, and the
       // reader is given every answerable question for it (2026-10-15).
@@ -3753,6 +3767,9 @@ async function runInterpretPath(
     }
     proposals = result.payload.proposals;
     malformed = result.payload.malformed;
+    // Read without trouble, and said nothing at all: no answer, no operation, nothing unclear.
+    readerSaidNothing = proposals.length === 0 && malformed === 0 && result.payload.unclear.length === 0
+      && (result.payload.ops === undefined || result.payload.ops.length === 0) && result.payload.opsError === undefined;
     // Validated here as well as in the parser: whatever a runner hands back, only
     // operations that pass `parseOps` ever reach the store.
     const checked = result.payload.ops === undefined ? null : parseOps(result.payload.ops);
@@ -3934,6 +3951,26 @@ async function runInterpretPath(
     }
   }
   await markInterpretationCommitted(deps.db, interpretationId, storedOutcomes(decisions, malformed));
+
+  // A TYPED "NO" THE READER FOUND NOTHING IN (#666). A change waits and the organizer types "לא, רגע — עד 17 במאי":
+  // the held end already IS 17 May, so a reader that is not told what waits has nothing to change and says nothing,
+  // and the box stayed live with the recap re-sent beneath it. The reader is told now (`waitingChange`), and this is
+  // the floor under it: a message that OPENS with a refusal, that the reader found nothing at all in, and that
+  // carries no value other than the held one for what the waiting change alters, is the organizer's No - exactly
+  // what "no" in words does. Only while the box is what they are looking at: its own version on screen, or the
+  // summary re-sent beneath a box this process sent. A question or the boundary offer on screen is the organizer's
+  // answer to THAT ("no, that's all"), never a refusal of a change.
+  // A refusal with a value of its own is a correction, which is the reader's to read, never ours to drop.
+  const boxIsOnScreen = waiting !== null && session.ok
+    && (promptDigest(session.view.lastPrompt, waiting.id) !== null
+      || (session.view.state === "awaiting_confirmation" && shownPreviews.has(waiting.id)));
+  if (readerSaidNothing && waiting && boxIsOnScreen && (change as ProposeResult | null) === null
+      && decisions.accepted.length === 0 && recorded
+      && leadsWithNo(sourceText) && !carriesNewValue(sourceText, recorded.answers, waiting.ops)) {
+    log(structuredLog("info", "interview.change_no_restated", { session_id: burst.sessionId, draft_id: waiting.id }));
+    await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "cancel" }, strings, log);
+    return;
+  }
 
   // A CHANGE TO THE STOPS OR THE TRAVELLERS: shown, never written. The operations
   // go into the session's one waiting draft — merged with what is already

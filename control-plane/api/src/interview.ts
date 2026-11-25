@@ -1207,14 +1207,63 @@ export function isFlightDesignator(value: string): boolean {
 // A full stop counts only after an abbreviation ("conf.", "ref.", "no."): after
 // "confirmation." it ends a sentence, and what follows is not that booking's code.
 // Hebrew takes one-letter prefixes ("האישור", "ואישור", "מספר האישור").
+const STAY_ENGLISH = "(?:hotel|stay|apartment|airbnb|accommodation|hostel|room|villa|lodging)";
+const STAY_HEBREW = "(?:מלון|לינה|דירה|וילה|צימר|אירוח|אכסניה|הוסטל|חדר)";
+const STAY_WORD = `(?:[הלבו]{0,2}${STAY_HEBREW}|${STAY_ENGLISH})`;
+// "the hotel's confirmation GU-4471", "אישור המלון GU-4471" (#667): the stay named between the word and the code.
 const CONFIRMATION_BEFORE = new RegExp(
   "(?<![\\p{L}\\p{N}])(?:[והבלשכמ]{0,2}אישור|confirmation|conf\\.?|reference|ref\\.?"
   + "|booking\\s+(?:reference|ref\\.?|number|no\\.?|num\\.?|code|#))"
-  + "(?:\\s*(?:number|num\\.?|no\\.?|מספר|code|#))?[\\s:#\\-]*$",
+  + "(?:\\s*(?:number|num\\.?|no\\.?|מספר|code|#))?"
+  + `(?:\\s+(?:(?:of|for|at|של|ל)\\s*)?(?:the\\s+)?${STAY_WORD}(?:\\s+(?:number|no\\.?|מספר))?)?[\\s:#\\-]*$`,
   "iu",
 );
 function followsConfirmationWord(text: string, at: number): boolean {
   return CONFIRMATION_BEFORE.test(text.slice(Math.max(0, at - 40), at));
+}
+
+// ── #667: the confirmation word AFTER the code ──
+//
+// "GU-4471 זה מספר האישור של המלון" — the organizer names the code first and says
+// what it is afterwards. A code is NOT a flight when, within the same clause:
+//  - it is followed by a hotel or stay word ("GU-4471 למלון", "GU-4471 for the
+//    hotel"), or
+//  - it is followed by "is / זה" and a confirmation word ("GU-4471 is the
+//    confirmation", "GU-4471 זה האישור של המלון"), or by a confirmation word
+//    that itself names a hotel or stay ("GU-4471 - אישור המלון").
+// It IS still a flight when the confirmation word is about the flight or hands
+// over another code: "LY5143 אישור הטיסה ABC123", "LY5143 confirmation ABC123".
+// A flight lost to this veto is the failure `flightDesignatorsIn` exists to
+// prevent, so anything not clearly one of the above stays a flight.
+// A bare "הזמנה" or "reservation" is how people name a flight too ("זו ההזמנה שלנו"), and #646 kept a bare
+// "booking" out for the same reason: those count only with a "number" (or after "אישור").
+const CONFIRMATION_WORD = "(?:(?:מספר\\s+[הוש]{0,2}(?:אישור|הזמנה|אסמכתא)|[הוש]{0,2}(?:אישור|אסמכתא)(?:\\s+[הוש]?הזמנה)?)|confirmation|conf\\.?|booking\\s+(?:reference|ref\\.?|number|no\\.?|code)|reservation\\s+(?:number|no\\.?|code)|reference|ref\\.?|pnr)";
+const COPULA = "(?:זה|זהו|זאת|זו|הוא|היא|הינו|is|was|=)";
+const GAP = "[\\s,:\\-\\u2013\\u2014]*";
+// A stay word BARE after a code ("טיסה LY5143, מלון Grand Hotel Union") is the next thing the organizer says, not
+// what the code is. It must be what the code is FOR: a preposition, with nothing but a space between.
+const CODE_AFTER_STAY = new RegExp(
+  `^\\s+(?:(?:for|of|at|in|של)\\s+(?:(?:the|my)\\s+)?(?:${STAY_ENGLISH}|ה?${STAY_HEBREW})|[לב]ה?${STAY_HEBREW})(?![\\p{L}\\p{N}])`, "iu");
+const CODE_IS_CONFIRMATION = new RegExp(
+  `^${GAP}${COPULA}\\s+(?:(?:the|my|our|a|an)\\s+)?(?:(?:hotel|stay|booking)\\s+)?${CONFIRMATION_WORD}(?![\\p{L}\\p{N}])`, "iu");
+const CODE_THEN_STAY_CONFIRMATION = new RegExp(
+  `^${GAP}(?:(?:the|my|our)\\s+)?${CONFIRMATION_WORD}\\s+(?:(?:of|for|at|של|ל)\\s*)?(?:the\\s+)?${STAY_WORD}(?![\\p{L}\\p{N}])`, "iu");
+/** What follows the confirmation word says it is the flight's own, or hands over another reference. */
+const CONFIRMATION_OF_A_FLIGHT =
+  /^\s*(?:(?:of|for|של|ל)\s*)?(?:the\s+)?(?:[הל]?טיסה|flight|ticket|trip)|(?<![A-Za-z0-9])(?=[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{3,}(?![A-Za-z0-9])/iu;
+
+function confirmationFollowsCode(text: string, end: number): boolean {
+  // The same clause only: a sentence break ends it (a full stop after an
+  // abbreviation — "conf.", "ref.", "no." — does not).
+  const tail = text.slice(end, end + 80).split(/(?<!(?:^|[^\p{L}])(?:conf|ref|no|num))\.|[!?;\n]/iu)[0] ?? "";
+  if (CODE_AFTER_STAY.test(tail)) return true;
+  for (const pattern of [CODE_IS_CONFIRMATION, CODE_THEN_STAY_CONFIRMATION]) {
+    const hit = pattern.exec(tail);
+    if (!hit) continue;
+    if (CONFIRMATION_OF_A_FLIGHT.test(tail.slice(hit[0].length))) continue;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1241,6 +1290,7 @@ export function flightDesignatorsIn(text: string): string[] {
     const code = match[1]!;
     const digits = match[2]!;
     if (followsConfirmationWord(text, match.index ?? 0)) continue;
+    if (confirmationFollowsCode(text, (match.index ?? 0) + match[0].length)) continue;
     const needed = /[0-9]/.test(code) ? 3 : 2;
     if (digits.length < needed) continue;
     const designator = `${code}${digits}`;
@@ -4936,7 +4986,11 @@ export async function noteTypedFlightsForChat(
   chatId: string,
   text: string,
 ): Promise<string[]> {
-  const found = flightDesignatorsIn(text);
+  // A code the held stays already carry as their confirmation is that booking's
+  // reference, not a flight, however it is worded (#667). Equality only.
+  const held = await answersForChat(db, chatId);
+  const stays = held ? stayConfirmations(held.answers) : new Set<string>();
+  const found = flightDesignatorsIn(text).filter((d) => !stays.has(d));
   if (found.length === 0) return [];
   await updateUiStateForChat(db, chatId, (ui) => ({
     ...ui,
