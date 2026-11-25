@@ -19,6 +19,8 @@ const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: fals
 const DESTROY = { readOnlyHint: false, destructiveHint: true, openWorldHint: false };
 // What set_group_change_line answers, with nothing changed, for a trip whose plan_change_group_line switch is off.
 const NO_PLAN_CHANGE_LINES = Object.freeze({ changed: false, message: 'This trip does not have plan-change lines.' });
+// What the trip-logo tools answer, with nothing changed, for a trip whose trip_logo switch is off.
+const NO_TRIP_LOGO = Object.freeze({ changed: false, message: 'The trip logo is not turned on for this trip.' });
 const bookingType = z.enum(['flight', 'hotel', 'car', 'attraction', 'other']);
 
 // Other people's records reach the assistant as name and colour only. Issue
@@ -249,6 +251,34 @@ function registerTools(mcp, site, { write = true, origin } = {}) {
       const bookings = await site.get('/api/bookings');
       if (!bookings.some(booking => booking.id === booking_id)) throw new Error('Booking not found on this trip');
       return { status: 'pending_upload', booking_id, url: origin + '/mcp/upload-confirmation/' + booking_id };
+    });
+
+  // ── The trip's logo (docs/specs/sprint-9/x-trip-logo.md) ────────────────────
+  // Claude and ChatGPT cannot hand image bytes to a tool, so the way to set the logo is a link to a page on the trip
+  // site, as for a booking confirmation. Both tools are WRITE: a read-only connection never lists them. The site's own
+  // routes (organizer-or-agent only, switch-gated) are the boundary; the page re-checks both before it offers a file.
+  tool('get_trip_logo_upload_link', 'Upload the trip logo',
+    'Give the organizer the link to the trip site\'s logo page, where they choose an image (PNG, JPEG, WebP or GIF, up to 8 MB). This assistant cannot transfer image bytes itself. '
+    + 'The link is pending, not proof that a logo was saved: ask the organizer to open it while signed into the trip site, and report success only after the page says the saved logo was verified. '
+    + 'If the trip does not have this feature, nothing is offered and the answer says so: relay that plainly. A home-screen icon that is already installed on a phone is not refreshed; a new install gets the new one.',
+    WRITE, {},
+    async () => {
+      if (!origin) throw new Error('Trip origin unavailable');
+      // /api/config carries the member-visible switches that are on; a failed read throws and nothing is offered.
+      const config = await site.get('/api/config');
+      if (config?.features?.trip_logo !== true) return NO_TRIP_LOGO;
+      return { status: 'pending_upload', url: origin + '/mcp/upload-logo' };
+    });
+
+  tool('clear_trip_logo', 'Remove the trip logo',
+    'Remove the trip\'s uploaded logo, so the site shows the trip file\'s logo if it has one, else the Kinerary mark. Confirm with the organizer first. '
+    + 'If the trip does not have this feature, nothing is changed and the answer says so. Returns the site\'s settings: read logo back and tell the organizer what the site now shows.',
+    WRITE, {},
+    async () => {
+      const config = await site.get('/api/config');
+      if (config?.features?.trip_logo !== true) return NO_TRIP_LOGO;
+      const settings = await writeCall(() => site.del('/api/ui-settings/logo'));
+      return { changed: true, logo: settings.logo };
     });
 
   tool('delete_booking', 'Delete a booking',

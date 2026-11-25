@@ -329,7 +329,7 @@ describe('the registry (AC-3)', () => {
   });
   test('the registry still loads (its shape check ran at require time) and keeps delivery_probe first', () => {
     assert.equal(FEATURE_SWITCHES[0].name, 'delivery_probe');
-    assert.deepEqual(FEATURE_SWITCHES.map((s) => s.name), ['delivery_probe', 'plan_change_marks', 'plan_change_group_line', 'whatsapp']);
+    assert.deepEqual(FEATURE_SWITCHES.map((s) => s.name), ['delivery_probe', 'plan_change_marks', 'plan_change_group_line', 'whatsapp', 'trip_logo']);
   });
 });
 

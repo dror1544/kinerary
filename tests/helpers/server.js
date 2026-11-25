@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -22,18 +22,31 @@ let tripDir = null;
 // passes its own PORT via extraEnv, named in helpers/ports.js.
 let BASE_URL = `http://localhost:${DEFAULT_TEST_PORT}`;
 
-export async function startTestServer(extraEnv = {}) {
+/**
+ * `options` (all optional, for tests that need a differently configured trip):
+ *   configure(config, tripDir)  edits the trip config object before the server reads it (a `features` block,
+ *                               `meta.logo`); `tripDir` is where a file the config names can be written.
+ *   reuseData                   boot over the data directory the previous server left (see stopTestServerKeepData),
+ *                               to prove what a restart keeps. `configure` still runs on the existing config file.
+ */
+export async function startTestServer(extraEnv = {}, options = {}) {
   const port = extraEnv.PORT || DEFAULT_TEST_PORT;
   // A leaked server holding this port would otherwise surface as EADDRINUSE
   // and "exited before becoming ready"; this names the holder instead.
   await assertPortFree(port);
-  dataDir = mkdtempSync(join(tmpdir(), 'trip-test-'));
+  if (!(options.reuseData && dataDir)) dataDir = mkdtempSync(join(tmpdir(), 'trip-test-'));
   // The trip dir is a throwaway copy, never the committed fixtures directory.
   // Endpoints that persist config changes (participant binding, plan export)
   // write trip.config.json in place, which used to dirty a tracked file — the
   // other test files already copy for exactly this reason.
   tripDir = join(dataDir, 'trip');
-  cpSync(FIXTURES_DIR, tripDir, { recursive: true });
+  if (!options.reuseData) cpSync(FIXTURES_DIR, tripDir, { recursive: true });
+  if (options.configure) {
+    const configPath = join(tripDir, 'trip.config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    options.configure(config, tripDir);
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+  }
   const siteDir = join(dataDir, 'site');
   mkdirSync(join(siteDir, 'confirmations'), { recursive: true });
   writeFileSync(join(siteDir, 'confirmations', 'static-test.pdf'), '%PDF-1.4 static confirmation');
@@ -90,6 +103,21 @@ export function stopTestServer() {
     try { rmSync(dataDir, { recursive: true, force: true }); } catch {}
     dataDir = null;
   }
+}
+
+/** Stop the server but keep its data directory, for startTestServer(env, { reuseData: true }). */
+export async function stopTestServerKeepData() {
+  const proc = serverProcess;
+  serverProcess = null;
+  if (!proc) return;
+  const exited = new Promise(resolve => proc.once('exit', resolve));
+  proc.kill('SIGTERM');
+  await exited;
+}
+
+/** The running test server's DATA_DIR (the trip SQLite and the media directory sit under it). */
+export function testDataDir() {
+  return dataDir;
 }
 
 /** The running test server's TRIP_DIR — a throwaway copy of the fixtures. */

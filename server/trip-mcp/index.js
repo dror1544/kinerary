@@ -27,6 +27,7 @@ const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenti
 const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
 const { registerTools, buildInstructions, visibleTags } = require('./tools');
 const { renderConfirmationUploadPage } = require('./confirmation-upload-page');
+const { renderLogoUploadPage } = require('./logo-upload-page');
 const { readConfirmationPdf } = require('./confirmation-readback');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
@@ -388,6 +389,20 @@ function registerTripMcp({
     res.set('X-Content-Type-Options', 'nosniff');
     res.set('Referrer-Policy', 'no-referrer');
     res.type('html').send(renderConfirmationUploadPage({ bookingId: id, nonce }));
+  });
+  // The trip logo's upload page (docs/specs/sprint-9/x-trip-logo.md), under the same CSP and nonce rules as the
+  // confirmation page. Like it, the page carries no trip data and no credential; the browser sends its own site
+  // session to the site's routes, which are the boundary.
+  app.get('/mcp/upload-logo', noStore, (_req, res) => {
+    const nonce = crypto.randomBytes(16).toString('base64');
+    res.set('Content-Security-Policy', [
+      "default-src 'none'", "script-src 'nonce-" + nonce + "'", "style-src 'nonce-" + nonce + "'",
+      "img-src 'self' blob:", "connect-src 'self'", "form-action 'none'", "frame-ancestors 'none'", "base-uri 'none'",
+    ].join('; '));
+    res.set('X-Frame-Options', 'DENY');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Referrer-Policy', 'no-referrer');
+    res.type('html').send(renderLogoUploadPage({ nonce }));
   });
   app.options('/mcp', cors);
   // A person who opens the address in a browser (or lands on /modern/mcp,

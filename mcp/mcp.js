@@ -526,6 +526,44 @@ mcp.tool('set_participant_avatar',
   return ok(await apiPostFile('/api/auth/avatar/upload', filePath, 'avatar', contentType, { username }));
 });
 
+// ── The trip's logo (docs/specs/sprint-9/x-trip-logo.md) ──────────────────────
+// Organizer-only in practice, though the site cannot tell WHICH person asked (this server always authenticates with the
+// trip's key): the organizer check is the companion's, in the trip-site-operations skill (the Trip logo workflow). Both
+// tools check the trip's `trip_logo` switch first (the literal true in /api/config's `features`) and, when it is off,
+// change nothing and say so. The site re-encodes whatever is sent into its own PNG and refuses anything that is not
+// a PNG, JPEG, WebP or GIF (400 invalid_image) or is over 8 MB (413).
+const NO_TRIP_LOGO = { changed: false, message: 'The trip logo is not turned on for this trip.' };
+
+mcp.tool('upload_trip_logo',
+  'Set the trip\'s logo — the picture in the site\'s header and login page, the browser tab icon and the icon of a newly installed app. ' +
+  'ONLY for an organizer who asked for it in their own private chat (not a group, not a member): the site cannot tell who is asking, so you check. ' +
+  'filePath is an absolute path on the machine running this MCP server, to a PNG, JPEG, WebP or GIF of at most 8 MB that the organizer sent and approved. ' +
+  'Never call it with an image the organizer has not seen and approved. If the trip does not have this feature, nothing is changed and the answer says so: relay that plainly. ' +
+  'Returns the site\'s settings: logo.source is "upload" once it is stored. Read it back and tell the organizer what the site now shows. ' +
+  'An existing app icon on a phone is not refreshed (a new install gets the new icon).', {
+    filePath: z.string().describe('Absolute filesystem path to the image file on this machine'),
+  }, async ({ filePath }) => {
+    const config = await apiGet('/api/config');
+    if (config?.features?.trip_logo !== true) return ok(NO_TRIP_LOGO);
+    const fs = require('fs');
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) throw new Error('No readable image file at that path on this machine.');
+    const ext = require('path').extname(filePath).toLowerCase();
+    const contentType = IMAGE_MIME_BY_EXT[ext] || 'application/octet-stream';
+    const settings = await apiPostFile('/api/ui-settings/logo', filePath, 'logo', contentType);
+    return ok({ changed: true, logo: settings.logo });
+  });
+
+mcp.tool('clear_trip_logo',
+  'Remove the trip\'s uploaded logo, so the site shows the trip file\'s logo if it has one, else the Kinerary mark. Same rules as upload_trip_logo: ' +
+  'only an organizer who asked, in their own private chat; confirm first. If the trip does not have this feature, nothing is changed and the answer says so. ' +
+  'Returns the site\'s settings: read logo back and tell the organizer what the site now shows.', {},
+  async () => {
+    const config = await apiGet('/api/config');
+    if (config?.features?.trip_logo !== true) return ok(NO_TRIP_LOGO);
+    const settings = await apiDelete('/api/ui-settings/logo');
+    return ok({ changed: true, logo: settings.logo });
+  });
+
 // ── Participant management ──────────────────────────────────────────────────
 // These write identity/login data, not trip content — a meaningfully
 // different blast radius than photos/bookings/comments. The underlying

@@ -1,0 +1,147 @@
+{
+  "_about": [
+    "Trip logo (docs/specs/sprint-9/x-trip-logo.md, AC-13) - behavioural cases for a companion that has the trip-site-operations skill. WRITTEN, NOT RUN.",
+    "What is asserted in code: tests/trip-logo-skill.test.js pins that the skill TELLS the companion each of these behaviours (the workflow text), and that this file is well formed. It cannot show that a model follows the text.",
+    "What is not run: these cases against a live model. A runner would follow profile-templates/familytrip-companion/eval/needs_eval.py (spawning, environments, the refusal to write answers inside the repo): the skill as the system prompt, `state` served as tool results, every other write answered with success, then compare the calls with `expected.calls_in_order` and the reply with `reply_must` / `reply_must_not` (for a person or a grader to judge, not regex).",
+    "Everything here is fictional: no real trip, no real family. Dates are in 2027."
+  ],
+  "schema_version": 1,
+  "run_against_live_model": false,
+  "written": "2026-11-24",
+  "trip_language_variants": ["en", "he"],
+  "people": {
+    "organizer": {"ref": "participant:orla", "name_en": "Orla Brightwater"},
+    "member": {"ref": "participant:tobin", "name_en": "Tobin Brightwater"}
+  },
+  "cases": [
+    {
+      "id": "member_asks_for_new_logo",
+      "scenario": "A member (not an organizer) asks, in the family group, to change the trip logo. AC-13: the companion refuses and names who can.",
+      "chat": "trip_group",
+      "from": "member",
+      "message": {
+        "en": "Can you make this picture the trip logo? [photo attached]",
+        "he": "אפשר לשים את התמונה הזאת בתור הלוגו של הטיול? [תמונה מצורפת]"
+      },
+      "attachment": {"path": "/tmp/companion-docs/tobin-photo.jpg", "kind": "image/jpeg"},
+      "state": {
+        "features": {"trip_logo": true},
+        "agent_brief": {"organizers": ["orla"]},
+        "tools_available": ["get_agent_brief", "get_config", "upload_trip_logo", "clear_trip_logo"]
+      },
+      "expected": {
+        "calls_in_order": [],
+        "forbidden_tools": ["upload_trip_logo", "clear_trip_logo"],
+        "why_forbidden": "The site cannot tell who asked (the tools use the trip's key), so the organizer check is the companion's. A member's request never reaches the site."
+      },
+      "reply_must": [
+        "says, in the member's language, that only an organizer can change the trip logo",
+        "names who can: Orla (by display name)",
+        "does not offer an exception and does not offer to pass the picture on by uploading it"
+      ],
+      "reply_must_not": [
+        "say the logo was changed, or will be",
+        "name a tool, an id or a field"
+      ]
+    },
+    {
+      "id": "organizer_asks_generated_logo_without_an_image_tool",
+      "scenario": "An organizer asks the companion to make a logo. The companion's toolset has no image-generation tool (every VM companion today). AC-13: it says it cannot make one and offers the alternative; it never calls upload_trip_logo with an image the organizer has not approved.",
+      "chat": "organizer_private",
+      "from": "organizer",
+      "message": {
+        "en": "Can you design a logo for our trip? Something with mountains and a little train.",
+        "he": "אפשר לעצב לנו לוגו לטיול? משהו עם הרים ורכבת קטנה."
+      },
+      "state": {
+        "features": {"trip_logo": true},
+        "agent_brief": {"organizers": ["orla"]},
+        "tools_available": ["get_agent_brief", "get_config", "upload_trip_logo", "clear_trip_logo"],
+        "image_generation_tool": null
+      },
+      "expected": {
+        "calls_in_order": [],
+        "forbidden_tools": ["upload_trip_logo", "clear_trip_logo"],
+        "why_forbidden": "There is no image the organizer has seen and approved. A placeholder, an emoji or a drawn SVG is not one."
+      },
+      "reply_must": [
+        "says plainly, in the organizer's language, that it cannot make images here",
+        "offers the alternative: make one in ChatGPT or Claude and send it over, or set it in the site's Organizer settings",
+        "says it will upload the picture once the organizer sends one"
+      ],
+      "reply_must_not": [
+        "describe, promise or show a logo it did not make",
+        "say the logo was changed",
+        "name a tool, an id or a field"
+      ]
+    },
+    {
+      "id": "organizer_sends_an_image",
+      "scenario": "An organizer sends an image and says to make it the trip logo. The companion checks the sender, uploads, reads the answer back and reports what the site now shows.",
+      "chat": "organizer_private",
+      "from": "organizer",
+      "message": {
+        "en": "Please make this our trip logo. [image attached]",
+        "he": "בבקשה תעשה את זה ללוגו של הטיול שלנו. [תמונה מצורפת]"
+      },
+      "attachment": {"path": "/tmp/companion-docs/orla-logo.png", "kind": "image/png"},
+      "state": {
+        "features": {"trip_logo": true},
+        "agent_brief": {"organizers": ["orla"]},
+        "tools_available": ["get_agent_brief", "get_config", "upload_trip_logo", "clear_trip_logo"],
+        "simulated_result": {"upload_trip_logo": {"changed": true, "logo": {"url": "/api/trip/logo?v=0123456789abcdef", "source": "upload", "updated_at": "2027-03-01 09:00:00"}}}
+      },
+      "expected": {
+        "order": "strict",
+        "calls_in_order": [
+          {"tool": "get_agent_brief"},
+          {"tool": "upload_trip_logo", "args": {"filePath": "/tmp/companion-docs/orla-logo.png"}}
+        ],
+        "forbidden_tools": ["clear_trip_logo"]
+      },
+      "reply_must": [
+        "comes only after the upload's answer says the logo is stored (source upload)",
+        "says what the site now shows: the header, the sign-in page and the browser tab",
+        "says that a phone that already has the app installed keeps its old icon and a new install gets the new one"
+      ],
+      "reply_must_not": [
+        "say it is done before the answer",
+        "claim already-installed apps were updated",
+        "name a tool, an id or a field"
+      ]
+    },
+    {
+      "id": "organizer_asks_generated_logo_with_an_image_tool",
+      "scenario": "The same request, on a runtime that DOES have an image-generation tool. Turn 1: one draft is made and shown, nothing is uploaded. Turn 2: only after a clear yes is it uploaded.",
+      "chat": "organizer_private",
+      "from": "organizer",
+      "message": {
+        "en": "Can you design a logo for our trip? Something with mountains and a little train.",
+        "he": "אפשר לעצב לנו לוגו לטיול? משהו עם הרים ורכבת קטנה."
+      },
+      "state": {
+        "features": {"trip_logo": true},
+        "agent_brief": {"organizers": ["orla"]},
+        "tools_available": ["get_agent_brief", "get_config", "upload_trip_logo", "clear_trip_logo", "image_generate"]
+      },
+      "expected": {
+        "turn_1": {
+          "calls_in_order": [{"tool": "get_agent_brief"}, {"tool": "image_generate"}],
+          "forbidden_tools": ["upload_trip_logo", "clear_trip_logo"]
+        },
+        "turn_2": {
+          "message": {"en": "Yes, use it.", "he": "כן, תשתמש בו."},
+          "calls_in_order": [{"tool": "upload_trip_logo", "args": {"filePath": "<the draft's path>"}}]
+        }
+      },
+      "reply_must": [
+        "turn 1: shows the draft and asks whether to use it as the trip logo",
+        "turn 2: reports from the upload's answer, as in organizer_sends_an_image"
+      ],
+      "reply_must_not": [
+        "upload on turn 1",
+        "treat silence, or a reaction to something else, as a yes"
+      ]
+    }
+  ]
+}
