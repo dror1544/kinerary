@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
 import { normalizeNavApp, type NavApp } from "./nav-links";
 
-export type TripSettings = { group_change_line?: boolean; nav_app?: string };
+export type TripSettings = { group_change_line?: boolean; nav_app?: string; group_photo_autosave?: boolean; moment_capture_mode?: string };
 
 export const SETTINGS_KEY = ["trip-settings"] as const;
 

@@ -135,6 +135,15 @@ function configVersion(db, raw) {
   };
 }
 
+// An additive column for the photos-and-moments feature. SQLite has no "ADD COLUMN IF NOT EXISTS", so the statement runs every boot and
+// the only failure that means "already done" is the duplicate column. Anything else (a missing table, a read-only file, a typo in the
+// statement) is a real fault and stops the boot with its message, not a column the site silently goes without.
+function addColumn(db, sql) {
+  try { db.exec(sql); } catch (err) {
+    if (!/duplicate column name/i.test(String(err && err.message))) throw err;
+  }
+}
+
 function schema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS trip_ui_settings (
@@ -301,6 +310,14 @@ function schema(db) {
   for (const column of ['logo_media_file', 'logo_hash', 'logo_updated_by', 'logo_updated_at']) {
     try { db.exec(`ALTER TABLE trip_ui_settings ADD COLUMN ${column} TEXT`); } catch {}
   }
+  // Trip photos and moments from the chats (docs/specs/sprint-9/x-trip-photos-and-moments.md, Part A). Two trip settings, like the
+  // ones above: whether photos posted in the trip's group are saved to the album (on by default), and what happens to a moment the
+  // companion drafts. Moments gain several photos (photo_ids, a JSON array; photo_id stays as the first, for old readers) and a
+  // source. Additive, defaulted, idempotent.
+  addColumn(db, 'ALTER TABLE trip_settings ADD COLUMN group_photo_autosave INTEGER NOT NULL DEFAULT 1 CHECK (group_photo_autosave IN (0,1))');
+  addColumn(db, "ALTER TABLE trip_settings ADD COLUMN moment_capture_mode TEXT NOT NULL DEFAULT 'ask_in_chat' CHECK (moment_capture_mode IN ('ask_in_chat','organizer_draft','publish'))");
+  addColumn(db, 'ALTER TABLE trip_moments ADD COLUMN source TEXT');
+  addColumn(db, 'ALTER TABLE trip_moments ADD COLUMN photo_ids TEXT');
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
   db.prepare('INSERT OR IGNORE INTO trip_settings (id, timezone) VALUES (1, NULL)').run();
 }
@@ -1083,6 +1100,34 @@ function navApp(row) {
   return row && row.nav_app === 'waze' ? 'waze' : 'google';
 }
 
+// Saving the group's photos is on only when the row says 1, like the group line: the default (on) lives in the column's DEFAULT,
+// and a read that finds no value is a setting nobody can read, so it reads as off (and says so once) rather than keeping
+// photos nobody chose to keep.
+let warnedAutosaveUnreadable = false;
+function groupPhotoAutosave(row) {
+  if (row && row.group_photo_autosave === 1) return true;
+  if (row && row.group_photo_autosave === 0) return false;
+  if (!warnedAutosaveUnreadable) {
+    warnedAutosaveUnreadable = true;
+    console.warn('trip_settings.group_photo_autosave_unreadable: the setting has no value here; it reads as off');
+  }
+  return false;
+}
+
+// What happens to a moment the companion drafts. FAIL SAFE: only the three exact strings are modes; a missing row, a missing
+// column or any other value is organizer_draft, the most restrictive one (nothing reaches the chat or the site without an
+// organizer), and says so once. An unknown value never falls through to publish.
+const MOMENT_CAPTURE_MODES = new Set(['ask_in_chat', 'organizer_draft', 'publish']);
+let warnedModeUnreadable = false;
+function momentCaptureMode(row) {
+  if (row && MOMENT_CAPTURE_MODES.has(row.moment_capture_mode)) return row.moment_capture_mode;
+  if (!warnedModeUnreadable) {
+    warnedModeUnreadable = true;
+    console.warn('trip_settings.moment_capture_mode_unreadable: the setting has no known value here; it reads as organizer_draft');
+  }
+  return 'organizer_draft';
+}
+
 function tripSettings(db) {
   const row = db.prepare('SELECT * FROM trip_settings WHERE id = 1').get();
   return {
@@ -1092,6 +1137,8 @@ function tripSettings(db) {
     // nobody can read, and it reads as off (and says so once) rather than sending a trip's group a line nobody chose.
     group_change_line: groupChangeLine(row),
     nav_app: navApp(row),
+    group_photo_autosave: groupPhotoAutosave(row),
+    moment_capture_mode: momentCaptureMode(row),
     updated_by: row?.updated_by || null,
     updated_at: row?.updated_at || null,
   };
@@ -1405,7 +1452,18 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (hasNav && !NAV_APPS.has(body.nav_app)) {
       return res.status(400).json({ error: 'nav_app must be "google" or "waze"' });
     }
-    if ((body.timezone !== undefined || !(hasLine || hasNav)) && !isValidTimeZone(body.timezone)) {
+    const hasAutosave = body.group_photo_autosave !== undefined;
+    // The photo and moment choices are the organizer's: the agent key (the companion, which a chat can talk to) may not change them.
+    // It keeps the settings it changes today (the timezone and the group line). Refused whole: nothing of a mixed body is applied.
+    if (req.user?.isAgent && (hasAutosave || body.moment_capture_mode !== undefined)) return res.status(403).json({ error: 'organizer_only_setting' });
+    if (hasAutosave && typeof body.group_photo_autosave !== 'boolean') {
+      return res.status(400).json({ error: 'group_photo_autosave must be true or false' });
+    }
+    const hasMode = body.moment_capture_mode !== undefined;
+    if (hasMode && !MOMENT_CAPTURE_MODES.has(body.moment_capture_mode)) {
+      return res.status(400).json({ error: 'moment_capture_mode must be "ask_in_chat", "organizer_draft" or "publish"' });
+    }
+    if ((body.timezone !== undefined || !(hasLine || hasNav || hasAutosave || hasMode)) && !isValidTimeZone(body.timezone)) {
       return res.status(400).json({ error: 'timezone must be a valid IANA time zone identifier, e.g. "America/New_York"' });
     }
     // Store Intl's canonical spelling, never the caller's own — the same rule
@@ -1418,8 +1476,8 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
       ? new Intl.DateTimeFormat(undefined, { timeZone: body.timezone }).resolvedOptions().timeZone
       : null;
     db.prepare(
-      "UPDATE trip_settings SET timezone = COALESCE(?, timezone), group_change_line = COALESCE(?, group_change_line), nav_app = COALESCE(?, nav_app), updated_by = ?, updated_at = datetime('now') WHERE id = 1"
-    ).run(canonical, hasLine ? (body.group_change_line ? 1 : 0) : null, hasNav ? body.nav_app : null, req.user.username);
+      "UPDATE trip_settings SET timezone = COALESCE(?, timezone), group_change_line = COALESCE(?, group_change_line), nav_app = COALESCE(?, nav_app), group_photo_autosave = COALESCE(?, group_photo_autosave), moment_capture_mode = COALESCE(?, moment_capture_mode), updated_by = ?, updated_at = datetime('now') WHERE id = 1"
+    ).run(canonical, hasLine ? (body.group_change_line ? 1 : 0) : null, hasNav ? body.nav_app : null, hasAutosave ? (body.group_photo_autosave ? 1 : 0) : null, hasMode ? body.moment_capture_mode : null, req.user.username);
     res.json(tripSettings(db));
   });
 
@@ -1929,45 +1987,127 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     res.json({ ok: true });
   });
 
+  // ── Trip moments ────────────────────────────────────────────────────────────
+  // A moment carries one or more photos (photo_ids, in order; photo_id stays the first, for old readers) and says where it came
+  // from (source). Who sees what is unchanged: everyone sees published moments, and a person sees their own drafts.
+  // Where a moment came from. `chat` is the companion's (the agent key's) alone: it writes in the name of a participant, and what
+  // it writes may quote other people. A member's own moment is `site` (the site's composer) or `connector` (their own Claude or
+  // ChatGPT, their own words). Provenance is what the publishing rule below turns on, so a member cannot claim `chat`.
+  const MOMENT_SOURCES = new Set(['site', 'chat', 'connector']);
+  const MEMBER_MOMENT_SOURCES = new Set(['site', 'connector']);
+  const AGENT_MOMENT_SOURCES = new Set(['chat']);
+  const MAX_MOMENT_PHOTOS = 20;
+  const PHOTO_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+  const momentOut = (row) => {
+    if (!row) return row;
+    let ids = [];
+    try { const parsed = JSON.parse(row.photo_ids); if (Array.isArray(parsed)) ids = parsed.filter((id) => typeof id === 'string'); } catch { /* none stored */ }
+    // A moment from before photo_ids has only photo_id: it is one photo.
+    if (!ids.length && row.photo_id) ids = [row.photo_id];
+    return { ...row, photo_ids: ids, photo_id: ids[0] || null, source: MOMENT_SOURCES.has(row.source) ? row.source : 'site' };
+  };
+  // Returns { ids } (possibly empty), or { error } for a shape the site does not store.
+  const readPhotoIds = (value) => {
+    if (value === undefined || value === null) return { ids: [] };
+    if (!Array.isArray(value) || value.length > MAX_MOMENT_PHOTOS) return { error: `photo_ids must be a list of at most ${MAX_MOMENT_PHOTOS} photo ids` };
+    if (!value.every((id) => typeof id === 'string' && PHOTO_ID_RE.test(id))) return { error: 'photo_ids must be photo ids (letters, digits, - and _)' };
+    return { ids: [...new Set(value)] };
+  };
+  const isParticipantUser = (username) => {
+    try { return Boolean(db.prepare('SELECT 1 FROM users WHERE username = ? AND removed_at IS NULL').get(username)); } catch { return false; }
+  };
+  // An organizer or the agent key: who may publish what the companion wrote, and edit it once it is out.
+  const isStaff = (req) => {
+    const { agent } = cfg();
+    const organizers = Array.isArray(agent?.organizers) ? agent.organizers : [agent?.organizer].filter(Boolean);
+    return organizers.includes(req.user.username) || Boolean(req.user.secondaryOrganizer) || Boolean(req.user.isAgent);
+  };
+  const mayChangeMoment = (req, row) => row.author === req.user.username || isStaff(req);
+  // A moment the companion wrote (source `chat`) reaches the family only through an organizer (or the agent): its author, who
+  // may be the member it was attributed to, cannot publish it, and cannot change it once it is published (it may quote others).
+  // A member's own moment (site, connector, or from before sources existed) the author may still publish, as the site always allowed.
+  const isChatMoment = (row) => row.source === 'chat';
+  // The organizer's choice of what happens to a drafted moment, enforced for the agent key too (the companion obeys it, and the site
+  // does not rely on that): in `organizer_draft` mode the agent cannot make a chat moment public, only an organizer can. In
+  // `ask_in_chat` (the agent publishes after the chat says yes) and `publish` it may. Organizers are never limited by the mode. Only while
+  // the trip has trip_moments_capture on: with it off there are no modes, and the agent behaves as before. An unreadable mode is
+  // organizer_draft (tripSettings fails safe), so a damaged setting never lets the agent publish.
+  // Keyed on the CALLER, not on a label the row carries: with the mode organizer_draft the agent key is refused any publish, a POST
+  // or a PATCH, whatever source the moment has.
+  const agentMayPublish = (req) => !req.user?.isAgent || !switchOn('trip_moments_capture') || tripSettings(db).moment_capture_mode !== 'organizer_draft';
+
   app.get('/api/moments', authRequired, (req, res) => {
+    // Everyone sees published moments and their own drafts. An organizer or the agent key also sees the drafts that came from the
+    // chat or a member's connector (the trip's `organizer_draft` mode is useless if no organizer can find them), and only while the
+    // trip has `trip_moments_capture` on: a draft a member wrote on the site, or any draft on a trip without the feature, stays
+    // theirs alone, exactly as before. The predicate is the one that lets organizers see booking drafts (`isOrganizer`); a caller
+    // that passes none gets the member view.
+    const staff = Boolean(isOrganizer && isOrganizer(req)) && switchOn('trip_moments_capture');
     const rows = db.prepare(
-      "SELECT * FROM trip_moments WHERE visibility = 'published' OR author = ? ORDER BY COALESCE(date, created_at) DESC, created_at DESC"
-    ).all(req.user.username);
-    res.json(rows);
+      "SELECT * FROM trip_moments WHERE visibility = 'published' OR author = ? OR (? = 1 AND source IN ('chat','connector')) ORDER BY COALESCE(date, created_at) DESC, created_at DESC"
+    ).all(req.user.username, staff ? 1 : 0);
+    res.json(rows.map(momentOut));
   });
 
   app.post('/api/moments', authRequired, (req, res) => {
     const body = req.body || {};
     if (typeof body.caption !== 'string' || !body.caption.trim()) return res.status(400).json({ error: 'caption required' });
+    const photos = readPhotoIds(body.photo_ids);
+    if (photos.error) return res.status(400).json({ error: photos.error });
+    // Provenance is fixed by WHO writes: the agent key's moments are `chat`, always (it cannot relabel itself `site` or `connector` to
+    // dodge the organizer review that `chat` carries), and a member's are `site` or `connector`, never `chat`.
+    const allowedSources = req.user.isAgent ? AGENT_MOMENT_SOURCES : MEMBER_MOMENT_SOURCES;
+    if (body.source !== undefined && !allowedSources.has(body.source)) return res.status(400).json({ error: req.user.isAgent ? 'source must be "chat"' : 'source must be "site" or "connector"' });
+    // `author` is the agent key's alone: the companion writes a moment in the name of the participant who said or sent it. A member
+    // cannot write one in anyone's name (nor their own: the route already knows who they are), and a name that is not a participant
+    // is refused, so the field can never mint an author the site has no person for.
+    // Only while the trip has trip_moments_capture on; with it off the field is not part of the API and the moment is the caller's, as before.
+    let author = req.user.username;
+    if (body.author !== undefined && (!req.user.isAgent || switchOn('trip_moments_capture'))) {
+      if (!req.user.isAgent) return res.status(403).json({ error: 'author_agent_only' });
+      if (typeof body.author !== 'string' || !isParticipantUser(body.author)) return res.status(400).json({ error: 'author must be a participant username' });
+      author = body.author;
+    }
+    // photo_id (the old single photo) still works; it becomes the only entry when photo_ids is not given.
+    let ids = photos.ids;
+    if (!ids.length && typeof body.photo_id === 'string' && body.photo_id) {
+      const one = readPhotoIds([body.photo_id]);
+      if (one.error) return res.status(400).json({ error: 'photo_id must be a photo id' });
+      ids = one.ids;
+    }
     const id = revisionId('moment');
     const visibility = body.visibility === 'published' ? 'published' : 'draft';
+    const sourceOut = body.source || (req.user.isAgent ? 'chat' : 'site');
+    if (visibility === 'published' && !agentMayPublish(req)) return res.status(403).json({ error: 'organizer_review_required' });
     db.prepare(
-      'INSERT INTO trip_moments (id,date,phase_id,item_uid,author,caption,body,photo_id,visibility) VALUES (?,?,?,?,?,?,?,?,?)'
-    ).run(id, body.date || null, body.phase_id || null, body.item_uid || null, req.user.username, body.caption.trim(), body.body || null, body.photo_id || null, visibility);
-    res.status(201).json(db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(id));
+      'INSERT INTO trip_moments (id,date,phase_id,item_uid,author,caption,body,photo_id,photo_ids,source,visibility) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+    ).run(id, body.date || null, body.phase_id || null, body.item_uid || null, author, body.caption.trim(), body.body || null, ids[0] || null, JSON.stringify(ids), sourceOut, visibility);
+    res.status(201).json(momentOut(db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(id)));
   });
 
   app.patch('/api/moments/:id', authRequired, (req, res) => {
     const row = db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(req.params.id);
     if (!row) return res.status(404).json({ error: 'not found' });
-    const { agent } = cfg();
-    const organizers = Array.isArray(agent?.organizers)
-      ? agent.organizers
-      : [agent?.organizer].filter(Boolean);
-    if (row.author !== req.user.username && !organizers.includes(req.user.username) && !req.user.secondaryOrganizer && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
-    db.prepare("UPDATE trip_moments SET caption = COALESCE(?, caption), body = COALESCE(?, body), visibility = COALESCE(?, visibility), updated_at = datetime('now') WHERE id = ?")
-      .run(req.body?.caption ?? null, req.body?.body ?? null, ['draft', 'published'].includes(req.body?.visibility) ? req.body.visibility : null, req.params.id);
-    res.json(db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(req.params.id));
+    if (!mayChangeMoment(req, row)) return res.status(403).json({ error: 'forbidden' });
+    // The organizer review of what the companion wrote: its author may neither publish it nor change it once it is out.
+    if (isChatMoment(row) && !isStaff(req) && (req.body?.visibility === 'published' || row.visibility === 'published')) {
+      return res.status(403).json({ error: 'organizer_review_required' });
+    }
+    if (row.visibility !== 'published' && req.body?.visibility === 'published' && !agentMayPublish(req)) {
+      return res.status(403).json({ error: 'organizer_review_required' });
+    }
+    const photos = req.body?.photo_ids !== undefined ? readPhotoIds(req.body.photo_ids) : null;
+    if (photos?.error) return res.status(400).json({ error: photos.error });
+    db.prepare("UPDATE trip_moments SET caption = COALESCE(?, caption), body = COALESCE(?, body), visibility = COALESCE(?, visibility), photo_ids = COALESCE(?, photo_ids), photo_id = CASE WHEN ? THEN ? ELSE photo_id END, updated_at = datetime('now') WHERE id = ?")
+      .run(req.body?.caption ?? null, req.body?.body ?? null, ['draft', 'published'].includes(req.body?.visibility) ? req.body.visibility : null,
+        photos ? JSON.stringify(photos.ids) : null, photos ? 1 : 0, photos ? (photos.ids[0] || null) : null, req.params.id);
+    res.json(momentOut(db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(req.params.id)));
   });
 
   app.delete('/api/moments/:id', authRequired, (req, res) => {
     const row = db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(req.params.id);
     if (!row) return res.status(404).json({ error: 'not found' });
-    const { agent } = cfg();
-    const organizers = Array.isArray(agent?.organizers)
-      ? agent.organizers
-      : [agent?.organizer].filter(Boolean);
-    if (row.author !== req.user.username && !organizers.includes(req.user.username) && !req.user.secondaryOrganizer && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
+    if (!mayChangeMoment(req, row)) return res.status(403).json({ error: 'forbidden' });
     db.prepare('DELETE FROM trip_moments WHERE id = ?').run(req.params.id);
     res.json({ ok: true });
   });

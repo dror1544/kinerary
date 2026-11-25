@@ -75,6 +75,21 @@ const FEATURE_SWITCHES = Object.freeze([
     surfaces: Object.freeze(['site', 'companion']),
     memberVisible: true,
   }),
+  // Trip photos and moments from the chats (docs/specs/sprint-9/x-trip-photos-and-moments.md). Part A (the site, the companion's
+  // MCP and the trip connector) reads `trip_moments_capture`; Part B (the relay) reads both. memberVisible because the site's
+  // organizer settings row reads features.<name>, and #567 S2 serves only member-visible names.
+  Object.freeze({
+    name: 'chat_photos_to_album',
+    summary: 'Photos posted in the trip group are saved to the album, attributed to their sender (and on request, when automatic saving is off); organizer setting on the site',
+    surfaces: Object.freeze(['relay', 'site', 'companion']),
+    memberVisible: true,
+  }),
+  Object.freeze({
+    name: 'trip_moments_capture',
+    summary: 'Trip moments with several photos from the chat, the companion\'s moment tools, and members adding moments and photos through their own Claude or ChatGPT; organizer setting on the site',
+    surfaces: Object.freeze(['relay', 'site', 'companion']),
+    memberVisible: true,
+  }),
 ]);
 
 // Fail loud at load: a malformed registry is a code bug, not a runtime state.

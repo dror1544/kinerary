@@ -1,5 +1,7 @@
 // The trip site's own MCP endpoint, for a trip member's own Claude or ChatGPT:
-// read and write for an organizer, read only for everyone else.
+// read and write for an organizer, read only for everyone else. One exception: while the trip's `trip_moments_capture`
+// switch is on, every member also gets the member-write class (server/trip-mcp/tools.js MEMBER_WRITE_TOOLS: trip moments and
+// the photo upload page), which only calls what the site already lets that member do.
 //
 // Off unless this trip's environment turns it on:
 //   TRIP_MCP_ENABLED=1
@@ -23,11 +25,12 @@ const express = require('express');
 const fetch = require('node-fetch');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
-const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE, READ_SCOPE } = require('./oauth');
+const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE, READ_SCOPE, MOMENTS_SCOPE } = require('./oauth');
 const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
 const { registerTools, buildInstructions, visibleTags } = require('./tools');
 const { renderConfirmationUploadPage } = require('./confirmation-upload-page');
 const { renderLogoUploadPage } = require('./logo-upload-page');
+const { renderPhotoUploadPage } = require('./photo-upload-page');
 const { readConfirmationPdf } = require('./confirmation-readback');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
@@ -75,11 +78,18 @@ function registerTripMcp({
   const isParticipant = username => userExists(username);
   const isOrganizer = username => organizers().includes(username) && isParticipant(username);
   const canWrite = grant => grant.scope === SCOPE && isOrganizer(grant.username);
+  // The member-write class: an organizer's write connection, or a member's connection approved with the moments scope, and only
+  // while the trip still has the feature on. `trip:read` connections never have it.
+  const canMoments = grant => momentsOn() && (canWrite(grant) || grant.scope === MOMENTS_SCOPE);
   // For an already-authenticated organizer only (the MCP server's own name).
   const tripTitle = () => {
     const t = getPublicConfig().meta?.title;
     return (t && typeof t === 'object' ? t.en || t.he : t) || 'Trip';
   };
+  // Member writes (trip photos and moments) exist only on a trip that has switched `trip_moments_capture` on. The site's own
+  // /api/config says which switches are on, member-visible ones only and only the literal true (a switch nobody recognises is
+  // off): the connector asks the same answer a signed-in member gets, never the raw trip file.
+  const momentsOn = () => getPublicConfig()?.features?.trip_moments_capture === true;
   // The consent page is pre-login, so its language comes from the browser,
   // not from the trip.
   const browserLang = req => (/^he\b|^iw\b/i.test(String(req.headers['accept-language'] || '')) ? 'he' : 'en');
@@ -113,7 +123,7 @@ function registerTripMcp({
   const protectedResource = (_req, res) => res.json({
     resource: mcpUrl,
     authorization_servers: [origin],
-    scopes_supported: [SCOPE, READ_SCOPE],
+    scopes_supported: [SCOPE, READ_SCOPE, MOMENTS_SCOPE],
     bearer_methods_supported: ['header'],
   });
   app.all(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'], cors, protectedResource);
@@ -128,7 +138,7 @@ function registerTripMcp({
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
     revocation_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
-    scopes_supported: [SCOPE, READ_SCOPE],
+    scopes_supported: [SCOPE, READ_SCOPE, MOMENTS_SCOPE],
     authorization_response_iss_parameter_supported: true,
   }));
 
@@ -238,6 +248,20 @@ function registerTripMcp({
     } catch { return null; }
   }
 
+  // The scope an approval by this person gets, right now. ONE function: the consent page shows what /oauth/authorize/scope says, and
+  // the decision records the same function's answer, so what is shown is what is granted. An organizer's connection can read and
+  // write; a member's is read plus, when the trip has the feature on at this moment, the member-write class (trip moments and
+  // photos) as its own scope; otherwise read only. A connection approved while the feature was off never gets it later.
+  const scopeFor = username => (isOrganizer(username) ? SCOPE : (momentsOn() ? MOMENTS_SCOPE : READ_SCOPE));
+
+  // What the consent page asks before it shows anything: the same session and Origin checks as the decision.
+  app.post('/oauth/authorize/scope', noStore, (req, res) => {
+    const username = sessionUser(req);
+    if (!username) return res.status(401).json({ error: 'unauthorized' });
+    if (!isParticipant(username)) return res.status(403).json({ error: 'not_on_this_trip' });
+    res.json({ scope: scopeFor(username) });
+  });
+
   app.post('/oauth/authorize/decision', noStore, (req, res) => {
     const b = req.body || {};
     const v = validateAuthRequest(b);
@@ -249,7 +273,10 @@ function registerTripMcp({
     if (b.decision !== 'allow') return res.json({ redirect_to: redirectWith(v.redirectUri, { error: 'access_denied', state: v.state }) });
     // Decided here, from who approved — never from the scope the app asked
     // for, which is whatever it chose to send.
-    const scope = isOrganizer(username) ? SCOPE : READ_SCOPE;
+    const scope = scopeFor(username);
+    // The page says which scope it showed. If that is not what is about to be granted (the switch moved while the page was open),
+    // nothing is granted: the person is asked again, with the right text.
+    if (b.consent_scope !== undefined && b.consent_scope !== scope) return res.status(409).json({ error: 'consent_changed', scope });
     const code = store.createCode({
       clientId: v.client.client_id, username, redirectUri: v.redirectUri,
       codeChallenge: v.codeChallenge, resource: v.resource, scope,
@@ -358,11 +385,12 @@ function registerTripMcp({
   // session can leak into another's, and a restart loses nothing.
   app.post('/mcp', cors, requireAccess, async (req, res) => {
     const write = canWrite(req.mcpGrant);
+    const memberWrites = canMoments(req.mcpGrant);
     const server = new McpServer(
       { name: 'kinerary-trip', title: tripTitle(), version: '1.0.0' },
-      { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write }))(getPublicConfig()) },
+      { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write, memberWrites }))(getPublicConfig()) },
     );
-    registerTools(server, siteClient(req.mcpGrant.username), { write, origin });
+    registerTools(server, siteClient(req.mcpGrant.username), { write, origin, memberWrites });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     try {
@@ -404,6 +432,21 @@ function registerTripMcp({
     res.set('Referrer-Policy', 'no-referrer');
     res.type('html').send(renderLogoUploadPage({ nonce }));
   });
+  // The photo upload page a member's assistant hands them (get_photo_upload_link). Like the one above it holds no trip data and no
+  // credential; the browser sends its own site session to the site's established photo and moment routes. For any signed-in member
+  // (the page asks the site who is signed in), and only while the trip's trip_moments_capture switch is on: off, it is not there.
+  app.get('/mcp/upload-photos', noStore, (req, res) => {
+    if (!momentsOn()) return res.status(404).json({ error: 'not_found' });
+    const nonce = crypto.randomBytes(16).toString('base64');
+    res.set('Content-Security-Policy', [
+      "default-src 'none'", "script-src 'nonce-" + nonce + "'", "style-src 'nonce-" + nonce + "'",
+      "connect-src 'self'", "img-src 'self'", "form-action 'none'", "frame-ancestors 'none'", "base-uri 'none'",
+    ].join('; '));
+    res.set('X-Frame-Options', 'DENY');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Referrer-Policy', 'no-referrer');
+    res.type('html').send(renderPhotoUploadPage({ nonce, lang: browserLang(req) }));
+  });
   app.options('/mcp', cors);
   // A person who opens the address in a browser (or lands on /modern/mcp,
   // because the site sends browsers to /modern/) gets an explanation instead
@@ -443,6 +486,9 @@ function registerTripMcp({
             client: g.client_name || host || 'Unknown app',
             host,
             access: canWrite(g) ? 'read_write' : 'read',
+            // Whether this connection can also add and change the member's own trip moments and photos (a member's `read`
+            // connection made while the feature was on): said, so the list never calls it plain read-only.
+            moments: canMoments(g),
             connected_at: new Date(g.created_at * 1000).toISOString(),
             last_used_at: g.last_used_at ? new Date(g.last_used_at * 1000).toISOString() : null,
           };

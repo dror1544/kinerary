@@ -28,6 +28,9 @@ let BASE_URL = `http://localhost:${DEFAULT_TEST_PORT}`;
  *                               `meta.logo`); `tripDir` is where a file the config names can be written.
  *   reuseData                   boot over the data directory the previous server left (see stopTestServerKeepData),
  *                               to prove what a restart keeps. `configure` still runs on the existing config file.
+ *
+ * `options.features` writes a per-trip `features` block into the throwaway trip.config.json before boot — the way the control plane
+ * switches a feature on for one trip (the site reads the block once, at boot).
  */
 export async function startTestServer(extraEnv = {}, options = {}) {
   const port = extraEnv.PORT || DEFAULT_TEST_PORT;
@@ -46,6 +49,10 @@ export async function startTestServer(extraEnv = {}, options = {}) {
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     options.configure(config, tripDir);
     writeFileSync(configPath, JSON.stringify(config, null, 2));
+  }
+  if (options.features) {
+    const file = join(tripDir, 'trip.config.json');
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), features: options.features }, null, 2));
   }
   const siteDir = join(dataDir, 'site');
   mkdirSync(join(siteDir, 'confirmations'), { recursive: true });

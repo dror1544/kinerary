@@ -466,6 +466,12 @@ const SEED_USERS = (TRIP_CONFIG.participants || []).map(p => ({
 
 // ── SCHEMA MIGRATIONS ─────────────────────────────────────────────────────────
 try { db.exec('ALTER TABLE photos ADD COLUMN immich_id TEXT'); } catch {}
+// Where a photo came from: 'site' (the album's own upload), 'chat' (saved from the trip's group) or 'connector' (a member's Claude or
+// ChatGPT upload page). Nullable: a photo from before this column reads as 'site'.
+try { db.exec('ALTER TABLE photos ADD COLUMN source TEXT'); } catch (err) {
+  // Only "already there" is fine; anything else is a real fault and stops the boot.
+  if (!/duplicate column name/i.test(String(err && err.message))) throw err;
+}
 try { db.exec('ALTER TABLE users ADD COLUMN name_en TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN avatar_file TEXT'); } catch {}
 try { db.exec('ALTER TABLE bookings ADD COLUMN apple_wallet_url TEXT'); } catch {}
@@ -1960,19 +1966,41 @@ const photoUpload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
+const PHOTO_SOURCES = new Set(['site', 'chat', 'connector']);
+const MEMBER_PHOTO_SOURCES = new Set(['site', 'connector']);
 app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async (req, res) => {
   if (req.photoRejected) return res.status(400).json({ error: 'unsupported_file_type' });
   if (!req.file) return res.status(400).json({ error: 'no_file' });
   const { phase, caption } = req.body || {};
+  // multer has already written the file by the time the fields can be read, so a refusal below removes it.
+  const refuse = (status, error) => { try { fs.unlinkSync(req.file.path); } catch {} return res.status(status).json({ error }); };
+  // `source` says where the photo came from (a closed set). `uploaded_for` is the AGENT KEY's alone: the companion saves a photo a
+  // participant sent, so the album shows who took it, not the bot. A member cannot upload as someone else, and a name that is not
+  // a participant is refused rather than stored.
+  // `chat` (a photo saved from the trip's group) is the agent key's alone: a member's photo is `site` or `connector`.
+  const source = req.body?.source === undefined ? 'site' : req.body.source;
+  if (!(req.user.isAgent ? PHOTO_SOURCES : MEMBER_PHOTO_SOURCES).has(source)) return refuse(400, 'invalid_source');
+  let owner = req.user.username;
+  // With the trip's `chat_photos_to_album` switch off the agent's uploaded_for is not part of the API: the photo is the caller's,
+  // as before. A member's is refused either way.
+  if (req.body?.uploaded_for !== undefined && (!req.user.isAgent || featureOn('chat_photos_to_album'))) {
+    if (!req.user.isAgent) return refuse(403, 'uploaded_for_agent_only');
+    const target = typeof req.body.uploaded_for === 'string' ? getUser(req.body.uploaded_for) : null;
+    // A removed participant keeps their row (their history stays), but nothing new is written in their name.
+    if (!target || target.removed_at) return refuse(400, 'unknown_participant');
+    owner = target.username;
+  }
   const now = new Date().toISOString();
 
-  const id = Date.now().toString();
+  // The clock plus random hex, so two uploads in the same millisecond (the relay saves a burst of group photos at once) cannot
+  // collide on the primary key. Still a plain string; nothing parses a photo id as a number. Rows from before keep their numeric ids.
+  const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   db.prepare(
-    'INSERT INTO photos (id, filename, original_name, phase, caption, username, uploaded_at) VALUES (?,?,?,?,?,?,?)'
-  ).run(id, req.file.filename, req.file.originalname, phase || 'general', caption || '', req.user.username, now);
+    'INSERT INTO photos (id, filename, original_name, phase, caption, username, uploaded_at, source) VALUES (?,?,?,?,?,?,?,?)'
+  ).run(id, req.file.filename, req.file.originalname, phase || 'general', caption || '', owner, now, source);
 
-  const safeUser = publicUser(getUser(req.user.username)) || { username: req.user.username };
-  res.json({ ok: true, photo: { id, filename: req.file.filename, originalName: req.file.originalname, phase: phase || 'general', caption: caption || '', username: req.user.username, uploadedAt: now, url: photoFileUrl(req.file.filename), shareUrl: photoShareUrl(id), user: safeUser } });
+  const safeUser = publicUser(getUser(owner)) || { username: owner };
+  res.json({ ok: true, photo: { id, filename: req.file.filename, originalName: req.file.originalname, phase: phase || 'general', caption: caption || '', username: owner, uploadedAt: now, source, url: photoFileUrl(req.file.filename), shareUrl: photoShareUrl(id), user: safeUser } });
 
   // Push to Immich in background (non-blocking)
   if (IMMICH_URL && IMMICH_KEY) {
@@ -2044,6 +2072,7 @@ app.get('/api/photos', authRequired, (req, res) => {
     caption: p.caption,
     username: p.username,
     uploadedAt: p.uploaded_at,
+    source: PHOTO_SOURCES.has(p.source) ? p.source : 'site',
     url: photoFileUrl(p.filename),
     shareUrl: photoShareUrl(p.id),
     user: publicUser(getUser(p.username)) || { username: p.username },

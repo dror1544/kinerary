@@ -1,7 +1,7 @@
 # The bot sets the trip group's Telegram photo from the trip logo
 
 Status: approved (2026-11-24, by Dror; D1 of x-trip-logo.md: on request) → in build after x-trip-logo · Issue: none yet · Track: video look · Size: M · Tier: High
-Security path: yes (control plane acts in a family's Telegram group) · Migration: probably (see Contracts) ·
+Security path: yes (control plane acts in a family's Telegram group) · Migration: no (O2) ·
 Live-trip behaviour: yes, once the switch is on for a trip
 
 Depends on: `x-trip-logo.md` (the logo it uses). It is a separate PR because it is risk-class: control-plane
@@ -69,9 +69,10 @@ the plan-change line deliberately keeps the site from calling out to Telegram fo
 the chat resolved from the control plane's bindings, not from the site's env (AC-5). Open item O1 checks
 whether any trip's group bot differs from the outbox's bot.
 
-**Migration.** The outbox row needs the new type `trip_group_photo`. If `outbox` constrains its `type`, that
-is a new migration with `-- rollback: compatible — adds an allowed value; an older build ignores rows it does
-not know`, plus a cursor table for the poller if it needs one. B7 applies.
+**Migration: none.** `notification_outbox.notification_type` has had no CHECK since `0013_sprint4.sql`, so
+`trip_group_photo` is a new value, not a schema change. The request's state lives in the site's SQLite (step 1),
+so the poller needs no cursor table: each poll asks the site for its oldest pending request, and the site marks
+it `sending` when it hands it out. A request left `sending` for 10 minutes goes back to `pending`.
 
 **Switch:** `trip_group_photo`, surfaces `site`, `companion`, `control_plane`, `memberVisible: true` (the
 site's offer reads it).
@@ -92,14 +93,16 @@ migration, `shared/feature-switches.js`, both MCPs, `trip-web/src/App.tsx`, the 
 - Any image other than the trip logo. Arbitrary group photos from chat are a different trust question.
 - WhatsApp groups (`625-whatsapp-via-relay.md` has no group-photo path).
 
-## Open items
+## Open items (resolved 2026-11-24, from the code)
 
-- O1 Confirm that the outbox's bot is the bot in every bound trip group, Mac staging and VM alike. A trip
-  whose group bot differs gets `bot_lacks_rights` rather than a write from the wrong bot.
-- O2 Confirm the `outbox` type constraint, which decides whether this carries a migration.
+- O1 **Same bot.** The outbox sends with the signup bot's token (`control-plane/api/src/server.ts`,
+  `outboxBotToken`), and the signup bot is the trip bot that the relay runs in bound groups. A deployment whose
+  outbox token is a different bot gets `bot_lacks_rights` from the `getChatMember` check, never a write from the
+  wrong bot. The staging test confirms this on the Mac's bot pair.
+- O2 **No migration** (see Contracts).
 
 ## Rollout and regression
 
-Risk-class (relay/control-plane behaviour, maybe a migration), so it gets a regression plan
+Risk-class (control-plane behaviour that writes into a family's group), so it gets a regression plan
 (`regression-planner`) and the owner's manual test on a staging trip's group before the merge to `main`. Ships
 with `trip_group_photo` off. It goes on for a staging trip, then for one real trip on request.
