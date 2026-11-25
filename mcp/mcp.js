@@ -706,7 +706,7 @@ mcp.tool('list_moments',
 mcp.tool('add_moment',
   'Save a trip moment: a short title, a few sentences and the photos already in the album (photo_ids from add_photo). Write it in the name of the participant who said or sent it (author = their username from get_config); ' +
   'without author it is yours. visibility "draft" (default) is seen only by its author and the organizers until it is published (update_moment with visibility "published"; a moment with source "chat" can be published only by you or an organizer, never by the person it is attributed to). Use source "chat" for what you write from the group; "published" goes straight to the site, which every member reads, children included: no private details, no confirmation codes, nothing a child should not read. ' +
-  'Follow the trip\'s moment_capture_mode (get_photo_settings) when you choose. Returns the stored moment: read it back. If the trip does not have trip moments, nothing is saved and the answer says so.', {
+  'Follow the trip\'s moment_capture_mode (get_photo_settings) when you choose: in organizer_draft mode the site REFUSES to publish a moment you wrote (403 organizer_review_required), only an organizer can. Returns the stored moment: read it back. If the trip does not have trip moments, nothing is saved and the answer says so.', {
     caption: z.string().trim().min(1).max(200).describe('A short title'),
     body: z.string().max(2000).optional().describe('A few sentences'),
     photo_ids: momentPhotoIds.optional(),

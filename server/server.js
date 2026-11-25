@@ -468,7 +468,10 @@ const SEED_USERS = (TRIP_CONFIG.participants || []).map(p => ({
 try { db.exec('ALTER TABLE photos ADD COLUMN immich_id TEXT'); } catch {}
 // Where a photo came from: 'site' (the album's own upload), 'chat' (saved from the trip's group) or 'connector' (a member's Claude or
 // ChatGPT upload page). Nullable: a photo from before this column reads as 'site'.
-try { db.exec('ALTER TABLE photos ADD COLUMN source TEXT'); } catch {}
+try { db.exec('ALTER TABLE photos ADD COLUMN source TEXT'); } catch (err) {
+  // Only "already there" is fine; anything else is a real fault and stops the boot.
+  if (!/duplicate column name/i.test(String(err && err.message))) throw err;
+}
 try { db.exec('ALTER TABLE users ADD COLUMN name_en TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN avatar_file TEXT'); } catch {}
 try { db.exec('ALTER TABLE bookings ADD COLUMN apple_wallet_url TEXT'); } catch {}

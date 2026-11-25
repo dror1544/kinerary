@@ -248,6 +248,20 @@ function registerTripMcp({
     } catch { return null; }
   }
 
+  // The scope an approval by this person gets, right now. ONE function: the consent page shows what /oauth/authorize/scope says, and
+  // the decision records the same function's answer, so what is shown is what is granted. An organizer's connection can read and
+  // write; a member's is read plus, when the trip has the feature on at this moment, the member-write class (trip moments and
+  // photos) as its own scope; otherwise read only. A connection approved while the feature was off never gets it later.
+  const scopeFor = username => (isOrganizer(username) ? SCOPE : (momentsOn() ? MOMENTS_SCOPE : READ_SCOPE));
+
+  // What the consent page asks before it shows anything: the same session and Origin checks as the decision.
+  app.post('/oauth/authorize/scope', noStore, (req, res) => {
+    const username = sessionUser(req);
+    if (!username) return res.status(401).json({ error: 'unauthorized' });
+    if (!isParticipant(username)) return res.status(403).json({ error: 'not_on_this_trip' });
+    res.json({ scope: scopeFor(username) });
+  });
+
   app.post('/oauth/authorize/decision', noStore, (req, res) => {
     const b = req.body || {};
     const v = validateAuthRequest(b);
@@ -259,9 +273,10 @@ function registerTripMcp({
     if (b.decision !== 'allow') return res.json({ redirect_to: redirectWith(v.redirectUri, { error: 'access_denied', state: v.state }) });
     // Decided here, from who approved — never from the scope the app asked
     // for, which is whatever it chose to send.
-    // A member's connection also gets the member-write class (trip moments and photos), as its own scope, when the trip has the
-    // feature on right now; the consent page said so. A connection approved while it was off never gets it later.
-    const scope = isOrganizer(username) ? SCOPE : (momentsOn() ? MOMENTS_SCOPE : READ_SCOPE);
+    const scope = scopeFor(username);
+    // The page says which scope it showed. If that is not what is about to be granted (the switch moved while the page was open),
+    // nothing is granted: the person is asked again, with the right text.
+    if (b.consent_scope !== undefined && b.consent_scope !== scope) return res.status(409).json({ error: 'consent_changed', scope });
     const code = store.createCode({
       clientId: v.client.client_id, username, redirectUri: v.redirectUri,
       codeChallenge: v.codeChallenge, resource: v.resource, scope,

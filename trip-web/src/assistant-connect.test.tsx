@@ -17,10 +17,10 @@ afterEach(() => {
 const CONFIG = { participants: [{ username: "alice", name: "אליס", name_en: "Alice", color: "#123456" }] };
 const URL_ = "https://orlando.example/mcp";
 
-function renderMore(isOrganizer = true) {
+function renderMore(isOrganizer = true, config: object = CONFIG) {
   return render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <AccountPage lang="en" currentUser={{ username: "alice", name: "אליס", name_en: "Alice", color: "#123456", is_organizer: isOrganizer } as never} config={CONFIG} />
+      <AccountPage lang="en" currentUser={{ username: "alice", name: "אליס", name_en: "Alice", color: "#123456", is_organizer: isOrganizer } as never} config={config} />
     </QueryClientProvider>,
   );
 }
@@ -55,6 +55,17 @@ describe("connect your AI assistant", () => {
     renderMore(false);
     expect(await screen.findByRole("heading", { name: /connect your ai assistant/i })).toBeInTheDocument();
     expect(screen.getByText(/can read the trip, not change it/i)).toBeInTheDocument();
+  });
+
+  it("the member text names moments and photos only while the trip has trip_moments_capture on", async () => {
+    stubConnection({ enabled: true, url: URL_, access: "read", connections: [] });
+    renderMore(false, { ...CONFIG, features: { trip_moments_capture: true } });
+    expect(await screen.findByText(/apart from adding your own trip moments and photos/i)).toBeInTheDocument();
+    cleanup();
+    stubConnection({ enabled: true, url: URL_, access: "read", connections: [] });
+    renderMore(false, { ...CONFIG, features: { trip_moments_capture: "true" } });
+    expect(await screen.findByText(/can read the trip, not change it\./i)).toBeInTheDocument();
+    expect(screen.queryByText(/moments and photos/i)).toBeNull();
   });
 
   it("gives Claude's install link, pre-filled with this trip's address", async () => {

@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
-import { startTestServer, stopTestServer, loginAsAlice, api, testTripDir } from './helpers/server.js';
+import { startTestServer, stopTestServer, stopTestServerKeepData, loginAsAlice, api, testTripDir } from './helpers/server.js';
 import { freePort } from './helpers/port-guard.js';
 
 const require = createRequire(import.meta.url);
@@ -368,30 +368,45 @@ describe('AC-6: the photo upload page', () => {
 });
 
 describe('F3: the consent page names exactly what a member\'s connection will be able to do', () => {
-  async function consentText(features, session) {
+  // Runs the page's real script against a real site. `intercept(path, options)` may answer a request itself (to break one);
+  // `click('allow')` calls the handler the page attached to a button. Returns what the page showed and what it did.
+  async function consent(features, session, { intercept = () => null, press = false } = {}) {
     const ctx = await boot(features);
     try {
-      const authParams = new URLSearchParams({ client_id: ctx.h.clientId, redirect_uri: CLAUDE_CALLBACK, response_type: 'code', code_challenge: 'x'.repeat(43), code_challenge_method: 'S256', state: 's', resource: `${ctx.base}/mcp` });
+      const authParams = new URLSearchParams({ client_id: ctx.h.clientId, redirect_uri: CLAUDE_CALLBACK, response_type: 'code', code_challenge: createHash('sha256').update('v'.repeat(43)).digest('base64url'), code_challenge_method: 'S256', state: 's', resource: `${ctx.base}/mcp` });
       const html = await (await fetch(`${ctx.base}/oauth/authorize?${authParams}`)).text();
       const start = html.indexOf('<script nonce=');
       const script = html.slice(html.indexOf('>', start) + 1, html.indexOf('</script>', start));
-      const el = () => ({ textContent: '', hidden: false, value: '', addEventListener() {}, appendChild() {} });
+      const handlers = {};
+      const el = (id) => ({ textContent: '', hidden: false, disabled: false, value: '', addEventListener(e, f) { handlers[`${id}:${e}`] = f; }, appendChild() {} });
       const elements = {};
-      const get = (id) => (elements[id] ||= el());
+      const get = (id) => (elements[id] ||= el(id));
       const token = session === 'alice' ? ctx.alice : ctx.bob;
+      const requests = [];
+      let redirected = null;
       const context = {
-        document: { documentElement: { lang: 'en' }, getElementById: get, head: { appendChild() {} }, createElement: () => el() },
-        window: { location: { replace() {} } }, localStorage: { getItem: () => token },
-        fetch: (path, options = {}) => fetch(new URL(path, ctx.base), options), JSON, Promise, String, Object,
+        document: { documentElement: { lang: 'en' }, getElementById: get, head: { appendChild() {} }, createElement: () => el('x') },
+        window: { location: { replace(u) { redirected = u; } } }, localStorage: { getItem: () => token },
+        fetch: (path, options = {}) => { requests.push(`${options.method || 'GET'} ${path}`); return intercept(path, options) || fetch(new URL(path, ctx.base), { ...options, headers: { ...(options.headers || {}), origin: ctx.base } }); }, // a browser always sends Origin on a POST
+        JSON, Promise, String, Object, Array,
       };
       runInNewContext(script, context);
-      for (let i = 0; i < 100 && !get('wants').textContent; i++) await new Promise((r) => setTimeout(r, 20));
-      return { wants: get('wants').textContent, can: get('can').textContent };
+      for (let i = 0; i < 100 && !get('wants').textContent && !get('error').textContent; i++) await new Promise((r) => setTimeout(r, 20));
+      if (press) { await handlers['allow:click'](); await new Promise((r) => setTimeout(r, 200)); }
+      let granted = null;
+      if (redirected) {
+        const code = new URL(redirected).searchParams.get('code');
+        const t = await (await fetch(`${ctx.base}/oauth/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ grant_type: 'authorization_code', code, code_verifier: 'v'.repeat(43), client_id: ctx.h.clientId, redirect_uri: CLAUDE_CALLBACK }).toString() })).json();
+        granted = t.scope;
+      }
+      return { wants: get('wants').textContent, can: get('can').textContent, error: get('error').textContent, allowDisabled: get('allow').disabled, requests, granted };
     } finally { stopTestServer(); }
   }
+  const failing = (needle) => (path) => (path.includes(needle) ? Promise.resolve(new Response('{}', { status: 500, headers: { 'content-type': 'application/json' } })) : null);
 
   it('switch on, a member is told it can add moments and photos, cannot change the plan or publish the assistant\'s text', async () => {
-    const { wants, can } = await consentText({ trip_moments_capture: true }, 'bob');
+    const { wants, can } = await consent({ trip_moments_capture: true }, 'bob');
     assert.match(wants, /add your trip moments and photos/);
     assert.match(can, /add trip moments and photos in your name/);
     assert.match(can, /cannot change the plan, bookings or budget/);
@@ -399,15 +414,112 @@ describe('F3: the consent page names exactly what a member\'s connection will be
   });
 
   it('switch off, a member is told it is read-only, exactly as before', async () => {
-    const { wants, can } = await consentText(undefined, 'bob');
+    const { wants, can } = await consent(undefined, 'bob');
     assert.equal(wants, 'wants to read this trip as you');
     assert.match(can, /but not change anything/);
     assert.doesNotMatch(can, /moment/i);
   });
 
   it('an organizer\'s consent text is the organizer\'s, switch on or off', async () => {
-    const { wants, can } = await consentText({ trip_moments_capture: true }, 'alice');
+    const { wants, can } = await consent({ trip_moments_capture: true }, 'alice');
     assert.equal(wants, 'wants to manage this trip as you');
     assert.match(can, /change bookings, the plan, the budget and participants/);
+  });
+
+  it('R3: what is shown is what is granted — approving with the switch on records trip:moments, and the text said so', async () => {
+    const r = await consent({ trip_moments_capture: true }, 'bob', { press: true });
+    assert.match(r.can, /add trip moments and photos in your name/);
+    assert.equal(r.granted, 'trip:moments');
+    const off = await consent(undefined, 'bob', { press: true });
+    assert.match(off.can, /but not change anything/);
+    assert.equal(off.granted, 'trip:read');
+  });
+
+  it('R3: /api/config unreadable cannot make the page show read-only text while the server grants trip:moments (the text does not depend on it)', async () => {
+    const r = await consent({ trip_moments_capture: true }, 'bob', { intercept: failing('/api/config'), press: true });
+    assert.match(r.can, /add trip moments and photos in your name/, 'the text still comes from the server\'s own scope answer');
+    assert.equal(r.granted, 'trip:moments', 'and what was shown is what was granted');
+  });
+
+  it('R3: if the page cannot learn the scope it shows nothing misleading, keeps Allow off, and sends no approval', async () => {
+    const r = await consent({ trip_moments_capture: true }, 'bob', { intercept: failing('/oauth/authorize/scope'), press: true });
+    assert.equal(r.can, '');
+    assert.equal(r.allowDisabled, true);
+    assert.ok(r.error, 'it says something went wrong');
+    assert.ok(!r.requests.some((q) => q.includes('/oauth/authorize/decision')), 'no decision was sent');
+    assert.equal(r.granted, null, 'nothing was granted');
+  });
+
+  it('R3: the decision refuses (409, no code) when the scope shown is not the scope that would be granted', async () => {
+    const ctx = await boot({ trip_moments_capture: true });
+    try {
+      const params = { client_id: ctx.h.clientId, redirect_uri: CLAUDE_CALLBACK, response_type: 'code', code_challenge: createHash('sha256').update('v'.repeat(43)).digest('base64url'), code_challenge_method: 'S256', state: 's', resource: `${ctx.base}/mcp`, decision: 'allow' };
+      const post = (extra) => fetch(`${ctx.base}/oauth/authorize/decision`, { method: 'POST', headers: { 'content-type': 'application/json', origin: ctx.base, authorization: `Bearer ${ctx.bob}` }, body: JSON.stringify({ ...params, ...extra }) });
+      const stale = await post({ consent_scope: 'trip:read' });
+      assert.equal(stale.status, 409);
+      assert.deepEqual(await stale.json(), { error: 'consent_changed', scope: 'trip:moments' });
+      const fine = await post({ consent_scope: 'trip:moments' });
+      assert.equal(fine.status, 200);
+      assert.ok(new URL((await fine.json()).redirect_to).searchParams.get('code'));
+      const scope = await fetch(`${ctx.base}/oauth/authorize/scope`, { method: 'POST', headers: { origin: ctx.base, authorization: `Bearer ${ctx.bob}` } });
+      assert.deepEqual(await scope.json(), { scope: 'trip:moments' });
+      assert.equal((await fetch(`${ctx.base}/oauth/authorize/scope`, { method: 'POST', headers: { origin: ctx.base } })).status, 401, 'no session, no answer');
+      assert.equal((await fetch(`${ctx.base}/oauth/authorize/scope`, { method: 'POST', headers: { authorization: `Bearer ${ctx.bob}` } })).status, 401, 'no Origin, no answer');
+    } finally { stopTestServer(); }
+  });
+});
+
+describe('kill switch: on, a member approves trip:moments, off, on again', () => {
+  it('turning the feature off removes the tools and the page and the extra draft visibility; the same grant gets them back when it is turned on', async () => {
+    const port = await freePort();
+    const base = `http://localhost:${port}`;
+    const env = { PORT: String(port), TRIP_MCP_ENABLED: '1', PUBLIC_ORIGIN: base };
+    const on = { configure: (c) => { c.features = { trip_moments_capture: true }; } };
+    const off = { reuseData: true, configure: (c) => { delete c.features; } };
+    const again = { reuseData: true, configure: (c) => { c.features = { trip_moments_capture: true }; } };
+    const session = async () => {
+      const alice = await loginAsAlice();
+      const bob = (await (await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } })).json()).token;
+      return { alice, bob };
+    };
+    const rpcTools = async (token) => {
+      const r = await fetch(`${base}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${token}` }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) });
+      assert.equal(r.status, 200, 'the grant itself stays valid');
+      return (await r.json()).result.tools.map((t) => t.name);
+    };
+
+    // ON: approve, add a connector moment.
+    await startTestServer(env, on);
+    let { alice, bob } = await session();
+    const h = harness(base);
+    await h.register();
+    const grant = await h.connect(bob);
+    assert.equal(grant.scope, 'trip:moments');
+    assert.deepEqual(sorted(await rpcTools(grant.access_token)), sorted([...TODAY_MEMBER, ...CLASS]));
+    const made = JSON.parse(text(await call(h, grant.access_token, 'add_moment', { caption: 'Made while on' })));
+    assert.equal((await fetch(`${base}/mcp/upload-photos`)).status, 200);
+    assert.ok((await (await api('/api/moments', { token: alice })).json()).some((m) => m.id === made.id), 'on: the organizer can see the connector draft');
+
+    // OFF (a restart without the switch): the same token, no tools, no page, no extra visibility; the data is kept.
+    await stopTestServerKeepData();
+    await startTestServer(env, off);
+    ({ alice, bob } = await session());
+    assert.deepEqual(await rpcTools(grant.access_token), TODAY_MEMBER, 'off: exactly the nine');
+    const gone = await call(h, grant.access_token, 'add_moment', { caption: 'while off' });
+    assert.ok(gone.error || gone.result?.isError);
+    assert.equal((await fetch(`${base}/mcp/upload-photos`)).status, 404, 'off: the page is gone');
+    assert.ok(!(await (await api('/api/moments', { token: alice })).json()).some((m) => m.id === made.id), 'off: the organizer no longer gets the draft');
+    assert.ok((await (await api('/api/moments', { token: bob })).json()).some((m) => m.id === made.id), 'off: its author still has it');
+    const conn = (await (await api('/api/mcp/connection', { token: bob })).json()).connections;
+    assert.deepEqual(conn.map((c) => c.moments), [false], 'off: the connection list does not claim moments');
+
+    // ON again: the grant the member approved gets its scope's tools back (intended: they consented to that scope).
+    await stopTestServerKeepData();
+    await startTestServer(env, again);
+    ({ alice, bob } = await session());
+    assert.deepEqual(sorted(await rpcTools(grant.access_token)), sorted([...TODAY_MEMBER, ...CLASS]), 'on again: the same grant has them again');
+    assert.equal((await fetch(`${base}/mcp/upload-photos`)).status, 200);
+    assert.ok((await (await api('/api/moments', { token: alice })).json()).some((m) => m.id === made.id));
+    stopTestServer();
   });
 });

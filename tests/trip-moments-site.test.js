@@ -166,6 +166,40 @@ test('F1: what the companion wrote (source chat) is published only by an organiz
   assert.equal((await api(`/api/moments/${chat.id}`, { method: 'DELETE', token: bob })).status, 200, 'its author may still take it down');
 });
 
+test('R4: the agent key obeys moment_capture_mode — organizer_draft: it cannot publish a chat moment (POST or PATCH); ask_in_chat and publish: it may; organizers never limited', async () => {
+  const setMode = async (mode) => assert.equal((await patch({ moment_capture_mode: mode })).status, 200);
+  const agentPost = (body) => api('/api/moments', { method: 'POST', body: { caption: 'R4', author: 'bob', source: 'chat', ...body }, ...AGENT });
+  try {
+    await setMode('organizer_draft');
+    const refused = await agentPost({ visibility: 'published' });
+    assert.equal(refused.status, 403);
+    assert.deepEqual(await refused.json(), { error: 'organizer_review_required' });
+    const draft = await (await agentPost({})).json();
+    assert.equal(draft.visibility, 'draft', 'a draft is exactly what organizer_draft asks of it');
+    const refusedPatch = await api(`/api/moments/${draft.id}`, { method: 'PATCH', body: { visibility: 'published' }, ...AGENT });
+    assert.equal(refusedPatch.status, 403);
+    assert.deepEqual(await refusedPatch.json(), { error: 'organizer_review_required' });
+    assert.equal((await api(`/api/moments/${draft.id}`, { method: 'PATCH', body: { caption: 'agent still edits the draft' }, ...AGENT })).status, 200);
+    assert.equal((await moments(AGENT)).find((m) => m.id === draft.id).visibility, 'draft', 'nothing was published');
+    const byOrganizer = await api(`/api/moments/${draft.id}`, { method: 'PATCH', body: { visibility: 'published' }, token: alice });
+    assert.equal(byOrganizer.status, 200, 'an organizer is never limited by the mode');
+    const orgPost = await moment({ caption: 'organizer in organizer_draft mode', visibility: 'published' }, { token: alice });
+    assert.equal(orgPost.status, 201);
+    for (const mode of ['ask_in_chat', 'publish']) {
+      await setMode(mode);
+      const direct = await agentPost({ visibility: 'published', caption: `agent ${mode}` });
+      assert.equal(direct.status, 201, `${mode}: the agent may publish directly`);
+      assert.equal((await direct.json()).visibility, 'published');
+      const d = await (await agentPost({})).json();
+      const out = await api(`/api/moments/${d.id}`, { method: 'PATCH', body: { visibility: 'published' }, ...AGENT });
+      assert.equal(out.status, 200, `${mode}: the agent may publish a draft (ask_in_chat: after the chat said yes)`);
+    }
+    // A damaged setting is the strictest mode: the agent cannot publish.
+    await setMode('organizer_draft');
+    assert.equal((await agentPost({ visibility: 'published' })).status, 403);
+  } finally { await setMode('ask_in_chat'); }
+});
+
 test('F1: a moment the agent writes with no source is a chat moment, and the agent may publish it directly', async () => {
   const made = await (await moment({ caption: 'Agent default source', author: 'bob', visibility: 'published' }, AGENT)).json();
   assert.equal(made.source, 'chat');

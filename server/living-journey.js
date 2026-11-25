@@ -135,6 +135,15 @@ function configVersion(db, raw) {
   };
 }
 
+// An additive column for the photos-and-moments feature. SQLite has no "ADD COLUMN IF NOT EXISTS", so the statement runs every boot and
+// the only failure that means "already done" is the duplicate column. Anything else (a missing table, a read-only file, a typo in the
+// statement) is a real fault and stops the boot with its message, not a column the site silently goes without.
+function addColumn(db, sql) {
+  try { db.exec(sql); } catch (err) {
+    if (!/duplicate column name/i.test(String(err && err.message))) throw err;
+  }
+}
+
 function schema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS trip_ui_settings (
@@ -305,10 +314,10 @@ function schema(db) {
   // ones above: whether photos posted in the trip's group are saved to the album (on by default), and what happens to a moment the
   // companion drafts. Moments gain several photos (photo_ids, a JSON array; photo_id stays as the first, for old readers) and a
   // source. Additive, defaulted, idempotent.
-  try { db.exec('ALTER TABLE trip_settings ADD COLUMN group_photo_autosave INTEGER NOT NULL DEFAULT 1 CHECK (group_photo_autosave IN (0,1))'); } catch {}
-  try { db.exec("ALTER TABLE trip_settings ADD COLUMN moment_capture_mode TEXT NOT NULL DEFAULT 'ask_in_chat' CHECK (moment_capture_mode IN ('ask_in_chat','organizer_draft','publish'))"); } catch {}
-  try { db.exec('ALTER TABLE trip_moments ADD COLUMN source TEXT'); } catch {}
-  try { db.exec('ALTER TABLE trip_moments ADD COLUMN photo_ids TEXT'); } catch {}
+  addColumn(db, 'ALTER TABLE trip_settings ADD COLUMN group_photo_autosave INTEGER NOT NULL DEFAULT 1 CHECK (group_photo_autosave IN (0,1))');
+  addColumn(db, "ALTER TABLE trip_settings ADD COLUMN moment_capture_mode TEXT NOT NULL DEFAULT 'ask_in_chat' CHECK (moment_capture_mode IN ('ask_in_chat','organizer_draft','publish'))");
+  addColumn(db, 'ALTER TABLE trip_moments ADD COLUMN source TEXT');
+  addColumn(db, 'ALTER TABLE trip_moments ADD COLUMN photo_ids TEXT');
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
   db.prepare('INSERT OR IGNORE INTO trip_settings (id, timezone) VALUES (1, NULL)').run();
 }
@@ -2014,6 +2023,12 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
   // may be the member it was attributed to, cannot publish it, and cannot change it once it is published (it may quote others).
   // A member's own moment (site, connector, or from before sources existed) the author may still publish, as the site always allowed.
   const isChatMoment = (row) => row.source === 'chat';
+  // The organizer's choice of what happens to a drafted moment, enforced for the agent key too (the companion obeys it, and the site
+  // does not rely on that): in `organizer_draft` mode the agent cannot make a chat moment public, only an organizer can. In
+  // `ask_in_chat` (the agent publishes after the chat says yes) and `publish` it may. Organizers are never limited by the mode. Only while
+  // the trip has trip_moments_capture on: with it off there are no modes, and the agent behaves as before. An unreadable mode is
+  // organizer_draft (tripSettings fails safe), so a damaged setting never lets the agent publish.
+  const agentMayPublishChat = (req) => !req.user?.isAgent || !switchOn('trip_moments_capture') || tripSettings(db).moment_capture_mode !== 'organizer_draft';
 
   app.get('/api/moments', authRequired, (req, res) => {
     // Everyone sees published moments and their own drafts. An organizer or the agent key also sees the drafts that came from the
@@ -2055,9 +2070,11 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     }
     const id = revisionId('moment');
     const visibility = body.visibility === 'published' ? 'published' : 'draft';
+    const sourceOut = body.source || (req.user.isAgent ? 'chat' : 'site');
+    if (visibility === 'published' && sourceOut === 'chat' && !agentMayPublishChat(req)) return res.status(403).json({ error: 'organizer_review_required' });
     db.prepare(
       'INSERT INTO trip_moments (id,date,phase_id,item_uid,author,caption,body,photo_id,photo_ids,source,visibility) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
-    ).run(id, body.date || null, body.phase_id || null, body.item_uid || null, author, body.caption.trim(), body.body || null, ids[0] || null, JSON.stringify(ids), body.source || (req.user.isAgent ? 'chat' : 'site'), visibility);
+    ).run(id, body.date || null, body.phase_id || null, body.item_uid || null, author, body.caption.trim(), body.body || null, ids[0] || null, JSON.stringify(ids), sourceOut, visibility);
     res.status(201).json(momentOut(db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(id)));
   });
 
@@ -2067,6 +2084,9 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (!mayChangeMoment(req, row)) return res.status(403).json({ error: 'forbidden' });
     // The organizer review of what the companion wrote: its author may neither publish it nor change it once it is out.
     if (isChatMoment(row) && !isStaff(req) && (req.body?.visibility === 'published' || row.visibility === 'published')) {
+      return res.status(403).json({ error: 'organizer_review_required' });
+    }
+    if (isChatMoment(row) && row.visibility !== 'published' && req.body?.visibility === 'published' && !agentMayPublishChat(req)) {
       return res.status(403).json({ error: 'organizer_review_required' });
     }
     const photos = req.body?.photo_ids !== undefined ? readPhotoIds(req.body.photo_ids) : null;

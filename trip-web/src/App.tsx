@@ -1432,12 +1432,13 @@ export function PhasePlaces({ venues, lang }: {
 // A draft is the author's alone unless it came from the chat or a member's assistant, which organizers can also see (the site decides
 // who is served what; this only says it). A member's own site draft stays "Private draft".
 export function momentDraftLabel(moment: Moment, username: string | undefined, lang: Lang) {
+  // Used only while the trip has trip_moments_capture on; with it off the label is the one the site always had.
   if (moment.author !== username) return copy(lang, `Draft by ${moment.author}`, `טיוטה של ${moment.author}`);
   if (moment.source === "chat" || moment.source === "connector") return copy(lang, "Draft — you and the organizers can see it", "טיוטה — אתם והמארגנים יכולים לראות אותה");
   return copy(lang, "Private draft", "טיוטה פרטית");
 }
 
-export function MomentsView({ todayDate, lang, isOrganizer, username }: { todayDate?: string; lang: Lang; isOrganizer?: boolean; username?: string }) {
+export function MomentsView({ todayDate, lang, isOrganizer, username, momentsOn = false }: { todayDate?: string; lang: Lang; isOrganizer?: boolean; username?: string; momentsOn?: boolean }) {
 
   const queryClient = useQueryClient();
   const moments = useQuery({ queryKey: ["moments"], queryFn: getMoments });
@@ -1470,13 +1471,13 @@ export function MomentsView({ todayDate, lang, isOrganizer, username }: { todayD
       <div className="moment-feed">
         {(moments.data || []).map((moment) => (
           <article key={moment.id} className="moment-card">
-            <small>{moment.visibility === "draft" ? momentDraftLabel(moment, username, lang) : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
+            <small>{moment.visibility === "draft" ? (momentsOn ? momentDraftLabel(moment, username, lang) : copy(lang,"Private draft","טיוטה פרטית")) : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
             <h3>{moment.caption}</h3>
             {moment.body ? <p>{moment.body}</p> : null}
-            {isOrganizer && moment.visibility === "draft" ? (
+            {momentsOn && isOrganizer && moment.visibility === "draft" ? (
               <button type="button" className="ghost" disabled={publish.isPending} onClick={() => publish.mutate(moment.id)}>{copy(lang,"Publish","פרסום")}</button>
             ) : null}
-            {moment.photo_ids?.length ? <small>{copy(lang,`${moment.photo_ids.length} photo(s)`,`${moment.photo_ids.length} תמונות`)}</small> : null}
+            {momentsOn && moment.photo_ids?.length ? <small>{copy(lang,`${moment.photo_ids.length} photo(s)`,`${moment.photo_ids.length} תמונות`)}</small> : null}
           </article>
         ))}
         {!moments.data?.length ? <p className="empty-state">{copy(lang,"No moments yet.","אין רגעים עדיין.")}</p> : null}
@@ -2854,7 +2855,7 @@ export function AccountPage({ config, currentUser, lang }: { config?: TripConfig
   return (
     <div className="account-page">
       <Account currentUser={currentUser} lang={lang} />
-      <AssistantConnect lang={lang} tripName={typeof config?.meta?.title === "string" ? config.meta.title : undefined} />
+      <AssistantConnect lang={lang} momentsOn={featureOn(config, "trip_moments_capture")} tripName={typeof config?.meta?.title === "string" ? config.meta.title : undefined} />
       <TravellerList config={config} currentUser={currentUser} lang={lang} />
     </div>
   );
@@ -3195,14 +3196,14 @@ export default function App() {
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} onOpenBooking={openBooking} onOpenBookings={() => openVideoTab("bookings")} marks={marks} />,
     journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} focus={journeyFocus} today={today.data} marks={marks} />,
-    moments: <MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} username={me.data?.username} />,
+    moments: <MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} username={me.data?.username} momentsOn={featureOn(config.data, "trip_moments_capture")} />,
     more: <AccountPage config={config.data} currentUser={me.data} lang={lang} />, // the old #more address: its parts live on Account now (#612)
   }[activeTab];
   const moduleContent = shownModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} focus={bookingFocus} />,
     map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
     budget: <><BudgetView config={config.data} lang={lang} /><CurrencyConverter lang={lang}/></>,
-    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/><MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} username={me.data?.username} /></>,
+    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/><MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} username={me.data?.username} momentsOn={featureOn(config.data, "trip_moments_capture")} /></>,
     readiness: <Readiness config={config.data} lang={lang}/>,
     account: <AccountPage config={config.data} currentUser={me.data} lang={lang} />,
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,

@@ -35,8 +35,8 @@ function stub() {
   return calls;
 }
 
-const view = (isOrganizer: boolean, username = isOrganizer ? "alice" : "bob") => render(
-  <QueryClientProvider client={new QueryClient()}><MomentsView lang="en" isOrganizer={isOrganizer} username={username} /></QueryClientProvider>,
+const view = (isOrganizer: boolean, username = isOrganizer ? "alice" : "bob", momentsOn = true) => render(
+  <QueryClientProvider client={new QueryClient()}><MomentsView lang="en" isOrganizer={isOrganizer} username={username} momentsOn={momentsOn} /></QueryClientProvider>,
 );
 
 describe("moments: an organizer publishes a draft", () => {
@@ -50,6 +50,16 @@ describe("moments: an organizer publishes a draft", () => {
     await waitFor(() => expect(calls.some((c) => c.method === "PATCH")).toBe(true));
     expect(calls.find((c) => c.method === "PATCH")).toMatchObject({ url: "/api/moments/m1", body: { visibility: "published" } });
     await waitFor(() => expect(screen.getAllByRole("button", { name: "Publish" })).toHaveLength(1));
+  });
+
+  it("with trip_moments_capture OFF the list looks exactly as before: no Publish, no photo count, only the old label", async () => {
+    stub();
+    view(true, "alice", false);
+    expect((await screen.findAllByText(/Private draft/)).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: "Publish" })).toBeNull();
+    expect(screen.queryByText(/Draft by/)).toBeNull();
+    expect(screen.queryByText(/photo\(s\)/)).toBeNull();
+    expect(screen.queryByText(/you and the organizers/)).toBeNull();
   });
 
   it("a member sees no Publish button", async () => {

@@ -121,6 +121,7 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
   const T = ${scriptJson({ wrong: t.wrong, failed: t.failed, notOrganizer: t.notOrganizer, wants: t.wants, wantsRead: t.wantsRead, can: t.can, canRead: t.canRead, wantsMoments: t.wantsMoments, canMoments: t.canMoments })};
   const $ = id => document.getElementById(id);
   let session = null;
+  let shown = null;
   const stored = () => { try { return localStorage.getItem('trip-token') || localStorage.getItem('tripToken'); } catch { return null; } };
   const show = id => { for (const s of ['login', 'consent']) $(s).hidden = s !== id; };
   const fail = msg => { $('error').textContent = msg; $('error').hidden = !msg; };
@@ -139,9 +140,14 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
     // sanitized /api/config serves it. Its member-visible switches say whether a member's connection will also be able to add
     // trip moments and photos (the site decides the same way when it records the approval): the consent text names exactly that.
     const cfg = await json('/api/config', { headers: { authorization: 'Bearer ' + token } });
-    const moments = !me.body.is_organizer && cfg.ok && cfg.body && cfg.body.features && cfg.body.features.trip_moments_capture === true;
-    $('wants').textContent = me.body.is_organizer ? T.wants : moments ? T.wantsMoments : T.wantsRead;
-    $('can').textContent = me.body.is_organizer ? T.can : moments ? T.canMoments : T.canRead;
+    // What is shown comes from the server's own answer to "what will approving give this person" — the very function the decision
+    // records. If it cannot be read, nothing is shown that could be wrong and Allow stays off: no approval is possible.
+    const sc = await json('/oauth/authorize/scope', { method: 'POST', headers: { authorization: 'Bearer ' + token } });
+    shown = sc.ok && sc.body && ['trip', 'trip:moments', 'trip:read'].includes(sc.body.scope) ? sc.body.scope : null;
+    $('wants').textContent = shown === 'trip' ? T.wants : shown === 'trip:moments' ? T.wantsMoments : shown === 'trip:read' ? T.wantsRead : '';
+    $('can').textContent = shown === 'trip' ? T.can : shown === 'trip:moments' ? T.canMoments : shown === 'trip:read' ? T.canRead : '';
+    $('allow').disabled = !shown;
+    if (!shown) fail(T.failed);
     const title = cfg.ok && cfg.body && cfg.body.meta && cfg.body.meta.title;
     $('trip').textContent = (title && typeof title === 'object' ? (title[document.documentElement.lang] || title.en || title.he) : title) || '';
     $('who').textContent = me.body.name_en || me.body.name || me.body.username;
@@ -156,8 +162,11 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
   });
   $('switch').addEventListener('click', () => { session = null; fail(''); show('login'); });
   async function decide(decision) {
-    const r = await json('/oauth/authorize/decision', { method: 'POST', headers: { authorization: 'Bearer ' + session }, body: JSON.stringify({ ...PARAMS, decision }) });
+    if (decision === 'allow' && !shown) return fail(T.failed);
+    const r = await json('/oauth/authorize/decision', { method: 'POST', headers: { authorization: 'Bearer ' + session }, body: JSON.stringify({ ...PARAMS, decision, consent_scope: shown }) });
     if (r.ok && r.body && r.body.redirect_to) { window.location.replace(r.body.redirect_to); return; }
+    // The scope moved while the page was open: show the new text and ask again.
+    if (r.status === 409 && decision === 'allow') { await adopt(session); return; }
     fail(r.status === 403 ? T.notOrganizer : T.failed);
   }
   $('allow').addEventListener('click', () => decide('allow'));
