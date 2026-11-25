@@ -27,13 +27,46 @@ export interface TelegramAdapterConfig {
 }
 
 /**
+ * A Bot API call that did not succeed. Its message and fields never carry the bot token or a chat id: `description` is
+ * Telegram's own words ("Bad Request: not enough rights to change chat photo"), which name neither, and a network failure is
+ * reduced to one fixed phrase because Node's fetch errors quote the URL, and the URL carries the token.
+ */
+export class TelegramApiError extends Error {
+  constructor(readonly method: string, readonly httpStatus: number, readonly description: string | null) {
+    super(`telegram ${method} failed: ${httpStatus === 0 ? "unreachable" : `HTTP ${httpStatus}`}`);
+    this.name = "TelegramApiError";
+  }
+}
+
+/** What `getChatMember` says about the bot itself, reduced to the fields the photo decision reads. */
+export interface ChatMemberInfo {
+  /** Telegram's: creator, administrator, member, restricted, left, kicked. `unavailable` is ours: Telegram refused the question (see getChatMember). */
+  status: string;
+  can_change_info?: boolean;
+  /** Telegram's description, when `status` is `unavailable`. */
+  description?: string;
+}
+
+/** The three Bot API calls a group-photo request needs (group-photo.ts decides with them). */
+export interface GroupPhotoApi {
+  /** The bot's own user id: `getMe`, cached once it has succeeded. */
+  botId(): Promise<number>;
+  getChatMember(chatId: string, userId: number): Promise<ChatMemberInfo>;
+  /** Uploads `png` as the chat's photo (multipart InputFile). */
+  setChatPhoto(chatId: string, png: Uint8Array): Promise<void>;
+}
+
+const TELEGRAM_CALL_TIMEOUT_MS = 15_000;
+
+/**
  * Sends the real Telegram approval DM and records the short callback_data
  * refs it hands out. See db/migrations/0014_telegram_callback_refs.sql for
  * why this indirection exists: the signed action token this wraps runs to
  * ~190-200 bytes, well over Telegram's 64-byte callback_data limit.
  */
-export class TelegramNotificationAdapter implements NotificationAdapter {
+export class TelegramNotificationAdapter implements NotificationAdapter, GroupPhotoApi {
   private readonly apiRoot: string;
+  private cachedBotId: number | null = null;
 
   constructor(private readonly config: TelegramAdapterConfig) {
     this.apiRoot = (config.apiRoot ?? TELEGRAM_API_ROOT).replace(/\/+$/, "");
@@ -139,6 +172,73 @@ export class TelegramNotificationAdapter implements NotificationAdapter {
     if (!response.ok) {
       this.failSend(response.status, await response.text().catch(() => ""));
     }
+  }
+
+  // ── The trip group's photo (group-photo.ts) ──────────────────────────────────────────────────────────────────────────
+
+  /** One Bot API call, JSON or multipart, bounded in time. Throws TelegramApiError; returns `result`. */
+  private async call(method: string, body: Record<string, unknown> | FormData): Promise<unknown> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.apiRoot}/bot${this.config.botToken}/${method}`, {
+        method: "POST",
+        ...(body instanceof FormData
+          ? { body }
+          : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+        signal: AbortSignal.timeout(TELEGRAM_CALL_TIMEOUT_MS),
+      });
+    } catch {
+      throw new TelegramApiError(method, 0, "Telegram could not be reached");
+    }
+    const text = await response.text().catch(() => "");
+    let parsed: { ok?: unknown; result?: unknown; description?: unknown } = {};
+    try { parsed = JSON.parse(text) as typeof parsed; } catch { /* not JSON: the status says enough */ }
+    if (!response.ok || parsed.ok !== true) {
+      const description = typeof parsed.description === "string" ? parsed.description.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 200) : null;
+      this.config.log?.(structuredLog("warn", "telegram.api_call_failed", { method, status: response.status }));
+      throw new TelegramApiError(method, response.status, description);
+    }
+    return parsed.result;
+  }
+
+  async botId(): Promise<number> {
+    if (this.cachedBotId !== null) return this.cachedBotId;
+    const result = await this.call("getMe", {}) as { id?: unknown } | null;
+    if (!result || typeof result.id !== "number" || !Number.isSafeInteger(result.id)) {
+      throw new TelegramApiError("getMe", 200, "getMe did not name the bot");
+    }
+    // Only a success is kept: a blip at one moment must not pin the answer.
+    this.cachedBotId = result.id;
+    return result.id;
+  }
+
+  /**
+   * Telegram's answer to "what is this user in this chat", for the bot itself. A 400 or 403 means Telegram will not say
+   * (the bot was removed, the chat is gone or was upgraded, the bot may not look): that is an answer for the caller, not a
+   * fault, and it reads as `unavailable` so nothing is ever sent on it. Anything else (a rate limit, a 5xx, no network)
+   * throws, because the right action is to try again later.
+   */
+  async getChatMember(chatId: string, userId: number): Promise<ChatMemberInfo> {
+    try {
+      const result = await this.call("getChatMember", { chat_id: chatId, user_id: userId }) as { status?: unknown; can_change_info?: unknown } | null;
+      const status = typeof result?.status === "string" ? result.status : "unavailable";
+      return {
+        status,
+        ...(typeof result?.can_change_info === "boolean" ? { can_change_info: result.can_change_info } : {}),
+      };
+    } catch (error) {
+      if (error instanceof TelegramApiError && (error.httpStatus === 400 || error.httpStatus === 403)) {
+        return { status: "unavailable", ...(error.description ? { description: error.description } : {}) };
+      }
+      throw error;
+    }
+  }
+
+  async setChatPhoto(chatId: string, png: Uint8Array): Promise<void> {
+    const form = new FormData();
+    form.set("chat_id", chatId);
+    form.set("photo", new Blob([png as BlobPart], { type: "image/png" }), "logo.png");
+    await this.call("setChatPhoto", form);
   }
 
   private failSend(status: number, detail: string): never {

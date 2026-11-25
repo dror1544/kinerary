@@ -32,7 +32,7 @@ import { resolveOperatorNoticesChatId } from "../operator-chats.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
 import { gatewayKeyMasterProblem, type GatewayKeyMode } from "./protocol.js";
-import { renewCompanionConversation, setCompanionExpectsReply } from "../chat-router.js";
+import { renewCompanionConversation, resolveTripPerson, setCompanionExpectsReply } from "../chat-router.js";
 import { outboundScopeOptions } from "./outbound-scope.js";
 import { sayForChat,
   agentAlreadySpokeThisTurn,
@@ -59,6 +59,9 @@ import { groupJudgeFromEnv } from "./group-judge.js";
 import { OutageNoticeLimiter } from "./dispatch.js";
 import { startWhatsAppLoop } from "./whatsapp/poller.js";
 import { WhatsAppConfigError, createWhatsAppTransport, whatsappRuntimeConfig, type WhatsAppRuntimeConfig, type WhatsAppTransport } from "./whatsapp/runtime.js";
+import { GroupContext } from "./group-context.js";
+import { HttpTripPhotoGateway } from "./trip-photo-gateway.js";
+import { TripMoments } from "./trip-moments.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
 
@@ -153,6 +156,13 @@ interface Runtime {
    * (spec 625, AC-20).
    */
   whatsapp?: WhatsAppRuntimeConfig;
+  /**
+   * Where the relay reaches a trip's site for photos (trip-moments.ts): the runtime gateway's origin and the control-plane exchange
+   * key, from the profile's `web` block exactly as the portal and the group-line poller read them. Absent when the profile has
+   * no `web` block or its key does not resolve; said loudly at start, because then no photo is saved and no moment is sent
+   * whatever a trip's switches say.
+   */
+  tripPhotos?: { runtimeOrigin: string; exchangeKey: string };
 }
 
 /** The one line a WhatsApp block that cannot work leaves, naming the field and the rule (never a value). */
@@ -333,6 +343,25 @@ async function serveRuntime(path: string): Promise<Runtime> {
   }
   log(structuredLog("info", "relay.ops_chat", { configured: Boolean(opsChatId) }));
 
+  // Trip photos and moments reach a trip's site through the runtime gateway, with the control-plane exchange key (the same one the
+  // portal and the group-line poller hold). Without both the relay cannot save a photo or read a setting, and a trip with the
+  // switches on would look fine and keep nothing, so the absence is said here, at start, with its effect.
+  let tripPhotos: { runtimeOrigin: string; exchangeKey: string } | undefined;
+  if (profile.web?.runtime_exchange_key_secret_ref) {
+    try {
+      const exchangeKey = (await resolveSecretRef(profile.web.runtime_exchange_key_secret_ref)).trim();
+      if (exchangeKey) tripPhotos = { runtimeOrigin: profile.web.runtime_origin, exchangeKey };
+    } catch (error) {
+      log(structuredLog("error", "relay.trip_photos_key_unresolved", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+    }
+  }
+  if (!tripPhotos) {
+    log(structuredLog("error", "relay.trip_photos_unavailable", {
+      reason: profile.web ? "web.runtime_exchange_key_secret_ref did not resolve to a key" : "the architecture profile has no web block",
+      effect: "group photos are NOT saved and no trip moment is sent, whatever a trip's switches say",
+    }));
+  }
+
   return {
     gatewaySecrets: resolved,
     gatewayKeyMasters: masters,
@@ -348,6 +377,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
     multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
     ...(whatsapp ? { whatsapp } : {}),
+    ...(tripPhotos ? { tripPhotos } : {}),
     ...(opsChatId ? { opsChatId } : {}),
     ...(profile.signup?.super_admin_subject_digest
       ? { superAdminSubjectDigest: profile.signup.super_admin_subject_digest }
@@ -467,7 +497,11 @@ async function main(): Promise<void> {
     }
   }
 
+  // Trip photos and moments (trip-moments.ts): built after the connector, which it hands turns to, so the connector's send guard
+  // reads it through this holder. Absent - no database, or no way to reach the sites - the guard delivers everything.
+  let moments: TripMoments | undefined;
   const connector = new RelayConnector({
+    outboundGuard: (chatId, replyTo, latestTurnId, content) => moments?.guard(chatId, replyTo, latestTurnId, content) ?? { kind: "deliver" },
     gatewaySecrets: runtime.gatewaySecrets,
     gatewayKeyMasters: runtime.gatewayKeyMasters,
     gatewayKeyMode: runtime.gatewayKeyMode,
@@ -577,8 +611,26 @@ async function main(): Promise<void> {
       }));
     }
 
+    // The same store the poller keeps for context lines, shared so the moment turn can read what the group wrote around the photos.
+    const groupContext = new GroupContext();
+    if (runtime.tripPhotos) {
+      const db = runtime.db;
+      moments = new TripMoments({
+        db,
+        gateway: new HttpTripPhotoGateway({ runtimeOrigin: runtime.tripPhotos.runtimeOrigin, exchangeKey: runtime.tripPhotos.exchangeKey, log }),
+        groupContext,
+        resolvePerson: (tripId, senderId) => resolveTripPerson(db, tripId, senderId),
+        fetchAttachment: (ref, maxBytes) => runtime.telegram.fetchFile(ref, maxBytes),
+        pushInbound: (event, turn) => connector.pushInbound(event, turn),
+        botUsername: () => runtime.botIdentity?.username,
+        log,
+      });
+      log(structuredLog("info", "relay.trip_moments", { enabled: true, hint: "inert for a trip until its chat_photos_to_album / trip_moments_capture switches are on" }));
+    }
     stopPolling = startTripBotPoller({
       db: runtime.db,
+      groupContext,
+      ...(moments ? { moments } : {}),
       telegram: runtime.telegram,
       connector,
       botIdentity: runtime.botIdentity,

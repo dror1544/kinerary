@@ -67,6 +67,38 @@ const FEATURE_SWITCHES = Object.freeze([
     surfaces: Object.freeze(['relay', 'control_plane']),
     memberVisible: false,
   }),
+  // The trip's own logo (docs/specs/sprint-9/x-trip-logo.md). memberVisible because the site's organizer row reads
+  // features.trip_logo, and #567 S2 serves only member-visible names. Display of a stored logo never depends on it.
+  Object.freeze({
+    name: 'trip_logo',
+    summary: 'An organizer can set the trip\'s logo (website, companion, Claude/ChatGPT upload link); shown in the header, login page, favicon and installed-app icon',
+    surfaces: Object.freeze(['site', 'companion']),
+    memberVisible: true,
+  }),
+  // Trip photos and moments from the chats (docs/specs/sprint-9/x-trip-photos-and-moments.md). Part A (the site, the companion's
+  // MCP and the trip connector) reads `trip_moments_capture`; Part B (the relay) reads both. memberVisible because the site's
+  // organizer settings row reads features.<name>, and #567 S2 serves only member-visible names.
+  Object.freeze({
+    name: 'chat_photos_to_album',
+    summary: 'Photos posted in the trip group are saved to the album, attributed to their sender (and on request, when automatic saving is off); organizer setting on the site',
+    surfaces: Object.freeze(['relay', 'site', 'companion']),
+    memberVisible: true,
+  }),
+  Object.freeze({
+    name: 'trip_moments_capture',
+    summary: 'Trip moments with several photos from the chat, the companion\'s moment tools, and members adding moments and photos through their own Claude or ChatGPT; organizer setting on the site',
+    surfaces: Object.freeze(['relay', 'site', 'companion']),
+    memberVisible: true,
+  }),
+  // The bot sets the trip group's Telegram photo from the trip logo (docs/specs/sprint-9/x-trip-group-photo.md). On request
+  // only, and only after the bot's own rights in the bound group are checked. memberVisible because the site's offer after a
+  // logo change reads features.trip_group_photo, and #567 S2 serves only member-visible names.
+  Object.freeze({
+    name: 'trip_group_photo',
+    summary: 'An organizer can ask the bot to set the trip group\'s Telegram photo from the trip logo (website offer, companion, Claude/ChatGPT); the control plane checks the bot\'s rights first and reports the real result',
+    surfaces: Object.freeze(['site', 'companion', 'control_plane']),
+    memberVisible: true,
+  }),
 ]);
 
 // Fail loud at load: a malformed registry is a code bug, not a runtime state.

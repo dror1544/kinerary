@@ -212,6 +212,13 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("proxy_buffering off", mcp_block)
         self.assertIn("location ^~ /oauth/", bootstrap)
         self.assertIn("location ^~ /.well-known/oauth-", bootstrap)
+        # The connector's upload pages (/mcp/upload-confirmation/<id>,
+        # /mcp/upload-logo, /mcp/upload-photos) are separate paths: `= /mcp`
+        # matches only /mcp itself, so without their own block they were static
+        # 404s on every provisioned trip (found 2026-11-25 on a live trip).
+        self.assertIn("location ^~ /mcp/upload-", bootstrap)
+        upload_block = bootstrap.split("location ^~ /mcp/upload-", 1)[1].split("}", 1)[0]
+        self.assertIn("proxy_pass http://127.0.0.1:3000", upload_block)
         # The debian-12 template generates only C.utf8, so every apt/perl call
         # emits multi-line "Setting locale failed" warnings. Harmless in
         # themselves, but they filled the truncated stderr this transport

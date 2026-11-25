@@ -101,7 +101,7 @@ import {
   typedChoiceAnswer,
   applyPendingChangeForChat,
 } from "../interview.js";
-import { draftDigest, heldRefLists, parseOps, questionOfOp, type Op } from "../typed-changes.js";
+import { draftDigest, heldRefLists, parseOps, questionOfOp, stopsAnsweredByOps, type Op } from "../typed-changes.js";
 import {
   cancelDraft,
   getDraft,
@@ -193,8 +193,10 @@ import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import type { MediaDeps } from "./normalize.js";
 import { PendingAttachments } from "./pending-attachments.js";
 import { GroupContext } from "./group-context.js";
+import { photoText } from "./photo-copy.js";
+import type { TripMoments } from "./trip-moments.js";
 import {
-  askText, askTextAfterKnownDeclined, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
+  askText, askTextKnownConfirmed, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
   type Language,
 } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
@@ -260,6 +262,11 @@ export interface TripBotPollerDeps {
    */
   pendingAttachments?: PendingAttachments;
   groupContext?: GroupContext;
+  /**
+   * Trip photos and moments (trip-moments.ts). Absent - the default - the relay does none of it. Built by server.ts, which owns the
+   * gateway client and the key; the poller hands it to dispatch, runs its burst timer and answers a Save tap.
+   */
+  moments?: TripMoments;
   /**
    * The bounded-call runner behind the interpret path
    * (docs/interview-without-an-agent.md). Absent, `interpret_path` sessions
@@ -343,6 +350,8 @@ const DEFAULT_LONG_POLL_SECONDS = 25;
 // long-poll window.
 const DEFAULT_DELIVER_INTERVAL_MS = 700;
 const DEFAULT_MAX_BACKOFF_MS = 30_000;
+// How often the relay looks for a photo burst that has been quiet long enough (trip-moments.ts).
+const MOMENTS_TICK_MS = 15_000;
 
 // ── Acting on one decision ───────────────────────────────────────────────────
 
@@ -493,6 +502,15 @@ export async function applyDecision(
         chatId: decision.event.source.chat_id,
         text: strings.gatewayUnavailable,
       });
+      return;
+    }
+
+    case "moment_save": {
+      // The tap is always answered, so the button stops spinning; a refusal says why in the answer and posts nothing to the chat.
+      const answer = deps.moments
+        ? await deps.moments.onSaveTap({ chatId: decision.chatId, token: decision.token, fromId: decision.fromId, fromName: decision.fromName, language: decision.language })
+        : { text: photoText("tapUnavailable", decision.language) };
+      await deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId, text: answer.text }).catch(() => {});
       return;
     }
 
@@ -1031,7 +1049,7 @@ async function applyInterviewCallback(
       }
       if (picked === "too_big") {
         await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("change.droppedTooBig", now.view.language) }).catch(() => {});
-        await resumeAfterChange(deps, decision.chatId, strings, draft.displacedPrompt);
+        await resumeAfterChange(deps, decision.chatId, strings, draft.displacedPrompt, now.view.lastPrompt);
         return;
       }
       if (!picked) {
@@ -2251,7 +2269,7 @@ async function askOpenConflict(view: SessionView, chatId: string, deps: TripBotP
  */
 export function suggestionConfirmedText(question: IntakeQuestion, label: string | null, language: Language, source?: SuggestedAnswer["source"]): string {
   // "Is that the only stop?" answered Yes must not turn into "Where are you going, and when?" over the recorded stop.
-  const asked = source === "known_place" ? askTextAfterKnownDeclined(question, language) : askText(question, language);
+  const asked = source === "known_place" ? askTextKnownConfirmed(question, language) : askText(question, language);
   return `${asked}\n\n✅ ${cutWhole(label ?? "", SUGGESTION_EDIT_LABEL_MAX)}`;
 }
 const SUGGESTION_EDIT_LABEL_MAX = 3000;
@@ -2805,9 +2823,24 @@ async function resumeAfterChange(
   chatId: string,
   strings: DispatchStrings,
   displacedByChange: string | null,
+  /**
+   * What was recorded as on screen when the settling began: the preview's own `pc:` key, for a tap or a typed yes
+   * or no. Given, a prompt that is on screen NOW and was not then was said DURING the settling - the tick scan sees
+   * a tap's floor as the machine's and speaks while the "applied" or "cancelled" notice is still in flight - and it
+   * is what the organizer is looking at: nothing is put back over it. Without this the question went out twice
+   * (staging, 2026-11-25: `q:phases`, cancelled change, twice).
+   */
+  recordedWhenSettling?: string | null,
 ): Promise<void> {
   const before = await getSessionForChat(deps.db, chatId);
   const onScreen = before.ok ? before.view.lastPrompt ?? "" : "";
+  if (recordedWhenSettling?.startsWith("pc:") && onScreen !== "" && !onScreen.startsWith("pc:")) {
+    (deps.log ?? (() => {}))(structuredLog("info", "interview.resume_skipped_spoken_meanwhile", {
+      session_id: before.ok ? before.view.sessionId : null,
+      prompt: onScreen.split(":").slice(0, 2).join(":"),
+    }));
+    return;
+  }
   const displaced = onScreen && !onScreen.startsWith("pc:") ? onScreen : displacedByChange;
   await recordLastPromptForChat(deps.db, chatId, "");
   const now = await getSessionForChat(deps.db, chatId);
@@ -2930,7 +2963,7 @@ async function settleChange(
     await collapse(`✖ ${uiString("change.cancelled", language)}`);
     shownPreviews.delete(draft.id);
     await say(uiString("change.cancelled", language));
-    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt);
+    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt, view.lastPrompt);
     return;
   }
 
@@ -2942,7 +2975,7 @@ async function settleChange(
     await collapse(`✅ ${uiString("change.applied", language)}`);
     shownPreviews.delete(draft.id);
     await say(uiString("change.applied", language));
-    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt);
+    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt, view.lastPrompt);
     return;
   }
   log(structuredLog("info", "interview.change_not_applied", { session_id: view.sessionId, draft_id: draft.id, reason: applied.reason }));
@@ -2997,6 +3030,7 @@ async function announceChange(
   made: ProposeResult,
   language: Language,
   log: (line: string) => void,
+  strings: DispatchStrings,
 ): Promise<boolean> {
   if (made.kind === "no_session") return false;
   const now = await getSessionForChat(deps.db, burst.chatId);
@@ -3026,6 +3060,36 @@ async function announceChange(
       // definite one, which Hebrew needs after "את".
       return tell(uiString("change.uneditable", language)
         .replace("{what}", uiString(made.question === "travelers" ? "change.noun.travellers" : "change.noun.stops", language)));
+    case "noop": {
+      // THE WORDS CHANGE NOTHING that is held (#647): "GU-4471 is the hotel's
+      // confirmation" when the stay already says so. Showing it would be a header,
+      // an empty body and "update?". No draft was made, so nothing waits; the
+      // interview goes on. A follow-up that cancelled out a WAITING change took
+      // that draft with it (`cancelled`): what it displaced is put back.
+      log(structuredLog("info", "interview.change_noop", {
+        session_id: burst.sessionId,
+        merged: made.cancelled !== undefined,
+      }));
+      if (!made.cancelled) return false;
+      // Exactly what the organizer's own "No" does (`settleChange`): the old
+      // preview's buttons come off, they are told it was cancelled, and what the
+      // change displaced comes back.
+      const messageId = shownPreviews.get(made.cancelled.id);
+      if (messageId) {
+        await deps.telegram
+          .editMessageText({
+            chatId: burst.chatId,
+            messageId,
+            text: `${renderDraft(made.cancelled, language).text}\n\n✖ ${uiString("change.cancelled", language)}`,
+            replyMarkup: undefined,
+          })
+          .catch(() => {});
+      }
+      shownPreviews.delete(made.cancelled.id);
+      await deps.telegram.sendMessage({ chatId: burst.chatId, text: uiString("change.cancelled", language) }).catch(() => undefined);
+      await resumeAfterChange(deps, burst.chatId, strings, made.cancelled.displacedPrompt);
+      return true;
+    }
     default: {
       log(structuredLog("info", "interview.change_proposed", {
         session_id: burst.sessionId,
@@ -3695,6 +3759,32 @@ async function runInterpretPath(
     ops = checked?.ok ? checked.ops : undefined;
     opsError = checked && !checked.ok ? checked.error : result.payload.opsError;
     unclear = result.payload.unclear;
+    // NO STOP HELD YET: what the operations say about stops IS the answer to the stops question, not a change to
+    // something that is not there. The reader is told so (`changeSection`); this is what makes it true when it slips
+    // anyway - staging, 2026-11-25, a hotel named at the stops question came back as `update_stop` on a stop nobody
+    // had given, and the organizer was asked "which one do you mean?" with nothing to tap. It travels as the stops
+    // PROPOSAL, before the reading is recorded, so a crash and a replay find it stored like any other.
+    const folded = ops && recorded ? stopsAnsweredByOps(ops, recorded.answers) : null;
+    if (folded) {
+      const already = proposals.some((p) => p.questionId === "phases");
+      if (!already) {
+        proposals = [...proposals, {
+          questionId: "phases",
+          value: { kind: "structured", data: folded.stops },
+          confidence: 0.9,
+          // The organizer's own words: the operations carry no span of their own to check.
+          evidence: sourceText.trim().slice(0, 500),
+          sourceMessageId: messageIds[0] ?? "",
+        }];
+      }
+      ops = folded.rest.length > 0 ? folded.rest : undefined;
+      log(structuredLog("info", "interview.stop_ops_read_as_answer", {
+        session_id: burst.sessionId,
+        stops: folded.stops.length,
+        left_as_changes: folded.rest.length,
+        reader_also_proposed_stops: already,
+      }));
+    }
     // THE DRAFT FIRST. It is keyed by this interpretation, so making it twice is
     // one draft; and until it exists nothing below may be recorded as done — a
     // crash between the two used to lose the change for good, because the reading
@@ -3853,7 +3943,7 @@ async function runInterpretPath(
   // remembered and comes back when the change is settled.
   let draftShown = false;
   const made = change as ProposeResult | null;
-  if (made) draftShown = await announceChange(deps, burst, made, language, log);
+  if (made) draftShown = await announceChange(deps, burst, made, language, log, strings);
   if (draftShown) return;
 
   if (clarifyTravellers) {
@@ -5891,6 +5981,7 @@ export function startTripBotPoller(
         media: deps.media,
         pendingAttachments,
         groupContext,
+        ...(deps.moments ? { moments: deps.moments } : {}),
         ...(deps.superAdminSubjectDigest ? { superAdminSubjectDigest: deps.superAdminSubjectDigest } : {}),
         ...(deps.opsChatId ? { opsChatId: deps.opsChatId } : {}),
         ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
@@ -6088,7 +6179,26 @@ export function startTripBotPoller(
     }));
   });
 
+  // The burst timer of trip moments, on its own beat and not on the delivery loop above: a moment turn is a quick push, but the
+  // interview's delivery must never wait behind anything of this feature. No `deps.moments`, no timer.
+  let momentsTimer: ReturnType<typeof setInterval> | null = null;
+  if (deps.moments) {
+    let ticking = false;
+    momentsTimer = setInterval(() => {
+      if (ticking || stopped) return;
+      ticking = true;
+      deps.moments!.tick()
+        .catch((error: unknown) => {
+          log(structuredLog("warn", "relay.moments_tick_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+        })
+        .finally(() => { ticking = false; });
+    }, MOMENTS_TICK_MS);
+    momentsTimer.unref?.();
+  }
+
   return () => {
     stopped = true;
+    if (momentsTimer) clearInterval(momentsTimer);
+    deps.moments?.stop();
   };
 }

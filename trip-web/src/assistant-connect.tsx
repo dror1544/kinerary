@@ -4,7 +4,7 @@ import { api } from "./api";
 import type { Lang } from "./parity-ui";
 
 type Access = "read" | "read_write";
-type Connection = { id: string; username: string; client: string; host?: string | null; access?: Access; connected_at: string; last_used_at: string | null };
+type Connection = { id: string; username: string; client: string; host?: string | null; access?: Access; moments?: boolean; connected_at: string; last_used_at: string | null };
 type ConnectionState = { enabled: false } | { enabled: true; url: string; access: Access; connections: Connection[] };
 
 const copy = (lang: Lang, en: string, he: string) => (lang === "he" ? he : en);
@@ -29,7 +29,7 @@ export function claudeInstallLink(name: string, url: string) {
  * unless the trip turned the endpoint on, so nobody is shown an address that
  * does not work.
  */
-export function AssistantConnect({ lang, tripName }: { lang: Lang; tripName?: string }) {
+export function AssistantConnect({ lang, tripName, momentsOn = false }: { lang: Lang; tripName?: string; momentsOn?: boolean }) {
   const queryClient = useQueryClient();
   const state = useQuery({
     queryKey: ["mcp-connection"],
@@ -71,9 +71,13 @@ export function AssistantConnect({ lang, tripName }: { lang: Lang; tripName?: st
     <div className="assistant-connect">
       <h3>{copy(lang, "Connect your AI assistant", "חיבור עוזר AI")}</h3>
       <p>{readOnly
-        ? copy(lang,
+        ? (momentsOn
+          ? copy(lang,
+            "Ask Claude or ChatGPT about this trip — the plan, bookings, who is coming. It can read the trip, not change it — apart from adding your own trip moments and photos.",
+            "שאלו את Claude או את ChatGPT על הטיול — התוכנית, ההזמנות, מי מגיע. הוא יכול לקרוא את הטיול, לא לשנות אותו — מלבד הוספת רגעי טיול ותמונות משלכם.")
+          : copy(lang,
             "Ask Claude or ChatGPT about this trip — the plan, bookings, who is coming. It can read the trip, not change it.",
-            "שאלו את Claude או את ChatGPT על הטיול — התוכנית, ההזמנות, מי מגיע. הוא יכול לקרוא את הטיול, לא לשנות אותו.")
+            "שאלו את Claude או את ChatGPT על הטיול — התוכנית, ההזמנות, מי מגיע. הוא יכול לקרוא את הטיול, לא לשנות אותו."))
         : copy(lang,
             "Manage this trip from Claude or ChatGPT: it can read the trip and make the changes you can make here.",
             "נהלו את הטיול מ-Claude או מ-ChatGPT: הוא יכול לקרוא את הטיול ולעשות את השינויים שאתם יכולים לעשות כאן.")}</p>
@@ -109,7 +113,7 @@ export function AssistantConnect({ lang, tripName }: { lang: Lang; tripName?: st
                   <strong>{c.client}</strong>{" "}
                   <small>
                     {c.host && c.host !== c.client ? `${c.host} · ` : ""}@{c.username} ·{" "}
-                    {c.access === "read_write" ? copy(lang, "read and change", "קריאה ושינוי") : copy(lang, "read only", "קריאה בלבד")} ·{" "}
+                    {c.access === "read_write" ? copy(lang, "read and change", "קריאה ושינוי") : c.moments ? copy(lang, "read, plus your own moments and photos", "קריאה, ובנוסף הרגעים והתמונות שלכם") : copy(lang, "read only", "קריאה בלבד")} ·{" "}
                     {copy(lang, "since", "מאז")} {when(c.connected_at)}
                   </small>
                 </span>

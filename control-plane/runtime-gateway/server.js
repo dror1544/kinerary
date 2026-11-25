@@ -369,6 +369,102 @@ async function planChanges(req, res, tripId, searchParams) {
   res.end(payload);
 }
 
+// The trip group's photo (docs/specs/sprint-9/x-trip-group-photo.md): the control plane CLAIMS the newest pending request
+// (and the logo as a PNG) and REPORTS how it ended. Two POSTs, both on the exchange key like the routes above; this
+// gateway reads the trip's own site with that trip's key (tripKeyFor) and nothing else is carried over. The site's gate
+// takes the trip id from the BODY of a POST (server/control-plane-auth.js), so the body sent is built HERE from the path's
+// trip id and a closed set of fields: a caller cannot name another trip, or add a field the site did not ask for.
+// The answer is JSON passed through at the site's status; a redirect is never followed (502), and a body over
+// GROUP_PHOTO_MAX_BYTES (a 640x640 PNG is at most ~1.7 MB raw, ~2.3 MB as base64; the poller applies the same cap) or a
+// 2xx that is not JSON is a 502.
+const GROUP_PHOTO_MAX_BYTES = 3 * 1024 * 1024;
+const GROUP_PHOTO_RESULTS = new Set(["done", "bot_lacks_rights", "no_group", "no_logo", "failed"]);
+
+async function groupPhoto(req, res, tripId, action) {
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  let body = { tripId };
+  if (action === "result") {
+    let given;
+    try { given = await readJson(req, 4096); } catch { return json(res, 400, { error: "INVALID_REQUEST" }); }
+    if (!given || typeof given !== "object" || Array.isArray(given)) return json(res, 400, { error: "INVALID_REQUEST" });
+    const detail = given.detail ?? null;
+    if (!Number.isInteger(given.request_id) || given.request_id < 1 || !GROUP_PHOTO_RESULTS.has(given.status)
+      || typeof given.claim_token !== "string" || !/^[0-9a-f]{24}$/.test(given.claim_token)
+      || (detail !== null && (typeof detail !== "string" || detail.length > 300))) {
+      return json(res, 400, { error: "INVALID_REQUEST" });
+    }
+    body = { tripId, request_id: given.request_id, claim_token: given.claim_token, status: given.status, detail };
+  } else {
+    req.resume(); // nothing is read from a claim
+  }
+  const route = await routeFor(tripId);
+  const key = tripKeyFor(tripId, route); // throws 503 before any request to the trip
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/group-photo/${action}`, {
+    method: "POST", redirect: "manual",
+    headers: { "x-api-key": key, "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (response.status >= 300 && response.status < 400) {
+    await response.body?.cancel().catch(() => {});
+    console.error(`runtime_gateway.group_photo_redirect: trip=${tripId} status=${response.status}`);
+    return json(res, 502, { error: "UPSTREAM_REDIRECT" });
+  }
+  const payload = await readCapped(response, GROUP_PHOTO_MAX_BYTES);
+  if (payload === null) {
+    console.error(`runtime_gateway.group_photo_body_too_large: trip=${tripId}`);
+    return json(res, 502, { error: "UPSTREAM_BODY_TOO_LARGE" });
+  }
+  let parsedOk = true;
+  try { JSON.parse(payload); } catch { parsedOk = false; }
+  if (!parsedOk) {
+    if (response.ok) return json(res, 502, { error: "UPSTREAM_NOT_JSON" });
+    return json(res, response.status, { error: "UPSTREAM_ERROR" });
+  }
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
+// The relay's photos from a trip's group (docs/specs/sprint-9/x-trip-photos-and-moments.md, Part B). Three server-to-server routes,
+// shaped like the participant routes above: the caller proves itself with RUNTIME_EXCHANGE_KEY (the relay holds it as the portal does),
+// and this gateway reaches the trip's own site with the key the ROUTE says that trip holds (tripKeyFor) - the control-plane key is
+// never sent to a trip, and a trip's key is never sent anywhere but its own site. A redirect is never followed.
+//   POST /internal/t/<trip>/photos         one photo, JSON with the bytes in base64 and `tripId` in the body (the site checks it)
+//   GET  /internal/t/<trip>/photo-settings the two organizer settings and whether the group was told
+//   POST /internal/t/<trip>/photo-notice   the group was told
+// A photo is far larger than the other bodies (a 20 MB photo is ~27 MB of base64), so it has its own cap and its own, longer, wait.
+const PHOTO_BODY_MAX_BYTES = 28 * 1024 * 1024;
+const PHOTO_UPSTREAM_TIMEOUT_MS = Math.max(50, Number(process.env.RUNTIME_PHOTO_TIMEOUT_MS ?? 30_000) || 30_000);
+const PHOTO_ANSWER_MAX_BYTES = 64 * 1024;
+async function tripPhotoRoute(req, res, tripId, { method, upstreamPath, bodyLimit, timeoutMs }) {
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  let body = null;
+  if (method === "POST") {
+    try { body = await readJson(req, bodyLimit); }
+    catch (error) { return json(res, error?.message === "BODY_TOO_LARGE" ? 413 : 400, { error: error?.message === "BODY_TOO_LARGE" ? "BODY_TOO_LARGE" : "INVALID_REQUEST" }); }
+    if (!body || typeof body !== "object" || body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
+  }
+  const route = await routeFor(tripId);
+  const key = tripKeyFor(tripId, route); // throws 503 before any request to the trip
+  const response = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}${upstreamPath}`, {
+    method, redirect: "manual", signal: AbortSignal.timeout(timeoutMs),
+    headers: method === "POST"
+      ? { "content-type": "application/json", "x-api-key": key }
+      : { "x-api-key": key, "x-control-plane-trip-id": tripId, accept: "application/json" },
+    ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
+  });
+  if (response.status >= 300 && response.status < 400) {
+    await response.body?.cancel().catch(() => {});
+    console.error(`runtime_gateway.trip_photo_redirect: trip=${tripId} status=${response.status}`);
+    return json(res, 502, { error: "UPSTREAM_REDIRECT" });
+  }
+  const payload = await readCapped(response, PHOTO_ANSWER_MAX_BYTES);
+  if (payload === null) return json(res, 502, { error: "UPSTREAM_BODY_TOO_LARGE" });
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
 // Ask again while a stream is open, at half the cache window so a revocation
 // is seen within one window after the cached "live" runs out (30 s + 15 s with
 // the defaults). A negative answer, an outage and a hung control plane all end
@@ -651,6 +747,15 @@ export function createRuntimeGateway() {
       if (internal && req.method === "POST") return await provisionParticipant(req, res, decodeURIComponent(internal[1]));
       const internalPlanChanges = url.pathname.match(/^\/internal\/t\/([^/]+)\/plan-changes$/);
       if (internalPlanChanges && req.method === "GET") return await planChanges(req, res, decodeURIComponent(internalPlanChanges[1]), url.searchParams);
+      const internalGroupPhoto = url.pathname.match(/^\/internal\/t\/([^/]+)\/group-photo\/(claim|result)$/);
+      if (internalGroupPhoto && req.method === "POST") return await groupPhoto(req, res, decodeURIComponent(internalGroupPhoto[1]), internalGroupPhoto[2]);
+      const internalPhotos = url.pathname.match(/^\/internal\/t\/([^/]+)\/(photos|photo-notice|photo-settings)$/);
+      if (internalPhotos) {
+        const tripArg = decodeURIComponent(internalPhotos[1]);
+        if (internalPhotos[2] === "photos" && req.method === "POST") return await tripPhotoRoute(req, res, tripArg, { method: "POST", upstreamPath: "/api/internal/control-plane/photos", bodyLimit: PHOTO_BODY_MAX_BYTES, timeoutMs: PHOTO_UPSTREAM_TIMEOUT_MS });
+        if (internalPhotos[2] === "photo-notice" && req.method === "POST") return await tripPhotoRoute(req, res, tripArg, { method: "POST", upstreamPath: "/api/internal/control-plane/photo-notice", bodyLimit: 4096, timeoutMs: UPSTREAM_TIMEOUT_MS });
+        if (internalPhotos[2] === "photo-settings" && req.method === "GET") return await tripPhotoRoute(req, res, tripArg, { method: "GET", upstreamPath: "/api/internal/control-plane/photo-settings", timeoutMs: UPSTREAM_TIMEOUT_MS });
+      }
       const internalParticipant = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/([^/]+)$/);
       if (internalParticipant && req.method === "GET") return await participantExists(req, res, decodeURIComponent(internalParticipant[1]), decodeURIComponent(internalParticipant[2]));
       const match = url.pathname.match(/^\/t\/([^/]+)(\/.*)?$/);
@@ -680,7 +785,9 @@ export function createRuntimeGateway() {
         return json(res, 200, { portalUrl: PORTAL_ORIGIN });
       }
       // Internal identity endpoints are exclusively server-to-server.
-      if (suffix.startsWith("/api/internal/")) return json(res, 404, { error: "NOT_FOUND" });
+      // Express (the trip site) ignores case and decodes escapes, so this asks the same question host mode does (internalApiPath): any
+      // spelling of /api/internal, and a path that cannot be read at all, is not found.
+      if (internalApiPath(suffix) !== false) return json(res, 404, { error: "NOT_FOUND" });
 
       let session = decodeSession(cookieValue(req, cookieName(tripId)));
       if (session && session.tripId !== tripId) session = null;

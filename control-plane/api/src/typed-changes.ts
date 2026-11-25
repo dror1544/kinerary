@@ -533,7 +533,9 @@ export function applyOps(base: AnswerStore, ops: readonly Op[]): ApplyOutcome {
       if (!ref) return;
       const found = resolveRef(held[family], ref, family);
       if (found.kind === "resolved") resolved[opIndex]![role] = found.index;
-      else unresolved.push({ opIndex, role, family, ref, candidates: found.candidates });
+      // A name that matches NOTHING still asks - but with the whole held list to pick from, never with an empty
+      // "tap one" (staging, 2026-11-25). When the list itself is empty, the candidates are too, and the question says so.
+      else unresolved.push({ opIndex, role, family, ref, candidates: found.candidates.length > 0 ? found.candidates : held[family].map((_, i) => i) });
     };
     if ("target" in op) look("target", op.target);
     if ("after" in op) look("after", op.after);
@@ -911,6 +913,26 @@ export function draftDigest(draft: {
     .slice(0, 8);
 }
 
+/**
+ * Does this preview show NO difference? True when nothing in it says what would
+ * change: it has no lines, or only "what stays as it is" (`preview.unchanged`).
+ *
+ * A change that re-asserts what is already held - "GU-4471 is the hotel's
+ * confirmation" when the stay already carries it - validates, has a result, and
+ * describes nothing: every field of the touched entry is equal, so no line is
+ * written, and the touched entry is not counted as "unchanged" either. Shown, it
+ * is the header, an empty body and "update?" (#647, PR #633 staging test). It is
+ * not a change, and is never offered as one. Every edit a typed message can make
+ * (`STOP_FIELDS`, `TRAVELLER_FIELDS`, add, remove, replace, move) yields a line
+ * when it differs from what is held, so an empty preview IS the absence of one.
+ */
+export function showsNoChange(preview: readonly Line[]): boolean {
+  // Only the `preview.*` lines say what changes; a `warn.*` or `effect.*` line is
+  // computed for any entry the change TOUCHES (a stop that starts before the trip
+  // does, whatever was restated), so it cannot make a restatement a change.
+  return preview.every((l) => !l.key.startsWith("preview.") || l.key === "preview.unchanged");
+}
+
 /** The lines of a preview that warn about, or describe an effect on, the rest of the trip. */
 export function warningLines(preview: readonly Line[]): Line[] {
   return preview.filter((l) => l.key.startsWith("warn.") || l.key.startsWith("effect."));
@@ -1014,6 +1036,69 @@ export function applyPick(
   const target = ops[opIndex];
   if (!target || target.op === "choose" || !(role in target)) return null;
   return ops.map((op, i) => (i === opIndex ? { ...op, [role]: { name, pin: { index, name } } } as Op : op));
+}
+
+// ── Stops, before there are any ──────────────────────────────────────────────
+
+function tripDay(answers: AnswerStore, questionId: string): string | null {
+  const answer = answers[questionId];
+  const value = answer?.kind === "text" && typeof answer.text === "string" ? answer.text.trim() : "";
+  return dayNumber(value) !== null ? value : null;
+}
+
+/**
+ * What the operations on stops amount to when NO stop is held: the answer to the stops question.
+ *
+ * A change is to something that is held. With no stop held, "we sleep at Hotel X in A" is not a change to a stop that
+ * does not exist - it is the first stop, with the hotel in it - and the person is not asked to confirm a diff against
+ * nothing (staging, 2026-11-25: an update_stop for "A" came back as "I couldn't find A among your stops. Which one do
+ * you mean?", with nothing to tap). `add_stop` is a stop as written; `update_stop` and `replace_stop` name the place
+ * they are about (`fields.name`, else the target's) and say what is known of it; operations about the same place are
+ * one stop. A lone stop with no dates of its own takes the trip's - the rule the stops question's own prompt gives -
+ * and never with several stops, where nobody is told which dates are whose.
+ *
+ * `rest` is every operation that is not that, in order: a removal or a move of what is not there, a traveller's. Null
+ * when stops are held, or when nothing here is about a stop that has a name to make one of.
+ */
+export function stopsAnsweredByOps(
+  ops: readonly Op[],
+  answers: AnswerStore,
+): { stops: Array<Record<string, unknown>>; rest: Op[] } | null {
+  if (listOf(answers, "phases").length > 0) return null;
+  const stops: Array<Record<string, unknown>> = [];
+  const rest: Op[] = [];
+  const same = (a: unknown, b: unknown) => typeof a === "string" && typeof b === "string" && identityFold(a) === identityFold(b);
+  for (const op of ops) {
+    if (op.op === "add_stop") {
+      if (typeof op.fields.name !== "string" || op.fields.name.trim() === "") { rest.push(op); continue; }
+      const held = stops.find((s) => same(s.name, op.fields.name));
+      if (held) mergeFields(held, op.fields);
+      else stops.push({ ...op.fields });
+    } else if (op.op === "update_stop" || op.op === "replace_stop") {
+      const name = op.fields.name ?? op.target.name;
+      if (typeof name !== "string" || name.trim() === "") { rest.push(op); continue; }
+      const held = stops.find((s) => same(s.name, name));
+      if (held) mergeFields(held, op.fields);
+      else stops.push({ ...op.fields, name });
+    } else {
+      rest.push(op);
+    }
+  }
+  if (stops.length === 0) return null;
+  const start = tripDay(answers, "departure_date");
+  const end = tripDay(answers, "return_date");
+  const only = stops[0];
+  if (stops.length === 1 && only && only.start === undefined && only.end === undefined && start !== null && end !== null && start <= end) {
+    only.start = start;
+    only.end = end;
+  }
+  return { stops, rest };
+}
+
+function mergeFields(into: Record<string, unknown>, fields: Fields): void {
+  for (const [key, value] of Object.entries(fields)) {
+    into[key] = key === "accommodation" && isRecord(into.accommodation) ? { ...into.accommodation, ...(value as Entry) } : value;
+  }
 }
 
 // ── What the model is shown ──────────────────────────────────────────────────

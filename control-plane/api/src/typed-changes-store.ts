@@ -14,7 +14,7 @@
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
 import type { AnswerStore, IntakeAnswer } from "./interview.js";
-import { applyOps, applyPick, draftDigest, MAX_DRAFT_OPS, mergeOps, questionOfOp, type Line, type Op, type Unresolved } from "./typed-changes.js";
+import { applyOps, applyPick, draftDigest, MAX_DRAFT_OPS, mergeOps, questionOfOp, showsNoChange, type Line, type Op, type Unresolved } from "./typed-changes.js";
 import { renderDraft } from "./typed-changes-render.js";
 
 type Db = Pick<pg.Pool, "connect" | "query">;
@@ -119,7 +119,14 @@ export type ProposeResult =
   /** The change would make the waiting draft too big to show in one message, or hold too many operations. Nothing was stored. */
   | { kind: "too_big"; merged: boolean }
   /** What is held cannot be edited by typing (an entry that is not an object). Nothing was stored. */
-  | { kind: "uneditable"; question: "phases" | "travelers" };
+  | { kind: "uneditable"; question: "phases" | "travelers" }
+  /**
+   * The operations change nothing that is held (#647): there is nothing to confirm,
+   * so no draft was made. When they were MERGED into a waiting draft and cancel its
+   * changes out, that draft was cancelled and is returned, so the caller can put
+   * back what it displaced.
+   */
+  | { kind: "noop"; cancelled?: Draft };
 
 export interface ProposeInput {
   sessionId: string;
@@ -175,6 +182,14 @@ async function dropTooBig(client: pg.PoolClient, draftId: string): Promise<void>
   );
 }
 
+/** Does this state ask nothing, block nothing, and show no difference? A draft of it would be an empty "update?" (#647). */
+function changesNothing(state: ReturnType<typeof draftStateFor>): boolean {
+  return state.unresolved.length === 0
+    && state.blocked.length === 0
+    && Object.keys(state.result).length > 0
+    && showsNoChange(state.preview);
+}
+
 export async function proposeChange(db: Db, input: ProposeInput): Promise<ProposeResult> {
   const client = await db.connect();
   try {
@@ -205,6 +220,17 @@ export async function proposeChange(db: Db, input: ProposeInput): Promise<Propos
       const state = draftStateFor(held, ops);
       const refused = refusal(ops, state, true);
       if (refused) { await client.query("ROLLBACK"); return refused; }
+      if (changesNothing(state)) {
+        // The follow-up undid what was waiting: nothing is left to confirm.
+        await client.query(
+          `UPDATE control_plane.intake_pending_changes
+              SET status = 'cancelled', resolved_at = now(), resolved_by = 'system', updated_at = now()
+            WHERE id = $1 AND status = 'pending'`,
+          [open.rows[0].id],
+        );
+        await client.query("COMMIT");
+        return { kind: "noop", cancelled: toDraft(open.rows[0]) };
+      }
       const updated = await client.query<DraftRow>(
         `UPDATE control_plane.intake_pending_changes
             SET ops = $2::jsonb, base = $3::jsonb, result = $4::jsonb, preview = $5::jsonb,
@@ -223,6 +249,7 @@ export async function proposeChange(db: Db, input: ProposeInput): Promise<Propos
       const state = draftStateFor(held, ops);
       const refused = refusal(ops, state, false);
       if (refused) { await client.query("ROLLBACK"); return refused; }
+      if (changesNothing(state)) { await client.query("ROLLBACK"); return { kind: "noop" }; }
       const inserted = await client.query<DraftRow>(
         `INSERT INTO control_plane.intake_pending_changes
            (id, session_id, trip_id, interpretation_ids, base, ops, result, preview, unresolved, blocked, displaced_prompt)

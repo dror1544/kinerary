@@ -860,8 +860,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}, {\"type\": \"flight\", \"name\": \"FI305 Oslo → Reykjavik\", \"date\": \"2027-03-04\", \"time\": \"09:30\"}, {\"type\": \"car\", \"name\": \"Rental car pick-up Keflavik airport\", \"date\": \"2027-03-04\"}]",
     required: false,
     // A flight number is not a confirmation, and that is a rule, not a
-    // judgement — see withoutFlightNumbersAsConfirmations (#131).
-    sanitize: withoutFlightNumbersAsConfirmations,
+    // judgement — see withoutFlightNumbersAsConfirmations (#131). A car's pick-up
+    // place is said once, also by code — see withoutRepeatedPlaceInCarName (#648).
+    sanitize: (data: unknown) => withoutRepeatedPlaceInCarName(withoutFlightNumbersAsConfirmations(data)),
     checkComplete: anchorDatesProblem,
   },
   {
@@ -1192,6 +1193,31 @@ export function isFlightDesignator(value: string): boolean {
 // summary. The detector never files anything — the organizer's answer does.
 
 /**
+ * Does a confirmation word stand right before this position — "אישור GU-4471",
+ * "מספר אישור: GU4471", "confirmation GU-4471", "conf. #GU-4471", "ref GU-4471",
+ * "booking number GU-4471"? Then the code is that booking's reference, not a
+ * flight (#646: a hotel's `GU-4471` was read as flight GU4471, GU being a real
+ * airline code).
+ *
+ * ONLY the code immediately after the word, and only these words: a bare
+ * "booking" is how people introduce a flight too ("our booking is LY5143"), and
+ * a flight lost to this veto is the failure `flightDesignatorsIn` exists to
+ * prevent. The word must stand alone ("pref", "href" are not "ref").
+ */
+// A full stop counts only after an abbreviation ("conf.", "ref.", "no."): after
+// "confirmation." it ends a sentence, and what follows is not that booking's code.
+// Hebrew takes one-letter prefixes ("האישור", "ואישור", "מספר האישור").
+const CONFIRMATION_BEFORE = new RegExp(
+  "(?<![\\p{L}\\p{N}])(?:[והבלשכמ]{0,2}אישור|confirmation|conf\\.?|reference|ref\\.?"
+  + "|booking\\s+(?:reference|ref\\.?|number|no\\.?|num\\.?|code|#))"
+  + "(?:\\s*(?:number|num\\.?|no\\.?|מספר|code|#))?[\\s:#\\-]*$",
+  "iu",
+);
+function followsConfirmationWord(text: string, at: number): boolean {
+  return CONFIRMATION_BEFORE.test(text.slice(Math.max(0, at - 40), at));
+}
+
+/**
  * Flight designators in text the organizer typed, normalised ("LY8801"), in
  * order of first appearance.
  *
@@ -1214,6 +1240,7 @@ export function flightDesignatorsIn(text: string): string[] {
   for (const match of text.matchAll(pattern)) {
     const code = match[1]!;
     const digits = match[2]!;
+    if (followsConfirmationWord(text, match.index ?? 0)) continue;
     const needed = /[0-9]/.test(code) ? 3 : 2;
     if (digits.length < needed) continue;
     const designator = `${code}${digits}`;
@@ -1221,6 +1248,25 @@ export function flightDesignatorsIn(text: string): string[] {
     if (!found.includes(designator)) found.push(designator);
   }
   return found;
+}
+
+/**
+ * The references a stop's accommodation holds, normalised ("GU4471"). The reader
+ * files a hotel's confirmation there, and nothing in `travel_anchors` need say it
+ * again (#646).
+ */
+function stayConfirmations(answers: AnswerStore): Set<string> {
+  const out = new Set<string>();
+  const answer = answers.phases;
+  if (!answer || answer.kind !== "structured" || !Array.isArray(answer.data)) return out;
+  for (const stop of answer.data) {
+    if (typeof stop !== "object" || stop === null) continue;
+    const stay = (stop as { accommodation?: unknown }).accommodation;
+    if (typeof stay !== "object" || stay === null) continue;
+    const confirmation = (stay as { confirmation?: unknown }).confirmation;
+    if (typeof confirmation === "string") out.add(confirmation.replace(/[\s\-_.]/g, "").toUpperCase());
+  }
+  return out;
 }
 
 /** Is this designator named anywhere in the organizer's bookings? Any spelling, any case. */
@@ -1240,7 +1286,11 @@ function designatorInAnchors(designator: string, answers: AnswerStore): boolean 
  */
 export function flightsOwed(answers: AnswerStore, ui: InterviewUiState): string[] {
   const asked = new Set(ui.flightsAsked ?? []);
-  return (ui.typedFlights ?? []).filter((d) => !asked.has(d) && !designatorInAnchors(d, answers));
+  // A code the reader filed as a hotel's confirmation is not a flight, whatever
+  // it looks like (#646). The reader's proposal arrives AFTER the typed flights
+  // are noted, so this is where it can be known; equality, never a substring.
+  const stays = stayConfirmations(answers);
+  return (ui.typedFlights ?? []).filter((d) => !asked.has(d) && !stays.has(d) && !designatorInAnchors(d, answers));
 }
 
 /** Words for "you mentioned these flights — say them again as bookings", one or several. */
@@ -1354,6 +1404,61 @@ export function withoutFlightNumbersAsConfirmations(data: unknown): unknown {
     const { confirmation: _dropped, ...rest } = anchor;
     return { ...rest, ...(anchor.flight_number ? {} : { flight_number: confirmation }) };
   });
+}
+
+/**
+ * Says a car's pick-up place once (#648).
+ *
+ * The reader composes a car's name from where it is picked up and where it is
+ * returned ("the car as they called it, then the pick-up place and the return
+ * place"), and when both are the same place it sometimes writes it twice - live,
+ * PR #633 staging test, 2026-11-23: "רכב מ-Hertz שדה התעופה של לובליאנה שדה
+ * התעופה של לובליאנה". A repair in code, at the gate every answer passes, rather
+ * than one more sentence in a prompt (which a model follows only most of the time).
+ *
+ * DELIBERATELY NARROW, because a name is the organizer's and a wrong collapse
+ * loses part of a real place:
+ *  - only a `car`: the doubling comes from composing pick-up and return, which
+ *    only a car has. A hotel called "New York New York" is a real hotel;
+ *  - a run of at LEAST TWO words repeated immediately after itself. One word is
+ *    left alone - "Bora Bora" and "Pago Pago" are real places;
+ *  - words compare ignoring case and punctuation at their edges, the longest
+ *    repeat first, and the second copy is the one removed;
+ *  - a name with no repeat is returned as it was, spacing and all.
+ * A different return place is information and is never touched.
+ */
+export function withoutRepeatedPlaceInCarName(data: unknown): unknown {
+  if (!Array.isArray(data)) return data;
+  return data.map((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+    const anchor = row as Record<string, unknown>;
+    if (typeof anchor.type !== "string" || anchor.type.trim().toLowerCase() !== "car") return row;
+    if (typeof anchor.name !== "string") return row;
+    const collapsed = withoutImmediateRepeat(anchor.name);
+    return collapsed === null ? row : { ...anchor, name: collapsed };
+  });
+}
+
+/** `name` with its longest immediately-repeated run of two or more words said once, or null when it has none. */
+function withoutImmediateRepeat(name: string): string | null {
+  const words = name.split(/\s+/).filter(Boolean);
+  const fold = (w: string) => w.toLowerCase().replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, "");
+  let changed = false;
+  for (let again = true; again;) {
+    again = false;
+    for (let len = Math.floor(words.length / 2); len >= 2 && !again; len -= 1) {
+      for (let at = 0; at + 2 * len <= words.length; at += 1) {
+        let same = true;
+        for (let k = 0; k < len && same; k += 1) same = fold(words[at + k]!) === fold(words[at + len + k]!) && fold(words[at + k]!) !== "";
+        if (!same) continue;
+        words.splice(at + len, len);
+        changed = true;
+        again = true;
+        break;
+      }
+    }
+  }
+  return changed ? words.join(" ").replace(/[\s,;:.־-]+$/u, "") : null;
 }
 
 /** A year-less day and month for one of the two trip dates, placed against the other date or today; null if it cannot be. */
@@ -1996,7 +2101,13 @@ export interface SessionView {
   selections: Record<string, string[]>;
   /** Document answers waiting on "is this right?", by question id. */
   suggestions: Record<string, SuggestedAnswer>;
-  /** The stops were declined as "the only stop" (#438, AC-12): asked as an open question, not for the place and dates again. */
+  /**
+   * The destination and both dates are on record, so the stops question is asked for more detail on the trip - the
+   * stops in order, the flights, where they stay - and never for the place and the dates again (#438, AC-12; and the
+   * 2026-11-25 staging run, where a destination in Hebrew script could not be offered as "the only stop" and the plain
+   * "where are you going, and when?" was asked over a card that already said). Whether the offer was declined does not
+   * matter: the question is the same either way.
+   */
   stopsAskedFromKnown?: boolean;
   /** Buttons for text questions drawn from the record (the roster, for the organizer), by question id. */
   choices?: Record<string, RosterChoice[]>;
@@ -4038,6 +4149,18 @@ export function knownStopSuggestion(answers: AnswerStore, ui: InterviewUiState =
 }
 
 /**
+ * The destination and both dates are on record as a place and a real range of days. Unlike `knownStopSuggestion` it says
+ * nothing of whether the stop could be OFFERED (a destination written only in a non-Latin script cannot be): what is
+ * asked is whether the stops question may still ask "where, and when?", and it may not.
+ */
+export function tripPlaceAndDatesKnown(answers: AnswerStore): boolean {
+  const place = textAnswer(answers, "destination")?.trim() ?? "";
+  const start = textAnswer(answers, "departure_date")?.trim() ?? "";
+  const end = textAnswer(answers, "return_date")?.trim() ?? "";
+  return place !== "" && knownStopConfirmText(place, start, end, "en") !== null && end >= start;
+}
+
+/**
  * "Is that the only stop?" (#438, AC-12). Once the destination and both dates are on record -- seeded from the card or
  * typed -- the stops question starts from them instead of asking for the place and the dates a second time. A document's
  * own suggestion for the stops (read from evidence) wins; an answer already on record, or a no, leaves the question as
@@ -4111,7 +4234,7 @@ function buildSessionView(
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
     suggestions: withKnownStopSuggestion(withOrganizerNameSuggestion(ui.suggestions ?? {}, answers, ui), answers, ui, language),
-    stopsAskedFromKnown: ui.knownStopDeclined === true && knownStopSuggestion(answers, ui, language) !== null,
+    stopsAskedFromKnown: tripPlaceAndDatesKnown(answers),
     choices: recordChoices(answers),
     subjects: recordSubjects(answers),
     unsettled: unsettledAnswers(answers),

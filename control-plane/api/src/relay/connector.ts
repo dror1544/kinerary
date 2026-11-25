@@ -28,6 +28,7 @@
  */
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
+import type { InlineKeyboard } from "../chat-router.js";
 import { chatKind, chatPlatformOf, digestTelegramId } from "../identity.js";
 import { structuredLog } from "../redaction.js";
 import { detectInternalLeak } from "./internal-leak.js";
@@ -268,7 +269,20 @@ export interface ConnectorOptions {
    * default — records nothing. Never called for an interview chat.
    */
   assistantEvents?: ReplyObserver;
+  /**
+   * Trip moments (trip-moments.ts): asked about each companion send, with the id the send replies to and the latest turn this
+   * connector forwarded to the chat, whether it may go out and with what buttons. A moment turn is the one case where the answer
+   * is not "deliver": the companion's reply to it posts nothing (organizer_draft, publish) or is one draft with a Save button
+   * (ask_in_chat). Absent - the default - every send is delivered as it always was. Never called on an interview chat.
+   */
+  outboundGuard?: (chatId: string, replyTo: string | undefined, latestTurnId: string | undefined, content: string) =>
+    | { kind: "deliver"; replyMarkup?: InlineKeyboard; sent?: (messageId: string) => void }
+    | { kind: "suppress"; reason: string };
 }
+
+/** Ids the relay gives its own turns (trip-moments.ts): never a Telegram message id. */
+const SYNTHETIC_TURN_ID = /^k(?:moment|save)-/;
+const KEYBOARDS_MAX = 200;
 
 export class RelayConnector {
   private readonly wss: WebSocketServer;
@@ -286,6 +300,8 @@ export class RelayConnector {
   private readonly log: (line: string) => void;
   /** Which forwarded group turns named the assistant, so a silence reply to one is counted (stay-silent.ts). */
   private readonly explicitTurns = new ExplicitTurns();
+  /** Buttons the relay put on a message (trip moments' Save), by chat and message id, so an edit does not lose them. Bounded. */
+  private readonly keyboards = new Map<string, InlineKeyboard>();
   private readonly path: string;
   /** The WhatsApp transport, when a client is configured. */
   private readonly whatsapp: WhatsAppOutbound | null;
@@ -655,6 +671,15 @@ export class RelayConnector {
         }
         const content = verdict.content;
 
+        // A reply to a trip-moment turn (trip-moments.ts): held back, or sent with its Save button. Reported as delivered, like
+        // the suppressions around it: the gateway's per-request future has to resolve and there is nothing it could retry.
+        const guarded = this.options.outboundGuard?.(action.chat_id, action.reply_to, this.explicitTurns.latestMessageId(action.chat_id), content);
+        if (guarded?.kind === "suppress") {
+          this.log(structuredLog("warn", "relay.moment_reply_held_back", { reason: guarded.reason }));
+          this.options.assistantEvents?.replySent(action.chat_id, "suppressed", content.length, action.reply_to);
+          return { success: true };
+        }
+
         const leak = detectInternalLeak(content);
         if (leak.leaks) {
           this.log(structuredLog("warn", "relay.internal_leak_suppressed", {
@@ -698,8 +723,10 @@ export class RelayConnector {
           // a link written "japan\-2026\.ara\-united\.store". Raw here; the
           // dialect is honoured one layer down, once.
           text: content,
-          replyTo: action.reply_to,
+          // The relay's own turn ids (a moment turn, a Save tap) are not Telegram messages: replying to one would fail the send.
+          replyTo: action.reply_to && !SYNTHETIC_TURN_ID.test(action.reply_to) ? action.reply_to : undefined,
           parseMode: "MarkdownV2",
+          ...(guarded?.replyMarkup ? { replyMarkup: guarded.replyMarkup } : {}),
         }).catch((error: unknown) => {
           this.options.assistantEvents?.replySent(action.chat_id, "failed", content.length, action.reply_to);
           throw error;
@@ -738,6 +765,19 @@ export class RelayConnector {
             }));
           }
         }
+        // A message that went out with buttons keeps them through the companion's own edits of it (a streamed reply is a send and
+        // then edits), and a reply to it can be recognised.
+        if (sent.ok && sent.messageId && guarded?.replyMarkup) {
+          this.keyboards.set(`${action.chat_id}:${sent.messageId}`, guarded.replyMarkup);
+          while (this.keyboards.size > KEYBOARDS_MAX) {
+            const oldest = this.keyboards.keys().next();
+            if (oldest.done) break;
+            this.keyboards.delete(oldest.value);
+          }
+        }
+        if (sent.ok && sent.messageId) {
+          try { guarded?.sent?.(sent.messageId); } catch { /* bookkeeping about a delivered message never fails it */ }
+        }
         return sent.ok
           ? { success: true, message_id: sent.messageId }
           : { success: false, error: gatewayError(sent.error, "SEND_FAILED") };
@@ -763,6 +803,9 @@ export class RelayConnector {
           // is even quieter. Escaped once, by telegram-api.ts.
           text: editVerdict.content,
           parseMode: "MarkdownV2",
+          ...(this.keyboards.get(`${action.chat_id}:${action.message_id}`)
+            ? { replyMarkup: this.keyboards.get(`${action.chat_id}:${action.message_id}`)! }
+            : {}),
         });
         return edited.ok ? { success: true } : { success: false, error: gatewayError(edited.error, "EDIT_FAILED") };
       }

@@ -85,6 +85,10 @@ export interface InboundTurn {
   attachment: AttachmentRef | null;
   /** The attachment of the message replied to, with that message's caption. */
   repliedToAttachment: HeldAttachment | null;
+  /** When this message was sent, in ms (the platform's own time). Optional: a platform that does not say leaves it off. */
+  sentAtMs?: number;
+  /** When the message replied to was sent, in ms. */
+  repliedToSentAtMs?: number;
 }
 
 /** A person the trip knows, by the control plane's own link record. */
@@ -145,6 +149,24 @@ export interface BeforeMarksContext {
   withAnalytics(build: () => InboundFacts | Promise<InboundFacts>): Promise<{ analytics?: InboundFacts }>;
 }
 
+/**
+ * Trip photos and moments, the relay's half (trip-moments.ts; docs/specs/sprint-9/x-trip-photos-and-moments.md, Part B). Optional,
+ * like the stores beside it: absent, or with the trip's switches off, the gate does exactly what it did before. Telegram only.
+ */
+export interface MomentsPort {
+  /**
+   * A group message nobody addressed to the assistant. A photo in it is held and, with automatic saving on, saved; a `reply` is
+   * relay-owned text for the group (the once-only notice that photos are saved).
+   */
+  unaddressed(turn: InboundTurn, route: RoutedCompanionRoute): Promise<{ reply?: string }>;
+  /**
+   * A message that is for the assistant: a save request, a private chat's photo. A `reply` ends the turn with that text and NO
+   * model turn; a `context` goes on to the companion with that block ahead of the message (a draft moment the message may be the
+   * answer to); null leaves it to the companion, exactly as before.
+   */
+  addressed(turn: InboundTurn, route: RoutedCompanionRoute, how: { explicit: boolean }): Promise<{ reply: string } | { context: string } | null>;
+}
+
 export interface GateDeps<Extra = never> {
   db: pg.Pool;
   log: (line: string) => void;
@@ -171,6 +193,8 @@ export interface GateDeps<Extra = never> {
   pendingAttachments?: PendingAttachments;
   /** What the family said while nobody addressed the assistant. */
   groupContext?: GroupContext;
+  /** Photos from the trip's group, saved to the album and drafted into moments. Absent: nothing of it happens. */
+  moments?: MomentsPort;
   groupJudge?: GroupJudge;
   /** Do not wait for the judge; see `judge_pending`. */
   deferJudge?: boolean;
@@ -331,6 +355,19 @@ async function eventTurn<Extra>(
     capturedByJudge = judged?.kind === "yes";
   }
   const addressed = addressedOtherwise || capturedByConversation || capturedByJudge;
+  // Trip photos and moments (Part B). A message that IS for the assistant may be a request the relay answers itself - "@bot save
+  // this" in reply to a photo, a private chat's photo - with no model turn. It runs before any window is written or mark is put on:
+  // the relay answered, nobody was talked with. Never costs the message: a failure is logged and the turn goes on as it always did.
+  if (addressed && deps.moments && turn.platform === "telegram") {
+    try {
+      const answered = await deps.moments.addressed(turn, outcome.route, { explicit: explicitHere });
+      if (answered && "reply" in answered) return { kind: "reply", reply: { chatId, text: answered.reply } };
+      // The companion's own session never saw the draft this may answer; the block goes ahead of the words, under the marks.
+      if (answered) outcome.event.text = `${answered.context}\n\n${outcome.event.text}`;
+    } catch (error) {
+      log(structuredLog("warn", "relay.moments_failed", { stage: "addressed", safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+    }
+  }
   // #177: the gate's verdict, as metadata. Only ever called through
   // `withAnalytics`, which never calls it while assistant events are off.
   // The text is taken here, before anything is prefixed to it.
@@ -382,6 +419,7 @@ async function eventTurn<Extra>(
         chatId,
         outcome.event.source.user_name || "someone",
         outcome.event.text,
+        senderId,
       );
     }
     const held = Boolean(deps.pendingAttachments && senderId && attachment?.kind === "document");
@@ -390,6 +428,16 @@ async function eventTurn<Extra>(
         ...(turn.caption ? { caption: turn.caption } : {}),
       });
       log(structuredLog("info", "trip_bot.attachment_held", { kind: attachment.kind }));
+    }
+    // Trip photos and moments (Part B): a group photo is held by reference and, with the switch and the setting on, saved - no
+    // model turn - and the group is told once that this is so. A failure here costs the photo, never the message.
+    if (deps.moments && inGroup && turn.platform === "telegram") {
+      try {
+        const moment = await deps.moments.unaddressed(turn, outcome.route);
+        if (moment.reply) return { kind: "reply", reply: { chatId, text: moment.reply } };
+      } catch (error) {
+        log(structuredLog("warn", "relay.moments_failed", { stage: "unaddressed", safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+      }
     }
     return {
       kind: "drop",

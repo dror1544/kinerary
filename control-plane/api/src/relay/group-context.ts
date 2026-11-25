@@ -51,6 +51,16 @@ export interface OverheardMessage {
 
 interface Entry extends OverheardMessage {
   heldAt: number;
+  /** The platform's id of who said it, when the platform said (trip moments read it; `take` never returns it). */
+  senderId?: string;
+}
+
+/** One held line as the moment turn reads it: non-destructively, with who said it and when. */
+export interface HeldLine {
+  sender: string;
+  senderId?: string;
+  text: string;
+  at: number;
 }
 
 export class GroupContext {
@@ -58,12 +68,12 @@ export class GroupContext {
 
   constructor(private readonly now: () => number = Date.now) {}
 
-  /** Remember one message nobody addressed to the assistant. */
-  hold(chatId: string, sender: string, text: string): void {
+  /** Remember one message nobody addressed to the assistant. `senderId` is for the moment turn's attribution rules. */
+  hold(chatId: string, sender: string, text: string, senderId?: string | null): void {
     const trimmed = text.trim();
     if (!trimmed) return;
     const entries = this.chats.get(chatId) ?? [];
-    entries.push({ sender, text: trimmed, heldAt: this.now() });
+    entries.push({ sender, text: trimmed, heldAt: this.now(), ...(senderId ? { senderId } : {}) });
     while (entries.length > GROUP_CONTEXT_PER_CHAT) entries.shift();
     this.chats.set(chatId, entries);
     // Oldest chat out first, and only when over the cap — an eviction here is
@@ -82,6 +92,18 @@ export class GroupContext {
    */
   clear(chatId: string): void {
     this.chats.delete(chatId);
+  }
+
+  /**
+   * The lines held for this chat between two times, oldest first, WITHOUT forgetting them. For the trip-moment turn
+   * (photo-burst.ts): those lines still belong to the next addressed message that would carry them, so reading them for a moment
+   * must not take them. Nothing outside [`fromMs`, `toMs`] and nothing past the held window is returned.
+   */
+  window(chatId: string, fromMs: number, toMs: number): HeldLine[] {
+    const cutoff = this.now() - GROUP_CONTEXT_TTL_MS;
+    return (this.chats.get(chatId) ?? [])
+      .filter((entry) => entry.heldAt >= cutoff && entry.heldAt >= fromMs && entry.heldAt <= toMs)
+      .map((entry) => ({ sender: entry.sender, text: entry.text, at: entry.heldAt, ...(entry.senderId ? { senderId: entry.senderId } : {}) }));
   }
 
   /**

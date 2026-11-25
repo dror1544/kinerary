@@ -49,7 +49,7 @@ export function todayContext(items: ItineraryItem[], extra: Partial<TodayContext
   };
 }
 
-export type Served = { config: unknown; today: TodayContext; items: ItineraryItem[]; days?: ItineraryDay[]; user?: Record<string, unknown>; settings?: Record<string, unknown>; flights?: unknown[]; bookings?: unknown[] };
+export type Served = { config: unknown; today: TodayContext; items: ItineraryItem[]; days?: ItineraryDay[]; user?: Record<string, unknown>; settings?: Record<string, unknown>; ui?: Record<string, unknown>; flights?: unknown[]; bookings?: unknown[] };
 
 export const LABELLED_DAY: ItineraryDay = { phase_id: "colmar", date: TODAY, label_en: "Thu 12/3 — Wine Route", label_he: "יום ה׳ 3/12 — דרך היין" };
 
@@ -62,7 +62,7 @@ export function stubTripFetch(served: () => Served) {
     switch (url.pathname) {
       case "/api/config": return json(state.config);
       case "/api/auth/me": return json(state.user ?? { username: "avi", name: "אבי", name_en: "Avi", is_organizer: true });
-      case "/api/ui-settings": return json({ design_variant: "modern", hero: { url: null, focal_x: 0.5, focal_y: 0.45 } });
+      case "/api/ui-settings": return json({ design_variant: "modern", hero: { url: null, focal_x: 0.5, focal_y: 0.45 }, ...(state.ui ?? {}) });
       case "/api/hermes/status": return json({ identity: { name: "Victor" }, available: true, ask_in_telegram: false, telegram_username: null, verification_freshness: { open_issues: 0, checked_at: "" } });
       case "/api/itinerary/active": return json({ revision: "rev_1", days: state.days ?? [LABELLED_DAY], items: state.items });
       case "/api/today": return json(state.today);

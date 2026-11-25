@@ -21,7 +21,9 @@ import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { featureOn } from "./features";
+import { GroupPhotoControl } from "./group-photo";
 import { GroupLineToggle } from "./group-line";
+import { ChatPhotosSettings } from "./chat-photos";
 import { hasGoChip, mapUrlFor, navUrlFor, wazeUrlFor } from "./nav-links";
 import { useNavApp } from "./trip-settings";
 import { WeatherFlightsCard } from "./today-cards";
@@ -100,11 +102,14 @@ import {
   getItinerary,
   getMe,
   getMoments,
+  publishMoment,
+  type Moment,
   getPhotoComments,
   getPhotoReactions,
   getPhotos,
   getToday,
   getUiSettings,
+  type UiSettings,
   getLoginRoster,
   resetParticipantPassword,
   login,
@@ -319,6 +324,26 @@ function tripLogoUrl(value?: string) {
   }
 }
 
+/**
+ * The logo the header shows (docs/specs/sprint-9/x-trip-logo.md): the one the site resolved (`ui.logo.url`: an
+ * organizer's upload, else the trip file's logo), then a `meta.logo` that is itself an address (an https URL or a
+ * /path, which is all the header ever read it as), then the Kinerary mark.
+ */
+export function headerLogoSource(settings: Pick<UiSettings, "logo"> | undefined, configLogo?: string) {
+  if (settings?.logo?.url) return runtimeUrl(settings.logo.url);
+  return tripLogoUrl(configLogo) || brandMark;
+}
+
+/**
+ * The sign-in page draws before any session, so it asks the public logo route directly and falls back to the
+ * Kinerary mark when the trip has none (404) or the image does not load.
+ */
+export function LoginLogo() {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <img className="login-logo" src={brandLogo} alt="Kinerary" />;
+  return <img className="login-logo is-trip-logo" src={runtimeUrl("/api/trip/logo")} alt="" onError={() => setFailed(true)} />;
+}
+
 function extraLinkLabel(link: NonNullable<ItineraryItem["extra_links"]>[number], lang: Lang) {
   return text(link.label, lang) || text(link.title, lang) || text(link.name, lang) || "Extra";
 }
@@ -373,7 +398,7 @@ function LoginScreen() {
   return (
     <main className="login-shell">
       <section className="login-panel" aria-label="Sign in">
-        <img className="login-logo" src={brandLogo} alt="Kinerary" />
+        <LoginLogo />
         <h1>{copy(lang,"Open your trip","כניסה לטיול")}</h1>
         <p>{copy(lang,"Sign in to see your trip.","היכנסו לצפייה בטיול שלכם.")}</p>
         {roster.length > 0 ? (
@@ -760,7 +785,7 @@ function videoTabLabel(tab: VideoTab, lang: Lang) {
 /** The header of the video layout: logo and title, "<place> · <tab>", the signed-in user and More. */
 export function VideoHero({ config, settings, lang, placePhaseId, pageName, pageKey, active, openVideoTab, openMenu, openAccount, currentUser }: {
   config?: TripConfig;
-  settings?: { hero: { url: string | null; focal_x: number; focal_y: number } };
+  settings?: UiSettings;
   lang: Lang;
   placePhaseId: string;
   /** What the page is called after the dot: the tab, or the module when one is open. */
@@ -776,7 +801,7 @@ export function VideoHero({ config, settings, lang, placePhaseId, pageName, page
 }) {
   const place = text(config?.phases?.find((phase) => phase.id === placePhaseId)?.title, lang);
   const { photo, unavailable } = useHeroPhoto(heroCandidates(config, settings?.hero.url, placePhaseId));
-  const heroLogo = tripLogoUrl(config?.meta?.logo) || brandMark;
+  const heroLogo = headerLogoSource(settings, config?.meta?.logo);
   const heroLogoAlt = config?.meta?.logoAlt || config?.meta?.title || "Trip";
   const backgroundPosition = `${(settings?.hero.focal_x ?? 0.5) * 100}% ${(settings?.hero.focal_y ?? 0.45) * 100}%`;
   // Scroll-linked header (hero-scroll.ts): shrinks to a compact bar going down, stretches when pulled at the top.
@@ -1405,11 +1430,24 @@ export function PhasePlaces({ venues, lang }: {
   );
 }
 
-function MomentsView({ todayDate, lang }: { todayDate?: string; lang: Lang }) {
+// A draft is the author's alone unless it came from the chat or a member's assistant, which organizers can also see (the site decides
+// who is served what; this only says it). A member's own site draft stays "Private draft".
+export function momentDraftLabel(moment: Moment, username: string | undefined, lang: Lang) {
+  // Used only while the trip has trip_moments_capture on; with it off the label is the one the site always had.
+  if (moment.author !== username) return copy(lang, `Draft by ${moment.author}`, `טיוטה של ${moment.author}`);
+  if (moment.source === "chat" || moment.source === "connector") return copy(lang, "Draft — you and the organizers can see it", "טיוטה — אתם והמארגנים יכולים לראות אותה");
+  return copy(lang, "Private draft", "טיוטה פרטית");
+}
+
+export function MomentsView({ todayDate, lang, isOrganizer, username, momentsOn = false }: { todayDate?: string; lang: Lang; isOrganizer?: boolean; username?: string; momentsOn?: boolean }) {
 
   const queryClient = useQueryClient();
   const moments = useQuery({ queryKey: ["moments"], queryFn: getMoments });
   const [caption, setCaption] = useState("");
+  const publish = useMutation({
+    mutationFn: (id: string) => publishMoment(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["moments"] }),
+  });
   const mutation = useMutation({
     mutationFn: () => createMoment({ caption, date: todayDate, visibility: "draft" }),
     onSuccess: () => {
@@ -1434,9 +1472,13 @@ function MomentsView({ todayDate, lang }: { todayDate?: string; lang: Lang }) {
       <div className="moment-feed">
         {(moments.data || []).map((moment) => (
           <article key={moment.id} className="moment-card">
-            <small>{moment.visibility === "draft" ? copy(lang,"Private draft","טיוטה פרטית") : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
+            <small>{moment.visibility === "draft" ? (momentsOn ? momentDraftLabel(moment, username, lang) : copy(lang,"Private draft","טיוטה פרטית")) : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
             <h3>{moment.caption}</h3>
             {moment.body ? <p>{moment.body}</p> : null}
+            {momentsOn && isOrganizer && moment.visibility === "draft" ? (
+              <button type="button" className="ghost" disabled={publish.isPending} onClick={() => publish.mutate(moment.id)}>{copy(lang,"Publish","פרסום")}</button>
+            ) : null}
+            {momentsOn && moment.photo_ids?.length ? <small>{copy(lang,`${moment.photo_ids.length} photo(s)`,`${moment.photo_ids.length} תמונות`)}</small> : null}
           </article>
         ))}
         {!moments.data?.length ? <p className="empty-state">{copy(lang,"No moments yet.","אין רגעים עדיין.")}</p> : null}
@@ -2697,6 +2739,88 @@ function HeroPictureControl({ lang }: { lang: Lang }) {
   );
 }
 
+/**
+ * The trip's logo, changed from a file (docs/specs/sprint-9/x-trip-logo.md): organizer-only at the server
+ * (`POST` and `DELETE /api/ui-settings/logo`, behind the `trip_logo` switch). A preview of what the site shows now, "Choose
+ * image", and "Use the Kinerary logo" to take an upload away. Rendered by the caller only when the switch is on.
+ */
+export function TripLogoControl({ lang, groupPhoto = false }: { lang: Lang; groupPhoto?: boolean }) {
+  const [busy, setBusy] = useState(false);
+  // A logo was just uploaded in this view: the page offers the Telegram group photo too (docs/specs/sprint-9/x-trip-group-photo.md).
+  const [justUploaded, setJustUploaded] = useState(false);
+  const [problem, setProblem] = useState("");
+  const queryClient = useQueryClient();
+  const ui = useQuery({ queryKey: ["ui"], queryFn: getUiSettings });
+  const logo = ui.data?.logo;
+
+  async function send(method: "POST" | "DELETE", body?: FormData) {
+    setBusy(true);
+    setProblem("");
+    try {
+      const token = tokenStore.get();
+      const response = await fetch(runtimeUrl("/api/ui-settings/logo"), {
+        method,
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        body,
+      });
+      if (!response.ok) {
+        setProblem(response.status === 413
+          ? copy(lang, "That image is larger than 8 MB.", "התמונה גדולה מ-8 מגה-בייט.")
+          : response.status === 400
+            ? copy(lang, "That file is not an image the site can use. Choose a PNG, JPEG, WebP or GIF.", "הקובץ אינו תמונה שהאתר יכול להשתמש בה. בחרו PNG, JPEG, WebP או GIF.")
+            : response.status === 409
+              ? copy(lang, "The trip logo is not turned on for this trip.", "לוגו הטיול אינו פעיל בטיול הזה.")
+              : copy(lang, "Could not change the logo. Please try again.", "לא ניתן לשנות את הלוגו. נסו שוב."));
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: ["ui"] });
+      setJustUploaded(method === "POST");
+    } catch {
+      setProblem(copy(lang, "Could not change the logo. Please try again.", "לא ניתן לשנות את הלוגו. נסו שוב."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function choose(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    const body = new FormData();
+    body.set("logo", file);
+    void send("POST", body);
+  }
+
+  return (
+    <div className="trip-logo-control">
+      <h4>{copy(lang, "Trip logo", "לוגו הטיול")}</h4>
+      <div className="trip-logo-row">
+        <img className="trip-logo-preview" src={logo?.url ? runtimeUrl(logo.url) : brandMark} alt={logo?.url ? copy(lang, "The trip's logo", "לוגו הטיול") : copy(lang, "The Kinerary logo", "הלוגו של Kinerary")} />
+        <p className="trip-logo-note">
+          {logo?.source === "upload"
+            ? copy(lang, "Your uploaded logo is showing in the header, on the sign-in page and as the app icon.", "הלוגו שהעליתם מופיע בכותרת, בדף הכניסה וכסמל האפליקציה.")
+            : logo?.source === "config"
+              ? copy(lang, "The logo that came with the trip is showing.", "מוצג הלוגו שהגיע עם הטיול.")
+              : copy(lang, "The Kinerary logo is showing.", "מוצג הלוגו של Kinerary.")}
+        </p>
+      </div>
+      {problem && <p role="alert">{problem}</p>}
+      <label className="upload-control">
+        <Upload size={18} />
+        <span>{busy ? copy(lang, "Uploading…", "מעלה…") : copy(lang, "Choose image", "בחירת תמונה")}</span>
+        <input type="file" aria-label={copy(lang, "Choose image", "בחירת תמונה")} accept="image/png,image/jpeg,image/webp,image/gif" onChange={choose} disabled={busy} />
+      </label>
+      {logo?.source === "upload" && (
+        <button type="button" className="secondary-action" disabled={busy} onClick={() => void send("DELETE")}>
+          {copy(lang, "Use the Kinerary logo", "שימוש בלוגו של Kinerary")}
+        </button>
+      )}
+      <p className="trip-logo-hint">{copy(lang, "A phone that already has the app installed keeps its old icon; a new install gets the new one.", "בטלפון שכבר מותקנת בו האפליקציה הסמל הישן נשאר; התקנה חדשה תקבל את הסמל החדש.")}</p>
+      {groupPhoto ? <GroupPhotoControl lang={lang} offer={justUploaded} hasLogo={Boolean(logo?.url)} /> : null}
+    </div>
+  );
+}
+
 /** Everyone on the trip. On the classic More page, and on the video layout's Account page (#612). */
 function TravellerList({ config, currentUser, lang }: { config?: TripConfig; currentUser?: CurrentUser; lang: Lang }) {
   return (
@@ -2729,14 +2853,14 @@ function TravellerList({ config, currentUser, lang }: { config?: TripConfig; cur
 
 /**
  * The video layout's Account page (#612), top to bottom: the account's own settings (password, picture — `Account`),
- * connecting Claude or ChatGPT (organizers read and write, members read only: the server decides, the block says which),
+ * connecting Claude or ChatGPT (organizers read and write, members read only apart from their own trip moments and photos where the trip allows it: the server decides, the block says which),
  * and who is on the trip. Everyone sees all three.
  */
 export function AccountPage({ config, currentUser, lang }: { config?: TripConfig; currentUser?: CurrentUser; lang: Lang }) {
   return (
     <div className="account-page">
       <Account currentUser={currentUser} lang={lang} />
-      <AssistantConnect lang={lang} tripName={typeof config?.meta?.title === "string" ? config.meta.title : undefined} />
+      <AssistantConnect lang={lang} momentsOn={featureOn(config, "trip_moments_capture")} tripName={typeof config?.meta?.title === "string" ? config.meta.title : undefined} />
       <TravellerList config={config} currentUser={currentUser} lang={lang} />
     </div>
   );
@@ -2764,9 +2888,16 @@ export function OrganizerSettings({ config, isOrganizer, lang }: { config?: Trip
           <GroupLineToggle lang={lang} />
         </section>
       ) : null}
+      {featureOn(config, "chat_photos_to_album") || featureOn(config, "trip_moments_capture") ? (
+        <section className="organizer-tools" aria-labelledby="os-chat-photos">
+          <h3 id="os-chat-photos">{copy(lang,"Trip photos from the chat","תמונות הטיול מהצ'אט")}</h3>
+          <ChatPhotosSettings lang={lang} autosaveOn={featureOn(config, "chat_photos_to_album")} momentsOn={featureOn(config, "trip_moments_capture")} />
+        </section>
+      ) : null}
       <section className="organizer-tools" aria-labelledby="os-look">
         <h3 id="os-look">{copy(lang,"Trip look","מראה הטיול")}</h3>
         <HeroPictureControl lang={lang} />
+        {featureOn(config, "trip_logo") ? <TripLogoControl lang={lang} groupPhoto={featureOn(config, "trip_group_photo")} /> : null}
       </section>
     </section>
   );
@@ -2997,6 +3128,14 @@ export default function App() {
     document.documentElement.dir = lang === "he" ? "rtl" : "ltr";
   }, [lang]);
 
+  // An installed app is called for its trip, not "Kinerary" (the manifest does the same for Android and desktop;
+  // iOS reads this tag at the moment a person adds the site to the home screen).
+  const tripTitle = config.data?.meta?.title;
+  useEffect(() => {
+    const tag = document.querySelector('meta[name="apple-mobile-web-app-title"]');
+    if (tag && tripTitle?.trim()) tag.setAttribute("content", [...tripTitle.trim()].slice(0, 12).join("").trim());
+  }, [tripTitle]);
+
   useEffect(() => {
     if (me.data) { const { dashboard_url: _dashboard, ...stored } = me.data; localStorage.setItem("trip-user", JSON.stringify(stored)); } // dashboard_url is per trip and per session: memory only
   }, [me.data]);
@@ -3062,14 +3201,14 @@ export default function App() {
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} onOpenBooking={openBooking} onOpenBookings={() => openVideoTab("bookings")} marks={marks} />,
     journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} focus={journeyFocus} today={today.data} marks={marks} />,
-    moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
+    moments: <MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} username={me.data?.username} momentsOn={featureOn(config.data, "trip_moments_capture")} />,
     more: <AccountPage config={config.data} currentUser={me.data} lang={lang} />, // the old #more address: its parts live on Account now (#612)
   }[activeTab];
   const moduleContent = shownModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} focus={bookingFocus} />,
     map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
     budget: <><BudgetView config={config.data} lang={lang} /><CurrencyConverter lang={lang}/></>,
-    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/><MomentsView todayDate={today.data?.today} lang={lang} /></>,
+    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/><MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} username={me.data?.username} momentsOn={featureOn(config.data, "trip_moments_capture")} /></>,
     readiness: <Readiness config={config.data} lang={lang}/>,
     account: <AccountPage config={config.data} currentUser={me.data} lang={lang} />,
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,
