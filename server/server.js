@@ -1332,6 +1332,11 @@ app.delete('/api/ui-settings/logo', organizerOrAgentRequired, tripLogoSwitchOn, 
   res.json(journey.uiSettings());
 });
 
+// ── The Telegram group's photo, from the trip logo (docs/specs/sprint-9/x-trip-group-photo.md) ─────────────────────
+// The site only keeps the request and hands it to the control plane on request; it never calls Telegram. See server/group-photo.js.
+require('./group-photo').create({ db, effectiveLogo, featureOn })
+  .registerRoutes(app, { organizerOrAgentRequired, internal: controlPlaneAuth.internal });
+
 journey.registerRoutes(app, { authRequired, organizerOrAgentRequired, internal: controlPlaneAuth.internal });
 // GET /api/stops and the stop writes: organizer or agent only — provenance,
 // conflicts and history are never served to a member.

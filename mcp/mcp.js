@@ -566,6 +566,41 @@ mcp.tool('clear_trip_logo',
     return ok({ changed: true, logo: settings.logo });
   });
 
+// ── The trip group's Telegram photo (docs/specs/sprint-9/x-trip-group-photo.md) ──
+// Organizer-only in practice, as for the logo: the site cannot tell WHICH person asked of this server (it authenticates
+// with the trip's key), so the organizer check is the companion's, in the trip-site-operations skill. Both tools check the
+// trip's `trip_group_photo` switch first (the literal true in /api/config's `features`) and, when it is off, request
+// nothing and say so. No tool takes a chat id: the control plane resolves the group from the trip's own binding.
+const NO_GROUP_PHOTO = { changed: false, status: 'feature_off', message: 'The Telegram group photo is not turned on for this trip.' };
+
+mcp.tool('set_group_photo_from_logo',
+  'Ask the trip\'s bot to make the trip logo the photo of the trip\'s Telegram group. ONLY for an organizer who asked for it in their own private chat (not a group, not a member), ' +
+  'and only after you offered it and they said yes: never as a side effect of changing the logo. The bot can do it only if it is an admin of the group with the "Change group info" right; the control plane checks that first. ' +
+  'This only REQUESTS it. The result comes about two minutes later: call get_group_photo_status and report exactly what it says, never "done" before it does. ' +
+  'If the trip does not have this feature, nothing is requested and the answer says so: relay that plainly.', {},
+  async () => {
+    const config = await apiGet('/api/config');
+    if (config?.features?.trip_group_photo !== true) return ok(NO_GROUP_PHOTO);
+    try {
+      return ok({ requested: true, ...(await apiPost('/api/group-photo', {})) });
+    } catch (err) {
+      // The site refuses at once when the trip has no logo: an answer, not a fault.
+      if (/→ 422\b/.test(String(err && err.message)) && /no_logo/.test(String(err && err.message))) {
+        return ok({ requested: false, status: 'no_logo', message: 'This trip has no logo yet. Add one first, then ask again.' });
+      }
+      throw err;
+    }
+  });
+
+mcp.tool('get_group_photo_status',
+  'What happened to the latest request to set the Telegram group photo from the trip logo: status is none, pending, sending, done, bot_lacks_rights, no_group, no_logo, failed or expired, ' +
+  'with a message to relay in plain words. Report exactly that status: "done" only when it says done. If the trip does not have this feature, the answer says so.', {},
+  async () => {
+    const config = await apiGet('/api/config');
+    if (config?.features?.trip_group_photo !== true) return ok(NO_GROUP_PHOTO);
+    return ok(await apiGet('/api/group-photo'));
+  });
+
 // ── Participant management ──────────────────────────────────────────────────
 // These write identity/login data, not trip content — a meaningfully
 // different blast radius than photos/bookings/comments. The underlying

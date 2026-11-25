@@ -4,6 +4,10 @@ import { loadArchitectureProfile, validateBeforeProvider, whatsappPortalSettings
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
 import { startPlanChangePoller } from "./plan-change-poller.js";
+import { startGroupPhotoPoller } from "./group-photo-poller.js";
+import { GROUP_PHOTO_SWITCH, createGroupPhotoReporter } from "./group-photo.js";
+import { featureEnabled } from "./feature-switches.js";
+import { TelegramNotificationAdapter } from "./adapters/telegram.js";
 import { telegramApiRoot } from "./relay/telegram-api.js";
 import { createBotUsernameResolver } from "./bot-username.js";
 import { recoverStaleLeases, recoverExpiredApprovals } from "./job-queue.js";
@@ -331,6 +335,22 @@ const outboxNotification = signup?.notification ?? (outboxBotToken
   : undefined);
 if (outboxNotification && outboxBotToken) {
   const notification = outboxNotification;
+  // The trip group's photo (docs/specs/sprint-9/x-trip-group-photo.md) is set with the SAME bot the outbox sends as, which
+  // is the bot in the trip's bound group. It needs the real Telegram adapter (the fake one has no group to change) and the
+  // gateway road back to the trip's site; without both it is off, and says so once.
+  const groupPhotoApi = notification instanceof TelegramNotificationAdapter ? notification : null;
+  const groupPhoto = groupPhotoApi && portal?.runtimeExchangeKey
+    ? {
+      api: groupPhotoApi,
+      report: createGroupPhotoReporter({ exchangeKey: portal.runtimeExchangeKey, runtimeOrigin: portal.runtimeOrigin }),
+      switchOn: (tripId: string) => featureEnabled(pool, tripId, GROUP_PHOTO_SWITCH, (line) => process.stderr.write(`${line}\n`)),
+    }
+    : undefined;
+  if (!groupPhoto) {
+    process.stderr.write(`${structuredLog("warn", "group_photo.disabled", {
+      reason: !groupPhotoApi ? "the outbox does not send through the Telegram adapter" : "no web profile with runtime_exchange_key_secret_ref",
+    })}\n`);
+  }
   const resolveBotUsername = createBotUsernameResolver({
     configured: profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
     botToken: outboxBotToken,
@@ -354,7 +374,7 @@ if (outboxNotification && outboxBotToken) {
       // nothing logged. The resolver prefers what the deployment states and
       // otherwise asks the bot itself (getMe on the signup token), cached.
       // `publicOrigin` is for the unlink link in the Mini App sign-in notice.
-      { resolveBotUsername, publicOrigin: portal?.publicOrigin ?? null, ...(operatorNoticesChatId ? { operatorNoticesChatId } : {}) },
+      { resolveBotUsername, publicOrigin: portal?.publicOrigin ?? null, ...(operatorNoticesChatId ? { operatorNoticesChatId } : {}), ...(groupPhoto ? { groupPhoto } : {}) },
     )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {
@@ -382,6 +402,20 @@ if (outboxNotification && outboxBotToken) {
     process.stderr.write(`${structuredLog("warn", "plan_change_poll.disabled", {
       reason: "no web profile with runtime_exchange_key_secret_ref: the group line cannot reach any trip site",
     })}\n`);
+  }
+
+  // The group photo's trigger: claims a trip's pending request through the gateway and enqueues it. Started only with the
+  // dispatcher's half (above), so a request is never claimed that this process cannot answer.
+  if (groupPhoto && portal?.runtimeExchangeKey) {
+    startGroupPhotoPoller({
+      db: pool,
+      exchangeKey: portal.runtimeExchangeKey,
+      runtimeOrigin: portal.runtimeOrigin,
+      upstreamHostSuffixes: portal.runtimeUpstreamHostSuffixes,
+      upstreamAllowedHosts: portal.runtimeUpstreamAllowedHosts,
+      report: groupPhoto.report,
+      log: (line) => process.stderr.write(`${line}\n`),
+    });
   }
 }
 

@@ -390,7 +390,8 @@ function registerTripMcp({
       { name: 'kinerary-trip', title: tripTitle(), version: '1.0.0' },
       { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write, memberWrites }))(getPublicConfig()) },
     );
-    registerTools(server, siteClient(req.mcpGrant.username), { write, origin, memberWrites });
+    // `features`: the public config's block, so a tool for a feature the trip does not have is not even listed.
+    registerTools(server, siteClient(req.mcpGrant.username), { write, origin, memberWrites, features: getPublicConfig().features || {} });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     try {

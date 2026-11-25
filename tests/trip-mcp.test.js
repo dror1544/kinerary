@@ -209,6 +209,8 @@ describe('trip MCP — an organizer connects an assistant', () => {
     const names = list.result.tools.map(t => t.name);
     for (const n of ['get_trip_briefing', 'get_bookings', 'add_booking', 'get_phase_plan', 'swap_plan_days', 'add_participant']) assert.ok(names.includes(n), n);
     for (const n of ['reset_participant_password', 'bind_participant_telegram', 'publish_companion_reply', 'add_photo']) assert.ok(!names.includes(n), n);
+    // This trip has no trip_group_photo switch: the connector does not list the group-photo tools (x-trip-group-photo.md AC-4).
+    for (const n of ['set_group_photo_from_logo', 'get_group_photo_status']) assert.ok(!names.includes(n), n);
     const del = list.result.tools.find(t => t.name === 'delete_booking');
     assert.equal(del.annotations.destructiveHint, true);
   });

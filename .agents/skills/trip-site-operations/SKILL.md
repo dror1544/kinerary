@@ -15,6 +15,7 @@ Use when a user asks about the trip website itself: current published data, Tele
 - You need authoritative trip config and the local readonly mirror is missing, stale, or unreadable.
 - You need to connect a Telegram group to the site for Telegram Login.
 - The organizer asks to set, replace or remove the trip's **logo** (see "Workflow: Trip logo").
+- The organizer asks to put the trip logo on the **Telegram group** as its photo (see "Workflow: Telegram group photo").
 - The organizer asks to change the site's main image or a phase hero image.
 
 ## Source priority
@@ -71,6 +72,16 @@ The trip's logo is the small picture in the site's header and on the sign-in pag
 5. **Read back and report.** The tool's answer is the site's own read-back: `logo.source` is `"upload"` once it is stored. Only then tell the organizer what the site now shows: the header, the sign-in page and the browser tab, and the icon of anyone who installs the app from now on. Say plainly that a phone that already has the app installed keeps its old icon. Do not say "done" on a tool error or before you have read `logo.source`.
 6. **A logo made for them.** Only if your toolset really has an image-generation tool (look at your tool list; do not assume). If it has: make **one draft**, show it, ask "Use this as the trip logo?", and upload only after a clear yes in the organizer's own words. Silence or a thumbs-up on something else is not a yes. If it has **no** such tool (every companion on the control-plane VM today), say so plainly: "I can't make images here." Then suggest making one in ChatGPT or Claude and sending it to you, or setting it themselves in the trip site's Organizer settings or through their Claude or ChatGPT trip connection (it gives them an upload link). Never pretend, never describe an image you did not make, never upload a placeholder, an emoji or a screenshot in its place.
 7. **Remove.** Confirm first ("Go back to the Kinerary logo?"), then `clear_trip_logo`. Report from its answer: the site now shows the logo the trip was built with if it has one, else the Kinerary mark.
+8. **Offer the group photo.** After a logo is stored, and only if the trip has the Telegram group photo feature, **offer** it in one line ("Want the Telegram group to use it as its photo too?") and stop. Do not ask the tools anything about it until the organizer says yes (see "Workflow: Telegram group photo").
+
+## Workflow: Telegram group photo
+The bot can set the trip group's Telegram photo from the trip logo, **on request**, never as a side effect of a logo change. Tools: `mcp__trip_mcp__set_group_photo_from_logo` (no arguments) and `mcp__trip_mcp__get_group_photo_status` (no arguments). Neither takes a chat id: the control plane finds the group from the trip's own binding.
+1. **Who may ask.** Only an organizer, and only in their own private chat; the check is yours, as for the logo (read the organizers from `get_agent_brief`). From a member, or in the group, **refuse, call neither tool, and say who can**, naming the organizers by their display names.
+2. **Ask first.** Offer it after a logo change, or take it when the organizer asks outright ("put the logo as the group photo"). Call `set_group_photo_from_logo` only after a clear yes in their own words. Silence is not a yes.
+3. **Is it on for this trip.** The tools answer `feature_off` and request nothing when the trip does not have it. Relay that plainly; do not promise a date.
+4. **It is a request, not a result.** `set_group_photo_from_logo` only records the request; the control plane checks the bot's rights in the group and sets the photo within about two minutes. Say "I've asked; I'll tell you what happened", never "done". If it answers `no_logo`, tell them there is no logo yet and offer the Trip logo workflow.
+5. **Report the real status.** After a minute or two call `get_group_photo_status` and report exactly its `status`: `done` (the group photo is now the logo), `bot_lacks_rights` (say: make the bot an admin with "Change group info", then ask again; do not retry on your own), `no_group` (no Telegram group is connected to this trip), `failed` (Telegram refused; give the `detail`), `expired`, or still `pending`/`sending` (say it is not finished yet and check again later). Never say "done" before the status says `done`. Never try to set a group photo any other way.
+
 
 ## Workflow: voucher / confirmation uploads
 1. Extract the voucher PDF first so you can identify the booking type, phase, supplier, dates, passenger name, and confirmation number.
@@ -103,6 +114,7 @@ The trip's logo is the small picture in the site's header and on the sign-in pag
 - Public-site JS inspection can prove a read path like `/api/config`, but it does **not** prove write access exists.
 - For media changes, avoid implying you changed the site if you only inspected current config.
 - The trip logo is the one image you can change. A member asking for it is refused with the organizers named; an organizer asking for a generated one gets "I can't make images here" when you have no image tool, never a pretend logo.
+- The Telegram group photo is only ever the trip logo, only on an organizer's yes, and its result is whatever `get_group_photo_status` says, in those words.
 - `upload_trip_logo` and `clear_trip_logo` are not the scaffold-time `set_trip_logo` (that one edits the trip file, is LAN-only and is not yours).
 - Summary bookings in `get_config` are not enough for voucher upload; the upload tool needs live booking IDs from `get_bookings`.
 - Itinerary documents can be stale or internally inconsistent; verified flight/move days outrank the document when assigning activities to dates.
@@ -119,6 +131,7 @@ The trip's logo is the small picture in the site's header and on the sign-in pag
 - For content questions, verify the answer against `get_config` fields you actually inspected.
 - For homepage image changes, verify the image after the write, not just the intended source field.
 - For the trip logo, verify `logo.source` is `"upload"` (or the fallback you expected after a removal) in the tool's answer before you report it.
+- For the Telegram group photo, verify with `get_group_photo_status` that its `status` is `done` before you report it.
 - For voucher uploads, verify a successful upload response tied to the intended booking ID.
 - For operational answers, verify the active trip phase/date before finalizing the response.
 - For itinerary imports, verify the affected attraction rows after update/create, and confirm day placement does not contradict the trip’s verified flights/transfers.
