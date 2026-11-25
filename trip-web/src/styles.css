@@ -1301,9 +1301,9 @@ html:has(.video-layout) { scroll-padding-bottom: calc(64px + 12px + 24px + env(s
 }
 
 /* The organizer's trip-logo row (docs/specs/sprint-9/x-trip-logo.md). */
-.trip-logo-control { display: grid; gap: 10px; margin-top: 14px; }
-.trip-logo-control h4 { margin: 0; }
-.trip-logo-row { display: flex; align-items: center; gap: 14px; }
-.trip-logo-preview { width: 64px; height: 64px; object-fit: contain; border-radius: 12px; padding: 5px; background: rgba(14, 143, 134, .08); }
-.trip-logo-note, .trip-logo-hint { margin: 0; color: var(--kit-ink-soft); }
-.trip-logo-hint { font-size: .85rem; }
+.video-layout .trip-logo-control { display: grid; gap: 10px; margin-top: 14px; }
+.video-layout .trip-logo-control h4 { margin: 0; }
+.video-layout .trip-logo-row { display: flex; align-items: center; gap: 14px; }
+.video-layout .trip-logo-preview { width: 64px; height: 64px; object-fit: contain; border-radius: 12px; padding: 5px; background: rgba(14, 143, 134, .08); }
+.video-layout .trip-logo-note, .video-layout .trip-logo-hint { margin: 0; color: var(--kit-ink-soft); }
+.video-layout .trip-logo-hint { font-size: .85rem; }

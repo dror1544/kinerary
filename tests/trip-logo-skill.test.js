@@ -127,3 +127,29 @@ describe('AC-13: the behavioural cases beside the skill', () => {
     assert.deepEqual(draft.expected.turn_2.calls_in_order.map((call) => call.tool), ['upload_trip_logo']);
   });
 });
+
+describe('AC-13: the skill provisioned companions actually carry (familytrip-companion-operations)', () => {
+  const carried = readFileSync(join(HERE, '..', 'profile-templates', 'familytrip-companion', 'templates', 'skills', 'travel', 'familytrip-companion-operations', 'SKILL.md'), 'utf8');
+  const part = section(carried, 'Trip logo');
+
+  test('it has the Trip logo section, naming both tools and the full workflow', () => {
+    for (const name of ['upload_trip_logo', 'clear_trip_logo']) {
+      assert.ok(part.includes(`\`${name}\``), name);
+      assert.ok(mcpSource.includes(`mcp.tool('${name}'`), `${name} is registered in mcp/mcp.js`);
+    }
+    assert.match(part, /trip-site-operations/);
+  });
+
+  test('a member is refused and the organizers are named; an unapproved image is never uploaded; no image tool is said plainly', () => {
+    assert.match(part, /call neither tool and say only an organizer can change the trip logo, naming the organizers/);
+    assert.match(part, /Never call `upload_trip_logo` with an image they have not seen and said yes to/);
+    assert.match(part, /cannot make images here/);
+    assert.match(part, /ChatGPT or Claude/);
+    assert.match(part, /Never pretend, never upload a placeholder/);
+  });
+
+  test('it reads back before reporting and does not claim installed apps changed', () => {
+    assert.match(part, /logo\.source/);
+    assert.match(part, /keeps its old icon/);
+  });
+});

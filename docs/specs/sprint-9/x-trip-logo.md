@@ -182,9 +182,11 @@ approval), then as the default for future trips.
 - **D1 · Group photo — on request.** Was: automatic or on request? The spec in `x-trip-group-photo.md` assumes *on request*: the
   companion and the website offer "also make it the group photo" after a logo change. Recommended, because it
   replaces a photo the family chose and the bot cannot put the old one back.
-- **D2 · App name — the trip title (AC-14).** The installed app is called "Kinerary" on every trip. Should it take the trip's title
-  (short name: first 12 characters)? Recommended yes: a family with two trips installed sees two apps called
-  "Kinerary". The title already shows on the public login page.
+- **D2 · App name — the trip title (AC-14).** Re-decided by Dror on 2026-11-25, after the boundary review
+  corrected the first premise. The title was *not* public before sign-in: the login page shows first names and
+  the logo, not the title. The manifest therefore makes the trip title readable to anyone with the site's
+  address, and Dror accepted that knowingly. The title comes from the allow-listed public projection
+  (`publicConfig(...).meta.title`), never the raw config.
 - **D3 · Generating a logo — (a), no provider now.** No VM companion can generate an image today. (a) Ship without it: the companion
   says it cannot, and the skill uses a tool if one ever appears. (b) Turn on Hermes image generation with a
   provider key in `kinerary-deploy`. That adds a new provider, a cost, and images a model drew that children
