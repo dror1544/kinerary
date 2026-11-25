@@ -146,6 +146,21 @@ test("a redirect from the trip is never followed: 502, and the key went nowhere 
   assert.equal(trips[TRIP_R].seen.length, 1);
 });
 
+// Path mode used to refuse /t/<trip>/api/internal/ with a case-SENSITIVE prefix, and Express (the trip site) ignores case: the same
+// question host mode asks (internalApiPath) is now asked here, so no spelling of it reaches a trip.
+test("every spelling of /api/internal under /t/<trip>/ is 404 and reaches no trip, with or without a session", async () => {
+  const gw = await startGateway();
+  reset();
+  for (const spelling of ["/api/internal/control-plane/session", "/API/internal/control-plane/session", "/Api/Internal/control-plane/participants/bob", "/api/INTERNAL/control-plane/photos", "/%41pi/internal/control-plane/photos", "/api/internal", "/./API/internal/x", "/foo/../Api/Internal/x"]) {
+    for (const method of ["GET", "POST"]) {
+      const response = await fetch(`${gw.origin}/t/${TRIP_D}${spelling}`, { method, redirect: "manual", headers: method === "POST" ? { "content-type": "application/json" } : {}, ...(method === "POST" ? { body: "{}" } : {}) });
+      assert.equal(response.status, 404, `${method} ${spelling}`);
+      assert.deepEqual(await response.json(), { error: "NOT_FOUND" }, `${method} ${spelling}`);
+    }
+  }
+  assert.deepEqual(trips[TRIP_D].seen, [], "nothing reached the trip");
+});
+
 test("an unknown method or path is not a photo route", async () => {
   const gw = await startGateway();
   assert.equal((await fetch(`${gw.origin}/internal/t/${TRIP_D}/photos`, { headers: { "x-api-key": EXCHANGE } })).status, 404);

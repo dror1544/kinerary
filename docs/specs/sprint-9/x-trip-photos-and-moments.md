@@ -178,6 +178,17 @@ L4, quoting rules and staying silent. `trip-site-operations` links to it.
   a switch. Turning the switch on for every trip (`--all`) still asks Dror (standing approval).
 - **The moment turn is the first time the companion gets a turn nobody asked for.** It carries only lines
   already held for context. Its output is bounded: one draft message at most, or silence.
+- **A deliberate exception to "no raw config value is served" (boundary review of Part B, F4).** The site's internal
+  `GET /api/internal/control-plane/photo-settings` returns the trip's participants who have a bound Telegram id, with
+  `telegram_id`, `username`, `name` and `name_en`, and these come from config-seeded data. It is needed for attribution and
+  quoting: the relay checks who may ask for a save and whose words may be quoted against the same roster the album
+  attributes photos by. It is reachable only through `internal()` (the dedicated exchange key, this trip's own id and the
+  owner mapping), so the gateway's per-trip key is the only way in; no member session, no agent key and no
+  `/api/config` path serves it, and it is empty while both switches are off. It is not an allow-list change to
+  `sanitizeConfig()` and must not become one.
+- **The guest name is reserved.** Photos saved for someone who is not a participant are stored under `_guest`. No participant
+  may have that username (the agent's add-participant route refuses it and a trip file that lists it is skipped), and
+  organizers may delete a guest's photo, which a member may not.
 - **Boundary review:** live request/response for AC-5 (a member's tool list and a refused edit of someone
   else's moment), the gateway's internal photo route with a wrong trip key, and AC-9 (no upload with the
   setting off).

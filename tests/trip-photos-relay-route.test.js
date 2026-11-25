@@ -30,7 +30,7 @@ const BASE = '/api/internal/control-plane';
 const JPEG = Buffer.from('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=', 'base64');
 const day = (offset) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
 
-async function withServer(features, fn) {
+async function withServer(features, fn, tweak) {
   const port = await freePort();
   const base = `http://localhost:${port}`;
   const dataDir = mkdtempSync(join(tmpdir(), 'trip-chat-photos-'));
@@ -40,6 +40,7 @@ async function withServer(features, fn) {
   if (features !== undefined) cfg.features = features;
   // The first stop is happening around now, so a photo sent now has a stop to be filed under.
   cfg.phases[0].dates = { start: day(-2), end: day(2) };
+  if (tweak) tweak(cfg);
   writeFileSync(join(tripDir, 'trip.config.json'), JSON.stringify(cfg, null, 2));
   mkdirSync(join(dataDir, 'site'), { recursive: true });
   const manifest = join(dataDir, 'identity.json');
@@ -301,5 +302,52 @@ describe('the settings read and the once-only notice', () => {
       assert.equal(r.body.autosave_notice_pending, false);
       assert.deepEqual(r.body.participants, [], 'with both switches off the roster is not served');
     });
+  });
+});
+
+describe("a guest's photo: who may take it down, and who may be called _guest", () => {
+  const del = (call, headers, id) => call(headers, `/api/photos/${encodeURIComponent(id)}`, { method: 'DELETE' });
+
+  test('an organizer (and the agent key) delete a guest photo; a member gets 403 and it stays; a member still deletes only their own', async () => {
+    await withServer(ON, async ({ send, call, member, organizer, agent, album, files, bindTelegram }) => {
+      await bindTelegram('bob', '4242');
+      const guest1 = (await send({ sender: '999000111', messageKey: '-100:d1' })).body.photo.id;
+      const guest2 = (await send({ sender: '999000111', messageKey: '-100:d2' })).body.photo.id;
+      const bobs = (await send({ sender: '4242', messageKey: '-100:d3' })).body.photo.id;
+      const refused = await del(call, member, guest1);
+      assert.equal(refused.status, 403);
+      assert.deepEqual(refused.body, { error: 'forbidden' });
+      assert.equal((await album()).length, 3, "a member cannot remove a stranger's photo");
+      const gone = await del(call, organizer, guest1);
+      assert.equal(gone.status, 200, gone.text);
+      assert.equal((await del(call, agent, guest2)).status, 200);
+      assert.deepEqual((await album()).map((p) => p.id), [bobs]);
+      assert.equal(files().length, 1, 'the files went with them');
+      // Unchanged: an organizer still cannot delete a MEMBER's photo, and a member deletes their own.
+      assert.equal((await del(call, organizer, bobs)).status, 403);
+      assert.equal((await del(call, member, bobs)).status, 200);
+      console.log(`guest photo: member DELETE -> ${refused.status} ${JSON.stringify(refused.body)}; organizer DELETE -> ${gone.status}`);
+    });
+  });
+
+  test("_guest cannot be a participant: the agent's add-participant route refuses it in any case, and a trip file that lists it is skipped", async () => {
+    await withServer(ON, async ({ call, agent, send, album }) => {
+      for (const username of ['_guest', '_GUEST', ' _guest ']) {
+        const r = await call(agent, '/api/agent/participants', { method: 'POST', body: JSON.stringify({ username, name: 'Mallory' }) });
+        assert.equal(r.status, 400, username);
+        assert.deepEqual(r.body, { error: 'reserved_username' });
+      }
+      const login = await call({}, '/api/auth/login', { method: 'POST', body: JSON.stringify({ username: '_guest', password: '1234' }) });
+      assert.equal(login.status, 401, 'no such account');
+      const saved = await send({ sender: '999000111', messageKey: '-100:d9' });
+      assert.equal(saved.body.photo.guest, true);
+      assert.equal((await album())[0].user.guest, true);
+    });
+    await withServer(ON, async ({ call, send, album }) => {
+      const login = await call({}, '/api/auth/login', { method: 'POST', body: JSON.stringify({ username: '_guest', password: '1234' }) });
+      assert.equal(login.status, 401, 'a trip file naming _guest does not make the account');
+      await send({ sender: '999000111', messageKey: '-100:d8' });
+      assert.equal((await album())[0].user.name_en, 'A guest');
+    }, (cfg) => { cfg.participants.push({ username: '_guest', name: 'Guest', name_en: 'Guest' }); });
   });
 });

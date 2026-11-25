@@ -458,7 +458,17 @@ try {
 } catch (e) { console.error('trip config version snapshot failed:', e.message); }
 
 // ── USER SEED DATA ────────────────────────────────────────────────────────────
-const SEED_USERS = (TRIP_CONFIG.participants || []).map(p => ({
+// The name photos saved from the group for someone who is not a participant are stored under (trip photos and moments, Part B). It
+// is RESERVED: no participant may have it, however the participant is created (the agent's add-participant route, the trip file's
+// own list, the old users.json), because the account that held it would own every guest photo.
+const GUEST_USERNAME = '_guest';
+const SEED_USERS = (TRIP_CONFIG.participants || []).filter((p) => {
+  if (p && p.username === GUEST_USERNAME) {
+    console.error(`trip.config.json: participant username "${GUEST_USERNAME}" is reserved for guests' photos; that entry is skipped`);
+    return false;
+  }
+  return true;
+}).map(p => ({
   username: p.username, name: p.name, name_en: p.name_en,
   telegram_id: p.telegram_id ? String(p.telegram_id) : null,
   age: p.age, family: p.family, color: p.color,
@@ -719,7 +729,7 @@ async function initData() {
       console.log('Migrating users from users.json…');
       const seedMap = Object.fromEntries(SEED_USERS.map(u => [u.username, u.name_en]));
       const tx = db.transaction(() => {
-        for (const u of existing) insert.run(u.username, u.name, seedMap[u.username] || null, null, u.age, u.family, u.color, u.password);
+        for (const u of existing.filter((e) => e.username !== GUEST_USERNAME)) insert.run(u.username, u.name, seedMap[u.username] || null, null, u.age, u.family, u.color, u.password);
       });
       tx();
     } else if (SEED_PASSWORD) {
@@ -1442,6 +1452,7 @@ app.post('/api/agent/participants', mainOrganizerOrAgentRequired, async (req, re
   }
   const uname = String(username).toLowerCase().trim();
   if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
+  if (uname === GUEST_USERNAME) return res.status(400).json({ error: 'reserved_username' });
   // #213: color reaches the classic client's inline `style="background:${color}"`
   // on every participant-carrying surface (RSVP chip, reaction tooltip,
   // pg-avatar/vc-avatar). The renderer now escapes and falls back to a
@@ -2067,7 +2078,6 @@ function pushPhotoToImmich({ filePath, originalName, mime, size, id, phase, now 
 // The relay never names a username. It sends the sender's Telegram id and the site maps it to a participant; an id that maps to
 // nobody (or to a removed participant) is a GUEST, saved only while automatic saving is on and stored under a name no participant
 // can have, which the album shows as "a guest".
-const GUEST_USERNAME = '_guest';
 const CHAT_PHOTO_MAX_BYTES = 20 * 1024 * 1024; // Telegram's own download limit for a bot
 const chatPhotosOn = (_req, res, next) => (featureOn('chat_photos_to_album') ? next() : res.status(409).json({ error: 'feature_off' }));
 
@@ -2247,7 +2257,11 @@ app.get('/api/photos/file/:filename', photoFileAccess, (req, res) => {
 app.delete('/api/photos/:id', authRequired, async (req, res) => {
   const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id);
   if (!photo) return res.status(404).json({ error: 'not_found' });
-  if (photo.username !== req.user.username && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
+  // Anyone may delete their own photo; the agent key and organizers (canReviewDrafts: configured and secondary organizers) may delete a
+  // GUEST's photo, which nobody owns and which a stranger put in an album the whole family, children included, reads. A member still
+  // deletes only their own.
+  const mayDelete = photo.username === req.user.username || req.user.isAgent || (photo.username === GUEST_USERNAME && canReviewDrafts(req));
+  if (!mayDelete) return res.status(403).json({ error: 'forbidden' });
 
   // Delete from Immich
   if (photo.immich_id && IMMICH_URL && IMMICH_KEY) {

@@ -785,7 +785,9 @@ export function createRuntimeGateway() {
         return json(res, 200, { portalUrl: PORTAL_ORIGIN });
       }
       // Internal identity endpoints are exclusively server-to-server.
-      if (suffix.startsWith("/api/internal/")) return json(res, 404, { error: "NOT_FOUND" });
+      // Express (the trip site) ignores case and decodes escapes, so this asks the same question host mode does (internalApiPath): any
+      // spelling of /api/internal, and a path that cannot be read at all, is not found.
+      if (internalApiPath(suffix) !== false) return json(res, 404, { error: "NOT_FOUND" });
 
       let session = decodeSession(cookieValue(req, cookieName(tripId)));
       if (session && session.tripId !== tripId) session = null;
