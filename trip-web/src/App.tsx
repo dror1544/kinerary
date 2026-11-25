@@ -22,6 +22,7 @@ import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { featureOn } from "./features";
 import { GroupLineToggle } from "./group-line";
+import { ChatPhotosSettings } from "./chat-photos";
 import { hasGoChip, mapUrlFor, navUrlFor, wazeUrlFor } from "./nav-links";
 import { useNavApp } from "./trip-settings";
 import { WeatherFlightsCard } from "./today-cards";
@@ -100,6 +101,7 @@ import {
   getItinerary,
   getMe,
   getMoments,
+  publishMoment,
   getPhotoComments,
   getPhotoReactions,
   getPhotos,
@@ -1426,11 +1428,15 @@ export function PhasePlaces({ venues, lang }: {
   );
 }
 
-function MomentsView({ todayDate, lang }: { todayDate?: string; lang: Lang }) {
+export function MomentsView({ todayDate, lang, isOrganizer }: { todayDate?: string; lang: Lang; isOrganizer?: boolean }) {
 
   const queryClient = useQueryClient();
   const moments = useQuery({ queryKey: ["moments"], queryFn: getMoments });
   const [caption, setCaption] = useState("");
+  const publish = useMutation({
+    mutationFn: (id: string) => publishMoment(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["moments"] }),
+  });
   const mutation = useMutation({
     mutationFn: () => createMoment({ caption, date: todayDate, visibility: "draft" }),
     onSuccess: () => {
@@ -1455,9 +1461,13 @@ function MomentsView({ todayDate, lang }: { todayDate?: string; lang: Lang }) {
       <div className="moment-feed">
         {(moments.data || []).map((moment) => (
           <article key={moment.id} className="moment-card">
-            <small>{moment.visibility === "draft" ? copy(lang,"Private draft","טיוטה פרטית") : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
+            <small>{moment.visibility === "draft" ? (isOrganizer ? copy(lang,`Draft by ${moment.author}`,`טיוטה של ${moment.author}`) : copy(lang,"Private draft","טיוטה פרטית")) : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
             <h3>{moment.caption}</h3>
             {moment.body ? <p>{moment.body}</p> : null}
+            {isOrganizer && moment.visibility === "draft" ? (
+              <button type="button" className="ghost" disabled={publish.isPending} onClick={() => publish.mutate(moment.id)}>{copy(lang,"Publish","פרסום")}</button>
+            ) : null}
+            {moment.photo_ids?.length ? <small>{copy(lang,`${moment.photo_ids.length} photo(s)`,`${moment.photo_ids.length} תמונות`)}</small> : null}
           </article>
         ))}
         {!moments.data?.length ? <p className="empty-state">{copy(lang,"No moments yet.","אין רגעים עדיין.")}</p> : null}
@@ -2828,7 +2838,7 @@ function TravellerList({ config, currentUser, lang }: { config?: TripConfig; cur
 
 /**
  * The video layout's Account page (#612), top to bottom: the account's own settings (password, picture — `Account`),
- * connecting Claude or ChatGPT (organizers read and write, members read only: the server decides, the block says which),
+ * connecting Claude or ChatGPT (organizers read and write, members read only apart from their own trip moments and photos where the trip allows it: the server decides, the block says which),
  * and who is on the trip. Everyone sees all three.
  */
 export function AccountPage({ config, currentUser, lang }: { config?: TripConfig; currentUser?: CurrentUser; lang: Lang }) {
@@ -2861,6 +2871,12 @@ export function OrganizerSettings({ config, isOrganizer, lang }: { config?: Trip
         <section className="organizer-tools" aria-labelledby="os-notifications">
           <h3 id="os-notifications">{copy(lang,"Notifications","התראות")}</h3>
           <GroupLineToggle lang={lang} />
+        </section>
+      ) : null}
+      {featureOn(config, "chat_photos_to_album") || featureOn(config, "trip_moments_capture") ? (
+        <section className="organizer-tools" aria-labelledby="os-chat-photos">
+          <h3 id="os-chat-photos">{copy(lang,"Trip photos from the chat","תמונות הטיול מהצ'אט")}</h3>
+          <ChatPhotosSettings lang={lang} autosaveOn={featureOn(config, "chat_photos_to_album")} momentsOn={featureOn(config, "trip_moments_capture")} />
         </section>
       ) : null}
       <section className="organizer-tools" aria-labelledby="os-look">
@@ -3170,14 +3186,14 @@ export default function App() {
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} onOpenBooking={openBooking} onOpenBookings={() => openVideoTab("bookings")} marks={marks} />,
     journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} focus={journeyFocus} today={today.data} marks={marks} />,
-    moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
+    moments: <MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} />,
     more: <AccountPage config={config.data} currentUser={me.data} lang={lang} />, // the old #more address: its parts live on Account now (#612)
   }[activeTab];
   const moduleContent = shownModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} focus={bookingFocus} />,
     map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
     budget: <><BudgetView config={config.data} lang={lang} /><CurrencyConverter lang={lang}/></>,
-    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/><MomentsView todayDate={today.data?.today} lang={lang} /></>,
+    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/><MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} /></>,
     readiness: <Readiness config={config.data} lang={lang}/>,
     account: <AccountPage config={config.data} currentUser={me.data} lang={lang} />,
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,

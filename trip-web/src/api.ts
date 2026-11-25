@@ -450,8 +450,11 @@ export const deletePhoto = (id: string) => api<{ ok: true }>(`/api/photos/${enco
 export const togglePhotoReaction = (photoId: string, emoji: string) => api<{ ok: true; action: "added" | "removed" }>(`/api/reactions/${encodeURIComponent(photoId)}`, { method: "POST", body: JSON.stringify({ emoji }) });
 export const postPhotoComment = (photoId: string, body: string) => api<PhotoComment>(`/api/comments/photo/${encodeURIComponent(photoId)}`, { method: "POST", body: JSON.stringify({ body }) });
 export const deletePhotoComment = (id: number) => api<{ ok: true }>(`/api/comments/photo/${id}`, { method: "DELETE" });
-export const getMoments = () => api<Array<{ id: string; caption: string; body?: string | null; date?: string | null; visibility: string; author: string }>>("/api/moments");
-export const createMoment = (input: { caption: string; body?: string; date?: string; visibility?: "draft" | "published" }) => api("/api/moments", { method: "POST", body: JSON.stringify(input) });
+export type Moment = { id: string; caption: string; body?: string | null; date?: string | null; visibility: string; author: string; photo_ids?: string[]; source?: "site" | "chat" | "connector" };
+export const getMoments = () => api<Moment[]>("/api/moments");
+// An organizer's Publish on a draft (the site refuses anyone who is not the author or an organizer).
+export const publishMoment = (id: string) => api<Moment>(`/api/moments/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ visibility: "published" }) });
+export const createMoment = (input: { caption: string; body?: string; date?: string; visibility?: "draft" | "published"; photo_ids?: string[] }) => api("/api/moments", { method: "POST", body: JSON.stringify(input) });
 export const getHermes = () => api<{ identity: { name: string }; available: boolean; ask_in_telegram: boolean; telegram_username: string | null; verification_freshness: { open_issues: number; checked_at: string } }>("/api/hermes/status");
 export const reportIssue = (input: { title: string; detail?: string; phase_id?: string | null; date?: string | null; item_uid?: string | null; severity?: "info" | "warning" | "critical" }) => api<{ id: string }>("/api/issues/report", { method: "POST", body: JSON.stringify(input) });
 export const getConfirmations = () => api<{ items: Array<{ id: number; type: string; name: string; state: string; next_action?: string | null }> }>("/api/confirmations/summary");

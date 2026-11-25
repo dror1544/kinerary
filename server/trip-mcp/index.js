@@ -1,5 +1,7 @@
 // The trip site's own MCP endpoint, for a trip member's own Claude or ChatGPT:
-// read and write for an organizer, read only for everyone else.
+// read and write for an organizer, read only for everyone else. One exception: while the trip's `trip_moments_capture`
+// switch is on, every member also gets the member-write class (server/trip-mcp/tools.js MEMBER_WRITE_TOOLS: trip moments and
+// the photo upload page), which only calls what the site already lets that member do.
 //
 // Off unless this trip's environment turns it on:
 //   TRIP_MCP_ENABLED=1
@@ -28,6 +30,7 @@ const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = requir
 const { registerTools, buildInstructions, visibleTags } = require('./tools');
 const { renderConfirmationUploadPage } = require('./confirmation-upload-page');
 const { renderLogoUploadPage } = require('./logo-upload-page');
+const { renderPhotoUploadPage } = require('./photo-upload-page');
 const { readConfirmationPdf } = require('./confirmation-readback');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
@@ -80,6 +83,10 @@ function registerTripMcp({
     const t = getPublicConfig().meta?.title;
     return (t && typeof t === 'object' ? t.en || t.he : t) || 'Trip';
   };
+  // Member writes (trip photos and moments) exist only on a trip that has switched `trip_moments_capture` on. The site's own
+  // /api/config says which switches are on, member-visible ones only and only the literal true (a switch nobody recognises is
+  // off): the connector asks the same answer a signed-in member gets, never the raw trip file.
+  const momentsOn = () => getPublicConfig()?.features?.trip_moments_capture === true;
   // The consent page is pre-login, so its language comes from the browser,
   // not from the trip.
   const browserLang = req => (/^he\b|^iw\b/i.test(String(req.headers['accept-language'] || '')) ? 'he' : 'en');
@@ -358,11 +365,12 @@ function registerTripMcp({
   // session can leak into another's, and a restart loses nothing.
   app.post('/mcp', cors, requireAccess, async (req, res) => {
     const write = canWrite(req.mcpGrant);
+    const memberWrites = momentsOn();
     const server = new McpServer(
       { name: 'kinerary-trip', title: tripTitle(), version: '1.0.0' },
-      { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write }))(getPublicConfig()) },
+      { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write, memberWrites }))(getPublicConfig()) },
     );
-    registerTools(server, siteClient(req.mcpGrant.username), { write, origin });
+    registerTools(server, siteClient(req.mcpGrant.username), { write, origin, memberWrites });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     try {
@@ -403,6 +411,21 @@ function registerTripMcp({
     res.set('X-Content-Type-Options', 'nosniff');
     res.set('Referrer-Policy', 'no-referrer');
     res.type('html').send(renderLogoUploadPage({ nonce }));
+  });
+  // The photo upload page a member's assistant hands them (get_photo_upload_link). Like the one above it holds no trip data and no
+  // credential; the browser sends its own site session to the site's established photo and moment routes. For any signed-in member
+  // (the page asks the site who is signed in), and only while the trip's trip_moments_capture switch is on: off, it is not there.
+  app.get('/mcp/upload-photos', noStore, (req, res) => {
+    if (!momentsOn()) return res.status(404).json({ error: 'not_found' });
+    const nonce = crypto.randomBytes(16).toString('base64');
+    res.set('Content-Security-Policy', [
+      "default-src 'none'", "script-src 'nonce-" + nonce + "'", "style-src 'nonce-" + nonce + "'",
+      "connect-src 'self'", "img-src 'self'", "form-action 'none'", "frame-ancestors 'none'", "base-uri 'none'",
+    ].join('; '));
+    res.set('X-Frame-Options', 'DENY');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Referrer-Policy', 'no-referrer');
+    res.type('html').send(renderPhotoUploadPage({ nonce, lang: browserLang(req) }));
   });
   app.options('/mcp', cors);
   // A person who opens the address in a browser (or lands on /modern/mcp,
