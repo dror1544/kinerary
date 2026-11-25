@@ -2997,6 +2997,7 @@ async function announceChange(
   made: ProposeResult,
   language: Language,
   log: (line: string) => void,
+  strings: DispatchStrings,
 ): Promise<boolean> {
   if (made.kind === "no_session") return false;
   const now = await getSessionForChat(deps.db, burst.chatId);
@@ -3026,6 +3027,36 @@ async function announceChange(
       // definite one, which Hebrew needs after "את".
       return tell(uiString("change.uneditable", language)
         .replace("{what}", uiString(made.question === "travelers" ? "change.noun.travellers" : "change.noun.stops", language)));
+    case "noop": {
+      // THE WORDS CHANGE NOTHING that is held (#647): "GU-4471 is the hotel's
+      // confirmation" when the stay already says so. Showing it would be a header,
+      // an empty body and "update?". No draft was made, so nothing waits; the
+      // interview goes on. A follow-up that cancelled out a WAITING change took
+      // that draft with it (`cancelled`): what it displaced is put back.
+      log(structuredLog("info", "interview.change_noop", {
+        session_id: burst.sessionId,
+        merged: made.cancelled !== undefined,
+      }));
+      if (!made.cancelled) return false;
+      // Exactly what the organizer's own "No" does (`settleChange`): the old
+      // preview's buttons come off, they are told it was cancelled, and what the
+      // change displaced comes back.
+      const messageId = shownPreviews.get(made.cancelled.id);
+      if (messageId) {
+        await deps.telegram
+          .editMessageText({
+            chatId: burst.chatId,
+            messageId,
+            text: `${renderDraft(made.cancelled, language).text}\n\n✖ ${uiString("change.cancelled", language)}`,
+            replyMarkup: undefined,
+          })
+          .catch(() => {});
+      }
+      shownPreviews.delete(made.cancelled.id);
+      await deps.telegram.sendMessage({ chatId: burst.chatId, text: uiString("change.cancelled", language) }).catch(() => undefined);
+      await resumeAfterChange(deps, burst.chatId, strings, made.cancelled.displacedPrompt);
+      return true;
+    }
     default: {
       log(structuredLog("info", "interview.change_proposed", {
         session_id: burst.sessionId,
@@ -3853,7 +3884,7 @@ async function runInterpretPath(
   // remembered and comes back when the change is settled.
   let draftShown = false;
   const made = change as ProposeResult | null;
-  if (made) draftShown = await announceChange(deps, burst, made, language, log);
+  if (made) draftShown = await announceChange(deps, burst, made, language, log, strings);
   if (draftShown) return;
 
   if (clarifyTravellers) {

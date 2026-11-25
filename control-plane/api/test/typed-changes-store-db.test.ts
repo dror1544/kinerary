@@ -106,6 +106,32 @@ describe("the waiting draft", opts, () => {
     });
   });
 
+  test("operations that change nothing that is held make no draft at all (#647)", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Kyoto", "2026-05-27", "2026-05-30")]);
+      const restate: Op[] = [{ op: "update_stop", target: { name: "Tokyo" }, fields: { start: "2026-05-19", end: "2026-05-24" } }];
+      const r = await proposeChange(pool, { sessionId: a.sessionId, tripId: a.tripId, interpretationId: id("interp"), ops: restate });
+      assert.deepEqual(r, { kind: "noop" });
+      assert.equal(await getOpenDraft(pool, a.sessionId), null, "nothing waits, so nothing blocks the interview");
+      assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.intake_pending_changes")).rows[0].n, 0);
+    });
+  });
+
+  test("a follow-up that cancels out the waiting change cancels the draft and hands it back (#647)", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Kyoto", "2026-05-27", "2026-05-30")]);
+      const first = await propose(pool, a, tokyoEnd25);
+      assert.equal(first.kind, "created");
+      // The same target again, back to what is held: the follow-up replaces the waiting operation.
+      const undo: Op[] = [{ op: "update_stop", target: { name: "Tokyo" }, fields: { end: "2026-05-24" } }];
+      const r = await proposeChange(pool, { sessionId: a.sessionId, tripId: a.tripId, interpretationId: id("interp"), ops: undo });
+      assert.equal(r.kind, "noop");
+      assert.equal(r.kind === "noop" ? r.cancelled?.id : null, first.draft.id);
+      assert.equal(await getOpenDraft(pool, a.sessionId), null);
+      assert.equal((await getDraft(pool, first.draft.id))?.status, "cancelled");
+    });
+  });
+
   test("an interpretation seen twice is one draft — including a replay after the draft was applied", async () => {
     await withChats(async (pool, a) => {
       await hold(pool, a, "phases", [stop("Tokyo", "2026-05-19", "2026-05-24")]);
