@@ -2101,7 +2101,13 @@ export interface SessionView {
   selections: Record<string, string[]>;
   /** Document answers waiting on "is this right?", by question id. */
   suggestions: Record<string, SuggestedAnswer>;
-  /** The stops were declined as "the only stop" (#438, AC-12): asked as an open question, not for the place and dates again. */
+  /**
+   * The destination and both dates are on record, so the stops question is asked for more detail on the trip - the
+   * stops in order, the flights, where they stay - and never for the place and the dates again (#438, AC-12; and the
+   * 2026-11-25 staging run, where a destination in Hebrew script could not be offered as "the only stop" and the plain
+   * "where are you going, and when?" was asked over a card that already said). Whether the offer was declined does not
+   * matter: the question is the same either way.
+   */
   stopsAskedFromKnown?: boolean;
   /** Buttons for text questions drawn from the record (the roster, for the organizer), by question id. */
   choices?: Record<string, RosterChoice[]>;
@@ -4143,6 +4149,18 @@ export function knownStopSuggestion(answers: AnswerStore, ui: InterviewUiState =
 }
 
 /**
+ * The destination and both dates are on record as a place and a real range of days. Unlike `knownStopSuggestion` it says
+ * nothing of whether the stop could be OFFERED (a destination written only in a non-Latin script cannot be): what is
+ * asked is whether the stops question may still ask "where, and when?", and it may not.
+ */
+export function tripPlaceAndDatesKnown(answers: AnswerStore): boolean {
+  const place = textAnswer(answers, "destination")?.trim() ?? "";
+  const start = textAnswer(answers, "departure_date")?.trim() ?? "";
+  const end = textAnswer(answers, "return_date")?.trim() ?? "";
+  return place !== "" && knownStopConfirmText(place, start, end, "en") !== null && end >= start;
+}
+
+/**
  * "Is that the only stop?" (#438, AC-12). Once the destination and both dates are on record -- seeded from the card or
  * typed -- the stops question starts from them instead of asking for the place and the dates a second time. A document's
  * own suggestion for the stops (read from evidence) wins; an answer already on record, or a no, leaves the question as
@@ -4216,7 +4234,7 @@ function buildSessionView(
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
     suggestions: withKnownStopSuggestion(withOrganizerNameSuggestion(ui.suggestions ?? {}, answers, ui), answers, ui, language),
-    stopsAskedFromKnown: ui.knownStopDeclined === true && knownStopSuggestion(answers, ui, language) !== null,
+    stopsAskedFromKnown: tripPlaceAndDatesKnown(answers),
     choices: recordChoices(answers),
     subjects: recordSubjects(answers),
     unsettled: unsettledAnswers(answers),

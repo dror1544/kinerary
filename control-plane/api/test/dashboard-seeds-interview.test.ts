@@ -665,7 +665,7 @@ describe("AC-9 the organizer's name offers a one-tap confirm on the roster", { s
 
 describe("AC-12 the stops question starts from the known place and dates", { skip }, () => {
   const confirmEn = "You're going to Japan, April 12, 2027 – April 26, 2027. Is that the only stop?";
-  const openEn = "What are the stops, in order, with rough dates — and where you're staying if it's booked?";
+  const openEn = "Tell me more about the trip itself — the stops or places in order with rough dates, the flights, and where you're staying if it's booked.";
 
   /** A session at `phases`: every required question before it answered, the card's destination and dates on record. */
   async function atPhases(opts: { card?: Record<string, unknown>; language?: "en" | "he"; bare?: boolean } = {}) {

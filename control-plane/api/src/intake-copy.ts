@@ -84,6 +84,12 @@ interface QuestionCopy {
    */
   askKnown?: Localised;
   /**
+   * The question's heading over the answer the organizer gave by tapping Yes on the offer built from what is known
+   * ("Is that the only stop?" -> "✅ Japan, April 12 - 26"). `askKnown` says "tell me more", which over a recorded
+   * stop reads as though they had.
+   */
+  knownDone?: Localised;
+  /**
    * Asking again when an answer is on record but does not settle the question
    * (`IntakeQuestion.satisfiedBy`). `{answer}` is what was written (a date as a person would say it).
    */
@@ -147,6 +153,10 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
       he: "לאן אתם הולכים, ומתי? התחנות לפי הסדר, עם תאריכים משוערים — ואיפה אתם ישנים אם כבר הזמנתם.",
     },
     askKnown: {
+      en: "Tell me more about the trip itself — the stops or places in order with rough dates, the flights, and where you're staying if it's booked.",
+      he: "ספרו לי עוד על הטיול עצמו — התחנות או המקומות לפי הסדר עם תאריכים משוערים, הטיסות, ואיפה אתם ישנים אם כבר הזמנתם.",
+    },
+    knownDone: {
       en: "What are the stops, in order, with rough dates — and where you're staying if it's booked?",
       he: "מהן התחנות לפי הסדר, עם תאריכים משוערים — ואיפה אתם ישנים אם כבר הזמנתם?",
     },
@@ -639,7 +649,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     "change.blocked.possibleDuplicate": "Is {name} someone already on the list ({candidates}), or a new traveller? If it's the same person, tell me what to change; if it's someone new, give me their full name.",
     "change.blocked.generic": "I couldn't work out that change. Could you say it again in one sentence?",
     "change.ask.which": "Which one do you mean by \"{name}\"?",
-    "change.ask.whichNone": "I couldn't find \"{name}\" among {noun}. Which one do you mean? You can tap one, or tell me.",
+    "change.ask.whichNone": "I couldn't find \"{name}\" among {noun}, and there is nothing there yet to pick from. Tell me what you meant, or cancel.",
     "change.ask.choose": "Which of these did you mean?",
     "change.noun.stops": "your stops",
     "change.noun.travellers": "your travellers",
@@ -993,7 +1003,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     "change.blocked.possibleDuplicate": "האם {name} כבר ברשימה ({candidates}), או שזה נוסע חדש? אם זה אותו אדם, כתבו מה לשנות; אם זה מישהו חדש, כתבו את שמו המלא.",
     "change.blocked.generic": "לא הצלחתי להבין את השינוי הזה. אפשר לנסח שוב במשפט אחד?",
     "change.ask.which": "למי או למה התכוונתם ב\"{name}\"?",
-    "change.ask.whichNone": "לא מצאתי את \"{name}\" בין {noun}. למי או למה התכוונתם? אפשר ללחוץ על אחד, או לכתוב לי.",
+    "change.ask.whichNone": "לא מצאתי את \"{name}\" בין {noun}, ואין שם עדיין מה לבחור. אפשר לכתוב לי למה התכוונתם, או לבטל.",
     "change.ask.choose": "למה התכוונתם?",
     "change.noun.stops": "התחנות שלכם",
     "change.noun.travellers": "הנוסעים שלכם",
@@ -1242,6 +1252,11 @@ function pick(localised: Localised | undefined, language: Language): string | nu
 /** The question as asked after a no to the offer built from what is known; the plain question where it has none. */
 export function askTextAfterKnownDeclined(question: IntakeQuestion, language: Language = DEFAULT_LANGUAGE): string {
   return pick(INTAKE_COPY[question.id]?.askKnown, language) ?? askText(question, language);
+}
+
+/** The heading over the stop an organizer accepted with Yes (see `QuestionCopy.knownDone`); the plain question where it has none. */
+export function askTextKnownConfirmed(question: IntakeQuestion, language: Language = DEFAULT_LANGUAGE): string {
+  return pick(INTAKE_COPY[question.id]?.knownDone, language) ?? askText(question, language);
 }
 
 /**

@@ -1524,6 +1524,9 @@ function stopsSection(): string[] {
     `  itinerary is open. It does not leave the question unanswered: if the`,
     `  message names where they sleep, propose that stop. "unclear" is for a`,
     `  message that names no place to stay.`,
+    `- A hotel, or any place they will sleep, is the "accommodation" of the stop in that place`,
+    `  ({"name":"…","confirmation":"…"}, the confirmation only if they gave a code): propose the stop`,
+    `  with it inside. A stay named alone is still a stop: the place it is in.`,
     `- A stop with no dates of its own gets none unless it is the only stop, in`,
     `  which case it takes the trip's dates. Never invent a hotel or a date.`,
     ...STOP_HAS_ENGLISH_NAME,
@@ -1547,27 +1550,41 @@ function changesHeld(held: BuildInterpretPromptArgs["heldLists"]): boolean {
  */
 export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): string[] {
   if (!held || !changesHeld(held)) return [];
+  // PER FAMILY. An operation is a change to something HELD, and the model was taught all of them as soon as either
+  // list held anything: with the travellers answered and no stop yet, it read "we sleep at Hotel X in A" as
+  // update_stop on a stop that did not exist, because the same section told it not to propose the stops question
+  // (staging, 2026-11-25). What is not held is answered, not changed.
+  const stopsHeld = held.stops.length > 0;
+  const travellersHeld = held.travellers.length > 0;
+  const both = stopsHeld && travellersHeld;
   const list = (title: string, items: readonly HeldItem[]) =>
     items.length === 0 ? [] : [title, ...items.map((i) => `- ${i.id}: ${i.label}`)];
+  const unheld = (what: string, question: string) => [
+    `The ${what} are not held yet, so there is nothing in them to change. Whatever the message says about them`,
+    `— a place they are going, a hotel or a booking there — answers the "${question}" question, as a proposal,`,
+    `never as an operation.`,
+  ];
   return [
     `CHANGES TO STOPS OR TRAVELLERS ALREADY GIVEN`,
     `The person has already told us these. This is how we hold them now, each under an id:`,
     ...list(`Stops:`, held.stops),
     ...list(`Travellers:`, held.travellers),
+    ...(both ? [] : [``, ...(stopsHeld ? unheld("travellers", "travelers") : unheld("stops", "phases"))]),
     ``,
-    `If the message ADDS to, CHANGES or REMOVES something in one of these two lists, do NOT`,
-    `propose the "phases" or "travelers" question and do NOT write out a list. Instead put the`,
+    `If the message ADDS to, CHANGES or REMOVES something in ${both ? "one of these two lists" : "this list"}, do NOT`,
+    `propose the ${both ? `"phases" or "travelers" question` : `"${stopsHeld ? "phases" : "travelers"}" question`} and do NOT write out a list. Instead put the`,
     `operations in "opsJson", as a JSON array written as a STRING (escape it, as with dataJson).`,
     `One operation per thing they said. Everything the message does not mention stays as it is,`,
-    `so leave it out. If the message changes nothing in these lists, "opsJson" is null.`,
+    `so leave it out. If the message changes nothing in ${both ? "these lists" : "this list"}, "opsJson" is null.`,
     ``,
-    `Every operation that is about an existing entry has a "target": {"id":"s2","name":"Kyoto"}.`,
+    `Every operation that is about an existing entry has a "target": {"id":"${stopsHeld ? "s2" : "t1"}","name":"${stopsHeld ? "Kyoto" : "Ruth"}"}.`,
     `"name" is the name AS THE PERSON WROTE IT — never translate it, never complete it, never`,
     `swap it for the name we hold. "id" is the id from the list above, when one plainly fits.`,
     `If the name they used could be more than one entry (two Ruths), still give the name they`,
     `used: we will ask them which.`,
     ``,
     `The operations — exactly these, with exactly these keys:`,
+    ...(stopsHeld ? [
     `- add_stop  {"op":"add_stop","fields":{"name":"Nara","name_en":"Nara","start":"2026-09-27","end":"2026-09-28"},"after":{"name":"Kyoto"}}`,
     `    "name_en" is the place's common English name, as for every stop; the person's own`,
     `    spelling stays in "name".`,
@@ -1584,21 +1601,27 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `- replace_stop  {"op":"replace_stop","target":{…},"fields":{"name":"Nagoya"}}`,
     `    A DIFFERENT place instead of a listed one: "instead of Hakone we're going to Nagoya".`,
     `- move_stop  {"op":"move_stop","target":{…},"after":{…}}  (or "before")   "Kyoto after Osaka"`,
+    ] : []),
+    ...(travellersHeld ? [
     `- add_traveller  {"op":"add_traveller","fields":{"name":"Ella Cohen","age":9}}`,
     `    Someone joining: "my daughter Ella Cohen, 9, is joining". fields: name, name_en, age, family.`,
     `- update_traveller  {"op":"update_traveller","target":{…},"fields":{"age":71}}   "Ruth is 71"`,
     `- remove_traveller  {"op":"remove_traveller","target":{…}}   "Avi isn't coming"`,
+    ] : []),
+    ...(stopsHeld ? [
     `- choose  {"op":"choose","options":[<operation>,<operation>]}`,
     `    ONLY when the words honestly fit two or three different operations and nothing in the`,
     `    message settles which — the classic is "change Hakone to Nagoya", which could be a rename,`,
     `    a replacement, or one more stop. Give the complete operations as options, most likely`,
     `    first, and we will ask. Never use it to hedge when the message is clear.`,
+    ] : []),
     `Use no other operation, no other key, and never an "additional_visit" flag.`,
     ``,
     `In the reply the operations travel as one escaped string, exactly like dataJson:`,
-    `  ${`"opsJson":${JSON.stringify(JSON.stringify([{ op: "remove_stop", target: { name: "Kyoto" } }]))}`}`,
+    `  ${`"opsJson":${JSON.stringify(JSON.stringify([stopsHeld ? { op: "remove_stop", target: { name: "Kyoto" } } : { op: "remove_traveller", target: { name: "Avi" } }]))}`}`,
     ``,
     `Worked examples. They are illustrations: never copy their names, dates or ages.`,
+    ...(stopsHeld ? [
     `  "actually Tokyo is 20 to 25 September"`,
     `     -> [{"op":"update_stop","target":{"id":"s1","name":"Tokyo"},"fields":{"start":"2026-09-20","end":"2026-09-25"}}]`,
     `  "another three days at the end for Tokyo"`,
@@ -1613,23 +1636,32 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `         {"op":"add_stop","fields":{"name":"Nagoya"}}]}]`,
     `  "we're staying at Hotel X in Kyoto"`,
     `     -> [{"op":"update_stop","target":{"name":"Kyoto"},"fields":{"accommodation":{"name":"Hotel X"}}}]`,
+    ] : []),
+    ...(travellersHeld ? [
     `  "Ruth is 71"  (there may be two Ruths — give the name as written)`,
     `     -> [{"op":"update_traveller","target":{"name":"Ruth"},"fields":{"age":71}}]`,
     `  "my daughter Ella Cohen, 9, is joining"`,
     `     -> [{"op":"add_traveller","fields":{"name":"Ella Cohen","age":9}}]`,
     `  "Avi isn't coming"`,
     `     -> [{"op":"remove_traveller","target":{"name":"Avi"}}]`,
+    ] : []),
+    ...(stopsHeld ? [
     `  "טוקיו זה מה-20 עד ה-25 בספטמבר"   (Tokyo is 20 to 25 September)`,
     `     -> [{"op":"update_stop","target":{"name":"טוקיו"},"fields":{"start":"2026-09-20","end":"2026-09-25"}}]`,
     `  "עוד שלושה ימים בסוף בטוקיו"   (another three days at the end, in Tokyo)`,
     `     -> [{"op":"add_stop","fields":{"name":"טוקיו"}}]`,
     `  "נישן במלון X בקיוטו"   (we sleep at Hotel X in Kyoto)`,
     `     -> [{"op":"update_stop","target":{"name":"קיוטו"},"fields":{"accommodation":{"name":"X"}}}]`,
+    ] : []),
+    ...(travellersHeld ? [
     `  "רות בת 71"   (Ruth is 71)`,
     `     -> [{"op":"update_traveller","target":{"name":"רות"},"fields":{"age":71}}]`,
+    ] : []),
+    ...(stopsHeld ? [
     `  "אנחנו לא נוסעים לקיוטו"   (we are not going to Kyoto)`,
     `     -> [{"op":"remove_stop","target":{"name":"קיוטו"}}]`,
     `  "שנה את האקונה לנגויה"   (change Hakone to Nagoya) is the same "choose" as above.`,
+    ] : []),
     ``,
   ];
 }
