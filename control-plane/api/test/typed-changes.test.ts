@@ -287,7 +287,10 @@ describe("applyOps — adding, removing, renaming, replacing, moving stops", () 
     const refused = bad(applyOps(twice, [{ op: "update_stop", target: { name: "Tokyo" }, fields: { end: "2026-05-25" } }]));
     assert.deepEqual(refused.unresolved.map((u) => [u.opIndex, u.role, u.candidates]), [[0, "target", [0, 1]]]);
     const missing = bad(applyOps(three(), [{ op: "remove_stop", target: { name: "Nara" } }]));
-    assert.deepEqual(missing.unresolved[0]?.candidates, []);
+    // A name that matches nothing still asks, but with the whole held list to pick from: never an empty "tap one".
+    assert.deepEqual(missing.unresolved[0]?.candidates, [0, 1, 2]);
+    // Nothing held at all: nothing to pick from, and the question says so (typed-changes-render).
+    assert.deepEqual(bad(applyOps({} as AnswerStore, [{ op: "remove_stop", target: { name: "Nara" } }])).unresolved[0]?.candidates, []);
   });
 
   test("references resolve against the HELD list, so operation order cannot change what a name meant", () => {

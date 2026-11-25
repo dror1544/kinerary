@@ -101,7 +101,7 @@ import {
   typedChoiceAnswer,
   applyPendingChangeForChat,
 } from "../interview.js";
-import { draftDigest, heldRefLists, parseOps, questionOfOp, type Op } from "../typed-changes.js";
+import { draftDigest, heldRefLists, parseOps, questionOfOp, stopsAnsweredByOps, type Op } from "../typed-changes.js";
 import {
   cancelDraft,
   getDraft,
@@ -194,7 +194,7 @@ import type { MediaDeps } from "./normalize.js";
 import { PendingAttachments } from "./pending-attachments.js";
 import { GroupContext } from "./group-context.js";
 import {
-  askText, askTextAfterKnownDeclined, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
+  askText, askTextKnownConfirmed, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
   type Language,
 } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
@@ -1031,7 +1031,7 @@ async function applyInterviewCallback(
       }
       if (picked === "too_big") {
         await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("change.droppedTooBig", now.view.language) }).catch(() => {});
-        await resumeAfterChange(deps, decision.chatId, strings, draft.displacedPrompt);
+        await resumeAfterChange(deps, decision.chatId, strings, draft.displacedPrompt, now.view.lastPrompt);
         return;
       }
       if (!picked) {
@@ -2251,7 +2251,7 @@ async function askOpenConflict(view: SessionView, chatId: string, deps: TripBotP
  */
 export function suggestionConfirmedText(question: IntakeQuestion, label: string | null, language: Language, source?: SuggestedAnswer["source"]): string {
   // "Is that the only stop?" answered Yes must not turn into "Where are you going, and when?" over the recorded stop.
-  const asked = source === "known_place" ? askTextAfterKnownDeclined(question, language) : askText(question, language);
+  const asked = source === "known_place" ? askTextKnownConfirmed(question, language) : askText(question, language);
   return `${asked}\n\n✅ ${cutWhole(label ?? "", SUGGESTION_EDIT_LABEL_MAX)}`;
 }
 const SUGGESTION_EDIT_LABEL_MAX = 3000;
@@ -2805,9 +2805,24 @@ async function resumeAfterChange(
   chatId: string,
   strings: DispatchStrings,
   displacedByChange: string | null,
+  /**
+   * What was recorded as on screen when the settling began: the preview's own `pc:` key, for a tap or a typed yes
+   * or no. Given, a prompt that is on screen NOW and was not then was said DURING the settling - the tick scan sees
+   * a tap's floor as the machine's and speaks while the "applied" or "cancelled" notice is still in flight - and it
+   * is what the organizer is looking at: nothing is put back over it. Without this the question went out twice
+   * (staging, 2026-11-25: `q:phases`, cancelled change, twice).
+   */
+  recordedWhenSettling?: string | null,
 ): Promise<void> {
   const before = await getSessionForChat(deps.db, chatId);
   const onScreen = before.ok ? before.view.lastPrompt ?? "" : "";
+  if (recordedWhenSettling?.startsWith("pc:") && onScreen !== "" && !onScreen.startsWith("pc:")) {
+    (deps.log ?? (() => {}))(structuredLog("info", "interview.resume_skipped_spoken_meanwhile", {
+      session_id: before.ok ? before.view.sessionId : null,
+      prompt: onScreen.split(":").slice(0, 2).join(":"),
+    }));
+    return;
+  }
   const displaced = onScreen && !onScreen.startsWith("pc:") ? onScreen : displacedByChange;
   await recordLastPromptForChat(deps.db, chatId, "");
   const now = await getSessionForChat(deps.db, chatId);
@@ -2930,7 +2945,7 @@ async function settleChange(
     await collapse(`✖ ${uiString("change.cancelled", language)}`);
     shownPreviews.delete(draft.id);
     await say(uiString("change.cancelled", language));
-    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt);
+    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt, view.lastPrompt);
     return;
   }
 
@@ -2942,7 +2957,7 @@ async function settleChange(
     await collapse(`✅ ${uiString("change.applied", language)}`);
     shownPreviews.delete(draft.id);
     await say(uiString("change.applied", language));
-    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt);
+    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt, view.lastPrompt);
     return;
   }
   log(structuredLog("info", "interview.change_not_applied", { session_id: view.sessionId, draft_id: draft.id, reason: applied.reason }));
@@ -3695,6 +3710,32 @@ async function runInterpretPath(
     ops = checked?.ok ? checked.ops : undefined;
     opsError = checked && !checked.ok ? checked.error : result.payload.opsError;
     unclear = result.payload.unclear;
+    // NO STOP HELD YET: what the operations say about stops IS the answer to the stops question, not a change to
+    // something that is not there. The reader is told so (`changeSection`); this is what makes it true when it slips
+    // anyway - staging, 2026-11-25, a hotel named at the stops question came back as `update_stop` on a stop nobody
+    // had given, and the organizer was asked "which one do you mean?" with nothing to tap. It travels as the stops
+    // PROPOSAL, before the reading is recorded, so a crash and a replay find it stored like any other.
+    const folded = ops && recorded ? stopsAnsweredByOps(ops, recorded.answers) : null;
+    if (folded) {
+      const already = proposals.some((p) => p.questionId === "phases");
+      if (!already) {
+        proposals = [...proposals, {
+          questionId: "phases",
+          value: { kind: "structured", data: folded.stops },
+          confidence: 0.9,
+          // The organizer's own words: the operations carry no span of their own to check.
+          evidence: sourceText.trim().slice(0, 500),
+          sourceMessageId: messageIds[0] ?? "",
+        }];
+      }
+      ops = folded.rest.length > 0 ? folded.rest : undefined;
+      log(structuredLog("info", "interview.stop_ops_read_as_answer", {
+        session_id: burst.sessionId,
+        stops: folded.stops.length,
+        left_as_changes: folded.rest.length,
+        reader_also_proposed_stops: already,
+      }));
+    }
     // THE DRAFT FIRST. It is keyed by this interpretation, so making it twice is
     // one draft; and until it exists nothing below may be recorded as done — a
     // crash between the two used to lose the change for good, because the reading
