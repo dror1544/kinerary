@@ -18,7 +18,9 @@ const STRINGS = {
     callsItself: 'calls itself',
     shared: 'Everything it reads — including notes about travellers, such as health needs — is sent to the company that runs that assistant.',
     can: 'It will be able to read the trip and change bookings, the plan, the budget and participants — the same things you can do on the site. You can disconnect it at any time from the site\'s menu.',
-    canRead: 'It will be able to read the trip — the plan, bookings, budget and what others posted — but not change the plan, bookings or budget. Where the trip allows it, it can also add trip moments and photos for you, and change or delete the ones you added. You can disconnect it at any time from the site\'s menu.',
+    canRead: 'It will be able to read the trip — the plan, bookings, budget and what others posted — but not change anything. You can disconnect it at any time from the site\'s menu.',
+    wantsMoments: 'wants to read this trip as you, and add your trip moments and photos',
+    canMoments: 'It will be able to read the trip — the plan, bookings, budget and what others posted. It will also be able to add trip moments and photos in your name, and change or delete the ones you added. It cannot change the plan, bookings or budget, and it cannot publish what the trip assistant wrote. Everything it adds is read by the whole family once published, children included. You can disconnect it at any time from the site\'s menu.',
     signIn: 'Sign in with your trip account',
     username: 'Username', password: 'Password', submit: 'Sign in',
     as: 'Signed in as', other: 'Use a different account',
@@ -34,7 +36,9 @@ const STRINGS = {
     callsItself: 'מציג את עצמו בשם',
     shared: 'כל מה שהוא קורא — כולל הערות על המטיילים, כמו צרכים רפואיים — נשלח לחברה שמפעילה את העוזר הזה.',
     can: 'הוא יוכל לקרוא את הטיול ולשנות הזמנות, את התוכנית, את התקציב ואת המשתתפים — אותם דברים שאתם יכולים לעשות באתר. אפשר לנתק אותו בכל עת מהתפריט באתר.',
-    canRead: 'הוא יוכל לקרוא את הטיול — התוכנית, ההזמנות, התקציב ומה שאחרים כתבו — אבל לא לשנות את התוכנית, ההזמנות או התקציב. כשהטיול מאפשר זאת, הוא יוכל גם להוסיף רגעי טיול ותמונות בשמך, ולשנות או למחוק את מה שהוספת. אפשר לנתק אותו בכל עת מהתפריט באתר.',
+    canRead: 'הוא יוכל לקרוא את הטיול — התוכנית, ההזמנות, התקציב ומה שאחרים כתבו — אבל לא לשנות דבר. אפשר לנתק אותו בכל עת מהתפריט באתר.',
+    wantsMoments: 'מבקש לקרוא את הטיול הזה בשמך ולהוסיף רגעי טיול ותמונות בשמך',
+    canMoments: 'הוא יוכל לקרוא את הטיול — התוכנית, ההזמנות, התקציב ומה שאחרים כתבו. הוא יוכל גם להוסיף רגעי טיול ותמונות בשמך, ולשנות או למחוק את מה שהוספת. הוא לא יוכל לשנות את התוכנית, ההזמנות או התקציב, ולא לפרסם את מה שעוזר הטיול כתב. כל מה שהוא מוסיף ייקרא על ידי כל המשפחה אחרי הפרסום, כולל ילדים. אפשר לנתק אותו בכל עת מהתפריט באתר.',
     signIn: 'התחברו עם חשבון הטיול',
     username: 'שם משתמש', password: 'סיסמה', submit: 'התחברות',
     as: 'מחוברים בתור', other: 'חשבון אחר',
@@ -114,7 +118,7 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
 <script nonce="${nonce}">
 (() => {
   const PARAMS = ${scriptJson(params)};
-  const T = ${scriptJson({ wrong: t.wrong, failed: t.failed, notOrganizer: t.notOrganizer, wants: t.wants, wantsRead: t.wantsRead, can: t.can, canRead: t.canRead })};
+  const T = ${scriptJson({ wrong: t.wrong, failed: t.failed, notOrganizer: t.notOrganizer, wants: t.wants, wantsRead: t.wantsRead, can: t.can, canRead: t.canRead, wantsMoments: t.wantsMoments, canMoments: t.canMoments })};
   const $ = id => document.getElementById(id);
   let session = null;
   const stored = () => { try { return localStorage.getItem('trip-token') || localStorage.getItem('tripToken'); } catch { return null; } };
@@ -130,12 +134,14 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
     if (!me.ok) return false;
     // Organizers grant read and write, everyone else read only; the server
     // decides the same way, this only says it before they click.
-    $('wants').textContent = me.body.is_organizer ? T.wants : T.wantsRead;
-    $('can').textContent = me.body.is_organizer ? T.can : T.canRead;
     session = token; fail('');
     // The trip's name is shown only to someone signed in, and only as the
-    // sanitized /api/config serves it.
+    // sanitized /api/config serves it. Its member-visible switches say whether a member's connection will also be able to add
+    // trip moments and photos (the site decides the same way when it records the approval): the consent text names exactly that.
     const cfg = await json('/api/config', { headers: { authorization: 'Bearer ' + token } });
+    const moments = !me.body.is_organizer && cfg.ok && cfg.body && cfg.body.features && cfg.body.features.trip_moments_capture === true;
+    $('wants').textContent = me.body.is_organizer ? T.wants : moments ? T.wantsMoments : T.wantsRead;
+    $('can').textContent = me.body.is_organizer ? T.can : moments ? T.canMoments : T.canRead;
     const title = cfg.ok && cfg.body && cfg.body.meta && cfg.body.meta.title;
     $('trip').textContent = (title && typeof title === 'object' ? (title[document.documentElement.lang] || title.en || title.he) : title) || '';
     $('who').textContent = me.body.name_en || me.body.name || me.body.username;

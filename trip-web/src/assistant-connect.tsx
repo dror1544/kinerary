@@ -4,7 +4,7 @@ import { api } from "./api";
 import type { Lang } from "./parity-ui";
 
 type Access = "read" | "read_write";
-type Connection = { id: string; username: string; client: string; host?: string | null; access?: Access; connected_at: string; last_used_at: string | null };
+type Connection = { id: string; username: string; client: string; host?: string | null; access?: Access; moments?: boolean; connected_at: string; last_used_at: string | null };
 type ConnectionState = { enabled: false } | { enabled: true; url: string; access: Access; connections: Connection[] };
 
 const copy = (lang: Lang, en: string, he: string) => (lang === "he" ? he : en);
@@ -109,7 +109,7 @@ export function AssistantConnect({ lang, tripName }: { lang: Lang; tripName?: st
                   <strong>{c.client}</strong>{" "}
                   <small>
                     {c.host && c.host !== c.client ? `${c.host} · ` : ""}@{c.username} ·{" "}
-                    {c.access === "read_write" ? copy(lang, "read and change", "קריאה ושינוי") : copy(lang, "read only, plus your own moments and photos where the trip allows", "קריאה בלבד, ובנוסף הרגעים והתמונות שלכם כשהטיול מאפשר")} ·{" "}
+                    {c.access === "read_write" ? copy(lang, "read and change", "קריאה ושינוי") : c.moments ? copy(lang, "read, plus your own moments and photos", "קריאה, ובנוסף הרגעים והתמונות שלכם") : copy(lang, "read only", "קריאה בלבד")} ·{" "}
                     {copy(lang, "since", "מאז")} {when(c.connected_at)}
                   </small>
                 </span>

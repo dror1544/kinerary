@@ -1964,6 +1964,7 @@ const photoUpload = multer({
 });
 
 const PHOTO_SOURCES = new Set(['site', 'chat', 'connector']);
+const MEMBER_PHOTO_SOURCES = new Set(['site', 'connector']);
 app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async (req, res) => {
   if (req.photoRejected) return res.status(400).json({ error: 'unsupported_file_type' });
   if (!req.file) return res.status(400).json({ error: 'no_file' });
@@ -1973,10 +1974,13 @@ app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async 
   // `source` says where the photo came from (a closed set). `uploaded_for` is the AGENT KEY's alone: the companion saves a photo a
   // participant sent, so the album shows who took it, not the bot. A member cannot upload as someone else, and a name that is not
   // a participant is refused rather than stored.
+  // `chat` (a photo saved from the trip's group) is the agent key's alone: a member's photo is `site` or `connector`.
   const source = req.body?.source === undefined ? 'site' : req.body.source;
-  if (!PHOTO_SOURCES.has(source)) return refuse(400, 'invalid_source');
+  if (!(req.user.isAgent ? PHOTO_SOURCES : MEMBER_PHOTO_SOURCES).has(source)) return refuse(400, 'invalid_source');
   let owner = req.user.username;
-  if (req.body?.uploaded_for !== undefined) {
+  // With the trip's `chat_photos_to_album` switch off the agent's uploaded_for is not part of the API: the photo is the caller's,
+  // as before. A member's is refused either way.
+  if (req.body?.uploaded_for !== undefined && (!req.user.isAgent || featureOn('chat_photos_to_album'))) {
     if (!req.user.isAgent) return refuse(403, 'uploaded_for_agent_only');
     const target = typeof req.body.uploaded_for === 'string' ? getUser(req.body.uploaded_for) : null;
     // A removed participant keeps their row (their history stays), but nothing new is written in their name.

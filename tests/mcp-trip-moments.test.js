@@ -133,8 +133,22 @@ describe('switch OFF (the default): the moment tools change and read nothing, an
     });
   });
 
-  test('add_photo\'s new fields are ungated: they are plain arguments of the album upload', async () => {
+  test('F2: with chat_photos_to_album off the agent\'s uploaded_for is not part of the API: the photo is the agent\'s, as before', async () => {
     const saved = json(await mcpCallTool('add_photo', { filePath: ctx.file, uploaded_for: 'bob', source: 'chat' }));
-    assert.equal(saved.photo.username, 'bob');
+    assert.equal(saved.photo.username, 'hermes');
+    assert.equal(saved.photo.source, 'chat', 'the source label itself is just a label and is kept');
+  });
+
+  test('F2: with trip_moments_capture off nobody gets another person\'s drafts, whatever their source: exactly as before the feature', async () => {
+    const draft = await (await api('/api/moments', { method: 'POST', token: ctx.bob, body: { caption: 'Bob connector draft, switch off', source: 'connector' } })).json();
+    assert.ok(!(await (await api('/api/moments', { token: ctx.alice })).json()).some((m) => m.id === draft.id), 'organizer');
+    assert.ok(!(await (await api('/api/moments', { apiKey: 'test-hermes-key' })).json()).some((m) => m.id === draft.id), 'agent key');
+    assert.ok((await (await api('/api/moments', { token: ctx.bob })).json()).some((m) => m.id === draft.id), 'its author');
+  });
+
+  test('F2: with trip_moments_capture off the agent\'s author is ignored too (the tool answers first; the site route does the same)', async () => {
+    const res = await api('/api/moments', { method: 'POST', apiKey: 'test-hermes-key', body: { caption: 'Off', author: 'bob', source: 'chat' } });
+    assert.equal(res.status, 201);
+    assert.equal((await res.json()).author, 'hermes');
   });
 });

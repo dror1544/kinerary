@@ -25,7 +25,7 @@ const express = require('express');
 const fetch = require('node-fetch');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
-const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE, READ_SCOPE } = require('./oauth');
+const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE, READ_SCOPE, MOMENTS_SCOPE } = require('./oauth');
 const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
 const { registerTools, buildInstructions, visibleTags } = require('./tools');
 const { renderConfirmationUploadPage } = require('./confirmation-upload-page');
@@ -78,6 +78,9 @@ function registerTripMcp({
   const isParticipant = username => userExists(username);
   const isOrganizer = username => organizers().includes(username) && isParticipant(username);
   const canWrite = grant => grant.scope === SCOPE && isOrganizer(grant.username);
+  // The member-write class: an organizer's write connection, or a member's connection approved with the moments scope, and only
+  // while the trip still has the feature on. `trip:read` connections never have it.
+  const canMoments = grant => momentsOn() && (canWrite(grant) || grant.scope === MOMENTS_SCOPE);
   // For an already-authenticated organizer only (the MCP server's own name).
   const tripTitle = () => {
     const t = getPublicConfig().meta?.title;
@@ -120,7 +123,7 @@ function registerTripMcp({
   const protectedResource = (_req, res) => res.json({
     resource: mcpUrl,
     authorization_servers: [origin],
-    scopes_supported: [SCOPE, READ_SCOPE],
+    scopes_supported: [SCOPE, READ_SCOPE, MOMENTS_SCOPE],
     bearer_methods_supported: ['header'],
   });
   app.all(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'], cors, protectedResource);
@@ -135,7 +138,7 @@ function registerTripMcp({
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
     revocation_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
-    scopes_supported: [SCOPE, READ_SCOPE],
+    scopes_supported: [SCOPE, READ_SCOPE, MOMENTS_SCOPE],
     authorization_response_iss_parameter_supported: true,
   }));
 
@@ -256,7 +259,9 @@ function registerTripMcp({
     if (b.decision !== 'allow') return res.json({ redirect_to: redirectWith(v.redirectUri, { error: 'access_denied', state: v.state }) });
     // Decided here, from who approved — never from the scope the app asked
     // for, which is whatever it chose to send.
-    const scope = isOrganizer(username) ? SCOPE : READ_SCOPE;
+    // A member's connection also gets the member-write class (trip moments and photos), as its own scope, when the trip has the
+    // feature on right now; the consent page said so. A connection approved while it was off never gets it later.
+    const scope = isOrganizer(username) ? SCOPE : (momentsOn() ? MOMENTS_SCOPE : READ_SCOPE);
     const code = store.createCode({
       clientId: v.client.client_id, username, redirectUri: v.redirectUri,
       codeChallenge: v.codeChallenge, resource: v.resource, scope,
@@ -365,7 +370,7 @@ function registerTripMcp({
   // session can leak into another's, and a restart loses nothing.
   app.post('/mcp', cors, requireAccess, async (req, res) => {
     const write = canWrite(req.mcpGrant);
-    const memberWrites = momentsOn();
+    const memberWrites = canMoments(req.mcpGrant);
     const server = new McpServer(
       { name: 'kinerary-trip', title: tripTitle(), version: '1.0.0' },
       { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write, memberWrites }))(getPublicConfig()) },
@@ -466,6 +471,9 @@ function registerTripMcp({
             client: g.client_name || host || 'Unknown app',
             host,
             access: canWrite(g) ? 'read_write' : 'read',
+            // Whether this connection can also add and change the member's own trip moments and photos (a member's `read`
+            // connection made while the feature was on): said, so the list never calls it plain read-only.
+            moments: canMoments(g),
             connected_at: new Date(g.created_at * 1000).toISOString(),
             last_used_at: g.last_used_at ? new Date(g.last_used_at * 1000).toISOString() : null,
           };

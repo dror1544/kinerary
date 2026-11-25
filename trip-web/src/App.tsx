@@ -102,6 +102,7 @@ import {
   getMe,
   getMoments,
   publishMoment,
+  type Moment,
   getPhotoComments,
   getPhotoReactions,
   getPhotos,
@@ -1428,7 +1429,15 @@ export function PhasePlaces({ venues, lang }: {
   );
 }
 
-export function MomentsView({ todayDate, lang, isOrganizer }: { todayDate?: string; lang: Lang; isOrganizer?: boolean }) {
+// A draft is the author's alone unless it came from the chat or a member's assistant, which organizers can also see (the site decides
+// who is served what; this only says it). A member's own site draft stays "Private draft".
+export function momentDraftLabel(moment: Moment, username: string | undefined, lang: Lang) {
+  if (moment.author !== username) return copy(lang, `Draft by ${moment.author}`, `טיוטה של ${moment.author}`);
+  if (moment.source === "chat" || moment.source === "connector") return copy(lang, "Draft — you and the organizers can see it", "טיוטה — אתם והמארגנים יכולים לראות אותה");
+  return copy(lang, "Private draft", "טיוטה פרטית");
+}
+
+export function MomentsView({ todayDate, lang, isOrganizer, username }: { todayDate?: string; lang: Lang; isOrganizer?: boolean; username?: string }) {
 
   const queryClient = useQueryClient();
   const moments = useQuery({ queryKey: ["moments"], queryFn: getMoments });
@@ -1461,7 +1470,7 @@ export function MomentsView({ todayDate, lang, isOrganizer }: { todayDate?: stri
       <div className="moment-feed">
         {(moments.data || []).map((moment) => (
           <article key={moment.id} className="moment-card">
-            <small>{moment.visibility === "draft" ? (isOrganizer ? copy(lang,`Draft by ${moment.author}`,`טיוטה של ${moment.author}`) : copy(lang,"Private draft","טיוטה פרטית")) : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
+            <small>{moment.visibility === "draft" ? momentDraftLabel(moment, username, lang) : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
             <h3>{moment.caption}</h3>
             {moment.body ? <p>{moment.body}</p> : null}
             {isOrganizer && moment.visibility === "draft" ? (
@@ -3186,14 +3195,14 @@ export default function App() {
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} onOpenBooking={openBooking} onOpenBookings={() => openVideoTab("bookings")} marks={marks} />,
     journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} focus={journeyFocus} today={today.data} marks={marks} />,
-    moments: <MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} />,
+    moments: <MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} username={me.data?.username} />,
     more: <AccountPage config={config.data} currentUser={me.data} lang={lang} />, // the old #more address: its parts live on Account now (#612)
   }[activeTab];
   const moduleContent = shownModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} focus={bookingFocus} />,
     map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
     budget: <><BudgetView config={config.data} lang={lang} /><CurrencyConverter lang={lang}/></>,
-    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/><MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} /></>,
+    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/><MomentsView todayDate={today.data?.today} lang={lang} isOrganizer={me.data?.is_organizer} username={me.data?.username} /></>,
     readiness: <Readiness config={config.data} lang={lang}/>,
     account: <AccountPage config={config.data} currentUser={me.data} lang={lang} />,
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,

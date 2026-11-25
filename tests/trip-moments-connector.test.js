@@ -17,10 +17,12 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
-import { startTestServer, stopTestServer, loginAsAlice, api } from './helpers/server.js';
+import { startTestServer, stopTestServer, loginAsAlice, api, testTripDir } from './helpers/server.js';
 import { freePort } from './helpers/port-guard.js';
 
 const require = createRequire(import.meta.url);
+const Database = require('../server/node_modules/better-sqlite3');
+import { dirname, join } from 'node:path';
 const { MEMBER_WRITE_TOOLS } = require('../server/trip-mcp/tools.js');
 const CLAUDE_CALLBACK = 'https://claude.ai/api/mcp/auth_callback';
 const PIXEL = Buffer.from('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=', 'base64');
@@ -39,6 +41,7 @@ function harness(base) {
   const json = (path, body, headers = {}) => fetch(base + path, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
   const authParams = () => ({ client_id: client.client_id, redirect_uri: CLAUDE_CALLBACK, response_type: 'code', code_challenge: challenge, code_challenge_method: 'S256', state: 'st', resource: `${base}/mcp` });
   return {
+    get clientId() { return client.client_id; },
     async register() {
       const r = await json('/oauth/register', { client_name: 'Claude', redirect_uris: [CLAUDE_CALLBACK], token_endpoint_auth_method: 'none', grant_types: ['authorization_code', 'refresh_token'] });
       assert.equal(r.status, 201);
@@ -72,7 +75,7 @@ async function boot(features) {
   const bob = (await (await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } })).json()).token;
   const h = harness(base);
   await h.register();
-  return { base, alice, bob, h };
+  return { base, alice, bob, h, get clientId() { return h.clientId; } };
 }
 
 describe('switch OFF (the default): the connector is exactly what it was', () => {
@@ -83,6 +86,8 @@ describe('switch OFF (the default): the connector is exactly what it was', () =>
   it('a member\'s tool list equals today\'s, an organizer\'s equals today\'s, and the moment tools are not callable', async () => {
     const member = await ctx.h.connect(ctx.bob);
     const organizer = await ctx.h.connect(ctx.alice);
+    assert.equal(member.scope, 'trip:read', 'with the switch off a member\'s connection is the plain read scope');
+    assert.equal(organizer.scope, 'trip', 'an organizer\'s scope is unchanged');
     assert.deepEqual(await names(ctx.h, member.access_token), TODAY_MEMBER);
     assert.deepEqual(await names(ctx.h, organizer.access_token), TODAY_ORGANIZER);
     const answer = await call(ctx.h, member.access_token, 'add_moment', { caption: 'nope' });
@@ -111,11 +116,42 @@ describe('AC-5: switch ON — the member-write class, and only it', () => {
   it('the class is the frozen list of five, and a member\'s tool list differs from today\'s by exactly those', async () => {
     assert.deepEqual(sorted(MEMBER_WRITE_TOOLS), CLASS);
     assert.ok(Object.isFrozen(MEMBER_WRITE_TOOLS));
-    assert.equal(member.scope, 'trip:read', 'the grant is still the read scope: the class does not widen it');
+    assert.equal(member.scope, 'trip:moments', 'F3: the class is its own scope, granted at consent time while the switch is on');
+    assert.equal(organizer.scope, 'trip', 'an organizer\'s scope is unchanged');
     assert.deepEqual(sorted(await names(ctx.h, member.access_token)), sorted([...TODAY_MEMBER, ...CLASS]));
     for (const forbidden of ['publish_moment', 'add_booking', 'delete_booking', 'add_plan_item', 'add_budget_item', 'post_venue_comment', 'add_participant', 'get_trip_briefing', 'publish_daily_message', 'set_group_change_line']) {
       assert.ok(!(await names(ctx.h, member.access_token)).includes(forbidden), `${forbidden} must not be offered to a member`);
     }
+  });
+
+  it('F3: a trip:read connection made before keeps exactly today\'s nine tools (and cannot call the class) until its owner reconnects', async () => {
+    const old = await ctx.h.connect(ctx.bob);
+    const db = new Database(join(dirname(testTripDir()), 'trip.db'));
+    try { assert.equal(db.prepare("UPDATE mcp_oauth_grants SET scope = 'trip:read' WHERE rowid = (SELECT MAX(rowid) FROM mcp_oauth_grants WHERE username = 'bob')").run().changes === 1, true); } finally { db.close(); }
+    assert.deepEqual(await names(ctx.h, old.access_token), TODAY_MEMBER, 'exactly the nine, with the switch on');
+    const answer = await call(ctx.h, old.access_token, 'add_moment', { caption: 'old grant' });
+    assert.ok(answer.error || answer.result?.isError);
+    assert.ok(!(await (await api('/api/moments', { token: ctx.bob })).json()).some((m) => m.caption === 'old grant'));
+    const init = await (await ctx.h.rpc(old.access_token, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } })).json();
+    assert.doesNotMatch(init.result.instructions, /moment/i);
+    // The refresh path does not widen it either.
+    const refreshed = await (await fetch(ctx.base + '/oauth/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: old.refresh_token, client_id: ctx.clientId }).toString() })).json();
+    assert.equal(refreshed.scope, 'trip:read');
+    assert.deepEqual(await names(ctx.h, refreshed.access_token), TODAY_MEMBER);
+    // A new approval does get it.
+    assert.deepEqual(sorted(await names(ctx.h, (await ctx.h.connect(ctx.bob)).access_token)), sorted([...TODAY_MEMBER, ...CLASS]));
+  });
+
+  it('F3: /api/mcp/connection says which connections can add moments (a member\'s moments scope: read access, moments true)', async () => {
+    const fresh = await ctx.h.connect(ctx.bob);
+    const mine = (await (await api('/api/mcp/connection', { token: ctx.bob })).json()).connections;
+    assert.ok(mine.length >= 2);
+    assert.ok(mine.every((c) => c.access === 'read'), 'still read access: no site change but moments');
+    assert.ok(mine.some((c) => c.moments === true), 'the fresh moments connection says so');
+    assert.ok(mine.some((c) => c.moments === false), 'the downgraded trip:read connection does not');
+    const org = (await (await api('/api/mcp/connection', { token: ctx.alice })).json()).connections.filter((c) => c.username === 'alice');
+    assert.ok(org.every((c) => c.access === 'read_write'));
+    await fetch(ctx.base + '/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: fresh.refresh_token, client_id: ctx.clientId }).toString() });
   });
 
   it('an organizer\'s list is today\'s plus the class plus publish_moment', async () => {
@@ -328,5 +364,50 @@ describe('AC-6: the photo upload page', () => {
     await b.submit();
     assert.match(b.elements.status.textContent, /photos are saved, but the moment could not be created \(400\)/);
     assert.doesNotMatch(b.elements.status.textContent, /Done/);
+  });
+});
+
+describe('F3: the consent page names exactly what a member\'s connection will be able to do', () => {
+  async function consentText(features, session) {
+    const ctx = await boot(features);
+    try {
+      const authParams = new URLSearchParams({ client_id: ctx.h.clientId, redirect_uri: CLAUDE_CALLBACK, response_type: 'code', code_challenge: 'x'.repeat(43), code_challenge_method: 'S256', state: 's', resource: `${ctx.base}/mcp` });
+      const html = await (await fetch(`${ctx.base}/oauth/authorize?${authParams}`)).text();
+      const start = html.indexOf('<script nonce=');
+      const script = html.slice(html.indexOf('>', start) + 1, html.indexOf('</script>', start));
+      const el = () => ({ textContent: '', hidden: false, value: '', addEventListener() {}, appendChild() {} });
+      const elements = {};
+      const get = (id) => (elements[id] ||= el());
+      const token = session === 'alice' ? ctx.alice : ctx.bob;
+      const context = {
+        document: { documentElement: { lang: 'en' }, getElementById: get, head: { appendChild() {} }, createElement: () => el() },
+        window: { location: { replace() {} } }, localStorage: { getItem: () => token },
+        fetch: (path, options = {}) => fetch(new URL(path, ctx.base), options), JSON, Promise, String, Object,
+      };
+      runInNewContext(script, context);
+      for (let i = 0; i < 100 && !get('wants').textContent; i++) await new Promise((r) => setTimeout(r, 20));
+      return { wants: get('wants').textContent, can: get('can').textContent };
+    } finally { stopTestServer(); }
+  }
+
+  it('switch on, a member is told it can add moments and photos, cannot change the plan or publish the assistant\'s text', async () => {
+    const { wants, can } = await consentText({ trip_moments_capture: true }, 'bob');
+    assert.match(wants, /add your trip moments and photos/);
+    assert.match(can, /add trip moments and photos in your name/);
+    assert.match(can, /cannot change the plan, bookings or budget/);
+    assert.match(can, /cannot publish what the trip assistant wrote/);
+  });
+
+  it('switch off, a member is told it is read-only, exactly as before', async () => {
+    const { wants, can } = await consentText(undefined, 'bob');
+    assert.equal(wants, 'wants to read this trip as you');
+    assert.match(can, /but not change anything/);
+    assert.doesNotMatch(can, /moment/i);
+  });
+
+  it('an organizer\'s consent text is the organizer\'s, switch on or off', async () => {
+    const { wants, can } = await consentText({ trip_moments_capture: true }, 'alice');
+    assert.equal(wants, 'wants to manage this trip as you');
+    assert.match(can, /change bookings, the plan, the budget and participants/);
   });
 });

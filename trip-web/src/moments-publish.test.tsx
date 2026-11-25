@@ -15,7 +15,8 @@ afterEach(() => {
 
 function stub() {
   let rows = [
-    { id: "m1", caption: "Bob's draft", visibility: "draft", author: "bob", photo_ids: ["a", "b"] },
+    { id: "m1", caption: "Bob's draft", visibility: "draft", author: "bob", source: "connector", photo_ids: ["a", "b"] },
+    { id: "m3", caption: "Bob's site draft", visibility: "draft", author: "bob", source: "site", photo_ids: [] },
     { id: "m2", caption: "Already out", visibility: "published", author: "alice", photo_ids: [] },
   ];
   const calls: { method: string; url: string; body: unknown }[] = [];
@@ -34,21 +35,21 @@ function stub() {
   return calls;
 }
 
-const view = (isOrganizer: boolean) => render(
-  <QueryClientProvider client={new QueryClient()}><MomentsView lang="en" isOrganizer={isOrganizer} /></QueryClientProvider>,
+const view = (isOrganizer: boolean, username = isOrganizer ? "alice" : "bob") => render(
+  <QueryClientProvider client={new QueryClient()}><MomentsView lang="en" isOrganizer={isOrganizer} username={username} /></QueryClientProvider>,
 );
 
 describe("moments: an organizer publishes a draft", () => {
   it("shows the draft's author and a Publish button only on drafts, and PATCHes visibility published", async () => {
     const calls = stub();
     view(true);
-    expect(await screen.findByText(/Draft by bob/)).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "Publish" })).toHaveLength(1);
+    expect(await screen.findAllByText(/Draft by bob/)).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Publish" })).toHaveLength(2);
     expect(screen.getByText("2 photo(s)")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Publish" }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Publish" })[0]);
     await waitFor(() => expect(calls.some((c) => c.method === "PATCH")).toBe(true));
     expect(calls.find((c) => c.method === "PATCH")).toMatchObject({ url: "/api/moments/m1", body: { visibility: "published" } });
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Publish" })).toBeNull());
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Publish" })).toHaveLength(1));
   });
 
   it("a member sees no Publish button", async () => {
@@ -56,6 +57,7 @@ describe("moments: an organizer publishes a draft", () => {
     view(false);
     expect(await screen.findByText("Bob's draft")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Publish" })).toBeNull();
+    expect(screen.getByText(/Draft — you and the organizers can see it/)).toBeInTheDocument();
     expect(screen.getByText(/Private draft/)).toBeInTheDocument();
   });
 });

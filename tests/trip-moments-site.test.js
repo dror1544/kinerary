@@ -17,7 +17,7 @@ const AGENT = { apiKey: 'test-hermes-key' };
 const PIXEL = Buffer.from('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=', 'base64');
 let alice, bob, eve;
 before(async () => {
-  await startTestServer({ HOST: '127.0.0.1', PORT: await freePort() });
+  await startTestServer({ HOST: '127.0.0.1', PORT: await freePort() }, { features: { chat_photos_to_album: true, trip_moments_capture: true } });
   alice = await loginAsAlice();
   bob = (await (await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } })).json()).token;
   eve = (await (await api('/api/auth/login', { method: 'POST', body: { username: 'eve', password: '1234' } })).json()).token;
@@ -120,26 +120,80 @@ test('AC-3: a member sees only published moments and their own drafts, unchanged
   assert.ok(bobSees.includes(draft.id) && bobSees.includes(pub.id));
   assert.ok(!bobSees.includes(aliceDraft.id), 'another member\'s draft is not served');
   const aliceSees = (await moments({ token: alice })).map((m) => m.id);
-  assert.ok(aliceSees.includes(draft.id), 'an organizer sees a member\'s draft (so an organizer can publish it)');
+  assert.ok(!aliceSees.includes(draft.id), 'a draft a member wrote on the site stays theirs alone: an organizer does not get it');
   assert.ok(aliceSees.includes(aliceDraft.id) && aliceSees.includes(pub.id));
 });
 
-test('drafts: an organizer and the agent key see every moment; another member sees only published ones and their own', async () => {
-  const bobDraft = await (await moment({ caption: 'Bob draft for organizers' }, { token: bob })).json();
-  const aliceDraft = await (await moment({ caption: 'Alice draft only for alice and organizers' }, { token: alice })).json();
+test('F2: an organizer and the agent see chat and connector drafts only; a site draft stays its author\'s; a third member sees none', async () => {
+  const siteDraft = await (await moment({ caption: 'Bob site draft' }, { token: bob })).json();
+  const connectorDraft = await (await moment({ caption: 'Bob connector draft', source: 'connector' }, { token: bob })).json();
+  const aliceDraft = await (await moment({ caption: 'Alice draft' }, { token: alice })).json();
   const chatDraft = await (await moment({ caption: 'Chat draft for bob', author: 'bob', source: 'chat' }, AGENT)).json();
   const ids = async (extra) => (await moments(extra)).map((m) => m.id);
   const organizer = await ids({ token: alice });
-  assert.ok([bobDraft.id, aliceDraft.id, chatDraft.id].every((id) => organizer.includes(id)), 'organizer: all drafts');
+  assert.ok(organizer.includes(connectorDraft.id) && organizer.includes(chatDraft.id), 'organizer: connector and chat drafts');
+  assert.ok(!organizer.includes(siteDraft.id), 'organizer: NOT a member\'s site draft');
+  assert.ok(organizer.includes(aliceDraft.id), 'organizer: their own');
   const agent = await ids(AGENT);
-  assert.ok([bobDraft.id, aliceDraft.id, chatDraft.id].every((id) => agent.includes(id)), 'agent key: all drafts');
+  assert.ok(agent.includes(connectorDraft.id) && agent.includes(chatDraft.id), 'agent key: connector and chat drafts');
+  assert.ok(!agent.includes(siteDraft.id), 'agent key: NOT a member\'s site draft');
   const bobSees = await ids({ token: bob });
-  assert.ok(bobSees.includes(bobDraft.id) && bobSees.includes(chatDraft.id), 'bob sees his own drafts, including the one written in his name');
+  assert.ok([siteDraft.id, connectorDraft.id, chatDraft.id].every((id) => bobSees.includes(id)), 'bob sees his own drafts, including the one written in his name');
   assert.ok(!bobSees.includes(aliceDraft.id), 'a member never sees another member\'s draft');
   const eveSees = await ids({ token: eve });
-  assert.ok(![bobDraft.id, aliceDraft.id, chatDraft.id].some((id) => eveSees.includes(id)), 'a third member sees none of the drafts');
-  assert.equal((await api(`/api/moments/${bobDraft.id}`, { method: 'PATCH', body: { visibility: 'published' }, token: alice })).status, 200, 'the organizer publishes it');
-  assert.ok((await ids({ token: eve })).includes(bobDraft.id), 'and then everyone sees it');
+  assert.ok(![siteDraft.id, connectorDraft.id, chatDraft.id, aliceDraft.id].some((id) => eveSees.includes(id)), 'a third member sees none of the drafts');
+  assert.equal((await api(`/api/moments/${connectorDraft.id}`, { method: 'PATCH', body: { visibility: 'published' }, token: alice })).status, 200, 'the organizer publishes it');
+  assert.ok((await ids({ token: eve })).includes(connectorDraft.id), 'and then everyone sees it');
+});
+
+test('F1: what the companion wrote (source chat) is published only by an organizer or the agent; its author cannot publish it or edit it once out', async () => {
+  const chat = await (await moment({ caption: 'Chat says', body: 'quotes Dad', author: 'bob', source: 'chat' }, AGENT)).json();
+  assert.equal(chat.visibility, 'draft');
+  const publishByAuthor = await api(`/api/moments/${chat.id}`, { method: 'PATCH', body: { visibility: 'published' }, token: bob });
+  assert.equal(publishByAuthor.status, 403);
+  assert.deepEqual(await publishByAuthor.json(), { error: 'organizer_review_required' });
+  assert.equal((await moments({ token: bob })).find((m) => m.id === chat.id).visibility, 'draft', 'still a draft');
+  assert.equal((await api(`/api/moments/${chat.id}`, { method: 'PATCH', body: { caption: 'Bob tidies his draft' }, token: bob })).status, 200, 'its author may still edit the draft');
+  const out = await api(`/api/moments/${chat.id}`, { method: 'PATCH', body: { visibility: 'published' }, token: alice });
+  assert.equal(out.status, 200, 'an organizer publishes it');
+  const edit = await api(`/api/moments/${chat.id}`, { method: 'PATCH', body: { caption: 'Bob rewrites it live' }, token: bob });
+  assert.equal(edit.status, 403, 'its author cannot change it once published');
+  const unpublish = await api(`/api/moments/${chat.id}`, { method: 'PATCH', body: { visibility: 'draft' }, token: bob });
+  assert.equal(unpublish.status, 403);
+  assert.equal((await moments({ token: eve })).find((m) => m.id === chat.id).caption, 'Bob tidies his draft', 'what the family reads is what the organizer approved');
+  assert.equal((await api(`/api/moments/${chat.id}`, { method: 'PATCH', body: { caption: 'Organizer fixes a word' }, token: alice })).status, 200, 'an organizer may edit it');
+  assert.equal((await api(`/api/moments/${chat.id}`, { method: 'PATCH', body: { body: 'agent fix' }, ...AGENT })).status, 200, 'the agent may edit it');
+  assert.equal((await api(`/api/moments/${chat.id}`, { method: 'DELETE', token: bob })).status, 200, 'its author may still take it down');
+});
+
+test('F1: a moment the agent writes with no source is a chat moment, and the agent may publish it directly', async () => {
+  const made = await (await moment({ caption: 'Agent default source', author: 'bob', visibility: 'published' }, AGENT)).json();
+  assert.equal(made.source, 'chat');
+  assert.equal(made.visibility, 'published');
+  assert.equal((await api(`/api/moments/${made.id}`, { method: 'PATCH', body: { caption: 'x' }, token: bob })).status, 403);
+});
+
+test('F1: a member\'s own moment (site or connector) stays theirs to publish and to edit afterwards, as the site always allowed', async () => {
+  for (const source of [undefined, 'site', 'connector']) {
+    const own = await (await moment({ caption: `Mine ${source}`, ...(source ? { source } : {}) }, { token: bob })).json();
+    assert.equal((await api(`/api/moments/${own.id}`, { method: 'PATCH', body: { visibility: 'published' }, token: bob })).status, 200, String(source));
+    assert.equal((await api(`/api/moments/${own.id}`, { method: 'PATCH', body: { caption: 'Edited after publishing' }, token: bob })).status, 200, String(source));
+  }
+  const direct = await moment({ caption: 'Published at once', visibility: 'published' }, { token: bob });
+  assert.equal(direct.status, 201);
+});
+
+test('F4: a member cannot claim source chat on a moment (400, nothing stored), even to publish; the agent can', async () => {
+  const n = (await moments({ token: bob })).length;
+  for (const body of [{ caption: 'x', source: 'chat' }, { caption: 'x', source: 'chat', visibility: 'published' }]) {
+    const res = await moment(body, { token: bob });
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.match((await res.json()).error, /source/);
+  }
+  assert.equal((await moments({ token: bob })).length, n);
+  assert.equal((await moment({ caption: 'ok', source: 'connector' }, { token: bob })).status, 201);
+  assert.equal((await moment({ caption: 'ok', source: 'site' }, { token: bob })).status, 201);
+  assert.equal((await moment({ caption: 'from chat', source: 'chat' }, AGENT)).status, 201);
 });
 
 test('photo_ids and source are bounded: a bad shape is 400 and stores nothing', async () => {
@@ -240,7 +294,7 @@ test('AC-7: with no uploaded_for the agent is still the author, and source defau
 test('AC-7: a member cannot upload as someone else (403) and no file is left on disk', async () => {
   const files = () => readdirSync(uploadsDir()).length;
   const n = files();
-  const res = await upload({ uploaded_for: 'alice', source: 'chat' }, { token: bob });
+  const res = await upload({ uploaded_for: 'alice', source: 'connector' }, { token: bob });
   assert.equal(res.status, 403);
   assert.deepEqual(await res.json(), { error: 'uploaded_for_agent_only' });
   assert.equal(files(), n, 'the refused upload left nothing behind');
@@ -254,6 +308,17 @@ test('AC-7: an unknown participant, or an unknown source, is 400 and leaves no f
   assert.equal((await upload({ uploaded_for: 'bob', source: 'telegram' }, AGENT)).status, 400);
   assert.equal((await upload({ source: 'telegram' }, { token: bob })).status, 400);
   assert.equal(files(), n);
+});
+
+test('F4: a member cannot upload with source chat (400, no file left); site and connector are fine; the agent may use chat', async () => {
+  const files = () => readdirSync(uploadsDir()).length;
+  const n = files();
+  const res = await upload({ source: 'chat' }, { token: bob });
+  assert.equal(res.status, 400);
+  assert.deepEqual(await res.json(), { error: 'invalid_source' });
+  assert.equal(files(), n);
+  for (const source of ['site', 'connector']) assert.equal((await upload({ source }, { token: bob })).status, 200, source);
+  assert.equal((await upload({ source: 'chat' }, AGENT)).status, 200);
 });
 
 test('a member upload records its own source and is attributed to the member', async () => {

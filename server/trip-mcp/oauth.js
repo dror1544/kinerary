@@ -21,12 +21,15 @@ const CODE_TTL_S = 5 * 60;
 // read and write, anyone else on the trip grants read only. A grant never
 // widens later — a member promoted to organizer keeps a read-only connection
 // until they approve a new one, so nobody holds write access they did not see
-// on the consent page. (The member-write class — trip moments and the photo
-// page, tools.js MEMBER_WRITE_TOOLS — is not a scope: it rides on `trip:read`,
-// only while the trip's trip_moments_capture switch is on, and calls the site
-// as the member, so the site's own per-author checks decide.)
+// on the consent page. The member-write class (trip moments and the photo page,
+// tools.js MEMBER_WRITE_TOOLS) is its own scope for the same reason: a member
+// gets it only by approving a connection, on a trip whose trip_moments_capture
+// switch was on at that moment, with consent text that names it. A `trip:read`
+// connection made before keeps exactly the read tools until its owner reconnects.
+// The class calls the site as the member, so the site's own per-author checks decide.
 const SCOPE = 'trip';
 const READ_SCOPE = 'trip:read';
+const MOMENTS_SCOPE = 'trip:moments';
 // Registration is unauthenticated by design (every MCP client registers itself
 // on first connect), so it is bounded instead. A client that has not finished a
 // sign-in within this window is dropped (a code only lives five minutes), and
@@ -285,5 +288,5 @@ function authenticateClient(store, req) {
 
 module.exports = {
   createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, hash,
-  SCOPE, READ_SCOPE, ACCESS_TTL_S, DEFAULT_REDIRECT_URIS, MAX_URI_LENGTH,
+  SCOPE, READ_SCOPE, MOMENTS_SCOPE, ACCESS_TTL_S, DEFAULT_REDIRECT_URIS, MAX_URI_LENGTH,
 };

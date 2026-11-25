@@ -1978,7 +1978,11 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
   // ── Trip moments ────────────────────────────────────────────────────────────
   // A moment carries one or more photos (photo_ids, in order; photo_id stays the first, for old readers) and says where it came
   // from (source). Who sees what is unchanged: everyone sees published moments, and a person sees their own drafts.
+  // Where a moment came from. `chat` is the companion's (the agent key's) alone: it writes in the name of a participant, and what
+  // it writes may quote other people. A member's own moment is `site` (the site's composer) or `connector` (their own Claude or
+  // ChatGPT, their own words). Provenance is what the publishing rule below turns on, so a member cannot claim `chat`.
   const MOMENT_SOURCES = new Set(['site', 'chat', 'connector']);
+  const MEMBER_MOMENT_SOURCES = new Set(['site', 'connector']);
   const MAX_MOMENT_PHOTOS = 20;
   const PHOTO_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
   const momentOut = (row) => {
@@ -1999,22 +2003,29 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
   const isParticipantUser = (username) => {
     try { return Boolean(db.prepare('SELECT 1 FROM users WHERE username = ? AND removed_at IS NULL').get(username)); } catch { return false; }
   };
-  const mayChangeMoment = (req, row) => {
+  // An organizer or the agent key: who may publish what the companion wrote, and edit it once it is out.
+  const isStaff = (req) => {
     const { agent } = cfg();
     const organizers = Array.isArray(agent?.organizers) ? agent.organizers : [agent?.organizer].filter(Boolean);
-    return row.author === req.user.username || organizers.includes(req.user.username) || Boolean(req.user.secondaryOrganizer) || Boolean(req.user.isAgent);
+    return organizers.includes(req.user.username) || Boolean(req.user.secondaryOrganizer) || Boolean(req.user.isAgent);
   };
+  const mayChangeMoment = (req, row) => row.author === req.user.username || isStaff(req);
+  // A moment the companion wrote (source `chat`) reaches the family only through an organizer (or the agent): its author, who
+  // may be the member it was attributed to, cannot publish it, and cannot change it once it is published (it may quote others).
+  // A member's own moment (site, connector, or from before sources existed) the author may still publish, as the site always allowed.
+  const isChatMoment = (row) => row.source === 'chat';
 
   app.get('/api/moments', authRequired, (req, res) => {
-    // Organizers and the agent key see every moment, drafts included: a draft left for an organizer to publish (the trip's
-    // `organizer_draft` mode) is useless if no organizer can find it. The same predicate that lets them see booking drafts
-    // (`isOrganizer`, server.js canReviewDrafts). A caller that passes no predicate gets the member view, never the drafts.
-    const sees = isOrganizer && isOrganizer(req)
-      ? db.prepare('SELECT * FROM trip_moments ORDER BY COALESCE(date, created_at) DESC, created_at DESC').all()
-      : db.prepare(
-        "SELECT * FROM trip_moments WHERE visibility = 'published' OR author = ? ORDER BY COALESCE(date, created_at) DESC, created_at DESC"
-      ).all(req.user.username);
-    res.json(sees.map(momentOut));
+    // Everyone sees published moments and their own drafts. An organizer or the agent key also sees the drafts that came from the
+    // chat or a member's connector (the trip's `organizer_draft` mode is useless if no organizer can find them), and only while the
+    // trip has `trip_moments_capture` on: a draft a member wrote on the site, or any draft on a trip without the feature, stays
+    // theirs alone, exactly as before. The predicate is the one that lets organizers see booking drafts (`isOrganizer`); a caller
+    // that passes none gets the member view.
+    const staff = Boolean(isOrganizer && isOrganizer(req)) && switchOn('trip_moments_capture');
+    const rows = db.prepare(
+      "SELECT * FROM trip_moments WHERE visibility = 'published' OR author = ? OR (? = 1 AND source IN ('chat','connector')) ORDER BY COALESCE(date, created_at) DESC, created_at DESC"
+    ).all(req.user.username, staff ? 1 : 0);
+    res.json(rows.map(momentOut));
   });
 
   app.post('/api/moments', authRequired, (req, res) => {
@@ -2022,12 +2033,15 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (typeof body.caption !== 'string' || !body.caption.trim()) return res.status(400).json({ error: 'caption required' });
     const photos = readPhotoIds(body.photo_ids);
     if (photos.error) return res.status(400).json({ error: photos.error });
-    if (body.source !== undefined && !MOMENT_SOURCES.has(body.source)) return res.status(400).json({ error: 'source must be "site", "chat" or "connector"' });
+    // `chat` only from the agent key; a member's moment is `site` or `connector`.
+    const allowedSources = req.user.isAgent ? MOMENT_SOURCES : MEMBER_MOMENT_SOURCES;
+    if (body.source !== undefined && !allowedSources.has(body.source)) return res.status(400).json({ error: req.user.isAgent ? 'source must be "site", "chat" or "connector"' : 'source must be "site" or "connector"' });
     // `author` is the agent key's alone: the companion writes a moment in the name of the participant who said or sent it. A member
     // cannot write one in anyone's name (nor their own: the route already knows who they are), and a name that is not a participant
     // is refused, so the field can never mint an author the site has no person for.
+    // Only while the trip has trip_moments_capture on; with it off the field is not part of the API and the moment is the caller's, as before.
     let author = req.user.username;
-    if (body.author !== undefined) {
+    if (body.author !== undefined && (!req.user.isAgent || switchOn('trip_moments_capture'))) {
       if (!req.user.isAgent) return res.status(403).json({ error: 'author_agent_only' });
       if (typeof body.author !== 'string' || !isParticipantUser(body.author)) return res.status(400).json({ error: 'author must be a participant username' });
       author = body.author;
@@ -2043,7 +2057,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     const visibility = body.visibility === 'published' ? 'published' : 'draft';
     db.prepare(
       'INSERT INTO trip_moments (id,date,phase_id,item_uid,author,caption,body,photo_id,photo_ids,source,visibility) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
-    ).run(id, body.date || null, body.phase_id || null, body.item_uid || null, author, body.caption.trim(), body.body || null, ids[0] || null, JSON.stringify(ids), body.source || 'site', visibility);
+    ).run(id, body.date || null, body.phase_id || null, body.item_uid || null, author, body.caption.trim(), body.body || null, ids[0] || null, JSON.stringify(ids), body.source || (req.user.isAgent ? 'chat' : 'site'), visibility);
     res.status(201).json(momentOut(db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(id)));
   });
 
@@ -2051,6 +2065,10 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     const row = db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(req.params.id);
     if (!row) return res.status(404).json({ error: 'not found' });
     if (!mayChangeMoment(req, row)) return res.status(403).json({ error: 'forbidden' });
+    // The organizer review of what the companion wrote: its author may neither publish it nor change it once it is out.
+    if (isChatMoment(row) && !isStaff(req) && (req.body?.visibility === 'published' || row.visibility === 'published')) {
+      return res.status(403).json({ error: 'organizer_review_required' });
+    }
     const photos = req.body?.photo_ids !== undefined ? readPhotoIds(req.body.photo_ids) : null;
     if (photos?.error) return res.status(400).json({ error: photos.error });
     db.prepare("UPDATE trip_moments SET caption = COALESCE(?, caption), body = COALESCE(?, body), visibility = COALESCE(?, visibility), photo_ids = COALESCE(?, photo_ids), photo_id = CASE WHEN ? THEN ? ELSE photo_id END, updated_at = datetime('now') WHERE id = ?")
