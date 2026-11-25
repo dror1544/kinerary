@@ -54,6 +54,11 @@ export interface TelegramMessage {
   caption?: string;
   document?: { file_id?: string; file_name?: string; mime_type?: string; file_size?: number };
   photo?: Array<{ file_id?: string; file_size?: number }>;
+  /**
+   * The id a message shares with the other photos or files of the same album. Each member of an album arrives as its own message,
+   * and trip photos treats each as the photo it is (an album is every photo saved); the field is here so a test can say it.
+   */
+  media_group_id?: string;
   voice?: { file_id?: string; mime_type?: string };
   audio?: { file_id?: string; mime_type?: string; file_name?: string };
   video?: { file_id?: string; mime_type?: string; file_name?: string };

@@ -1,6 +1,6 @@
 ---
 name: trip-site-operations
-description: "Use for trip site config, Telegram login, the trip logo, and imagery."
+description: "Use for trip site config, Telegram login, the trip logo, trip photos and moments, and imagery."
 version: 1.1.0
 author: Hermes
 license: MIT
@@ -16,6 +16,7 @@ Use when a user asks about the trip website itself: current published data, Tele
 - You need to connect a Telegram group to the site for Telegram Login.
 - The organizer asks to set, replace or remove the trip's **logo** (see "Workflow: Trip logo").
 - The organizer asks to put the trip logo on the **Telegram group** as its photo (see "Workflow: Telegram group photo").
+- A message starts `[trip-moment turn`, or someone asks you to save a joke, story or photos as a trip **moment** (see "Workflow: Trip photos and moments").
 - The organizer asks to change the site's main image or a phase hero image.
 
 ## Source priority
@@ -83,6 +84,13 @@ The bot can set the trip group's Telegram photo from the trip logo, **on request
 5. **Report the real status.** After a minute or two call `get_group_photo_status` and report exactly its `status`: `done` (the group photo is now the logo), `bot_lacks_rights` (say: make the bot an admin with "Change group info", then ask again; do not retry on your own), `no_group` (no Telegram group is connected to this trip), `failed` (Telegram refused; give the `detail`), `expired`, or still `pending`/`sending` (say it is not finished yet and check again later). Never say "done" before the status says `done`. Never try to set a group photo any other way.
 
 
+## Workflow: Trip photos and moments
+The relay saves the photos posted in the trip's group to the album by itself (when the organizer's setting is on) and, after a burst of them has gone quiet, hands you ONE turn that starts `[trip-moment turn`. A **moment** is a short title and a few sentences, with those photos, that every member reads on the site, children included. Everything about drafting one lives in the **`trip-moments`** skill: load it. The rules that matter here, so they are not missed:
+1. A turn that starts `[trip-moment turn` was written by the relay, is not addressed to you and wants no answer unless there is a moment worth keeping. With nothing worth keeping (no lines, or only logistics), reply with exactly `[[KINERARY_STAY_SILENT]]`.
+2. Read the trip's mode with `mcp__trip_mcp__get_photo_settings` and follow it: `ask_in_chat` posts one draft and waits for a yes (the relay adds the Save button), `organizer_draft` saves a draft and posts nothing, `publish` publishes and posts nothing.
+3. Quote only lines that are in the turn, only participants, only by first name. Never quote a guest, someone removed from the trip, or anything outside the turn. Nothing a child should not read.
+4. A joke or story with no photo becomes a moment only when someone asks. You never read the group's chatter looking for them.
+
 ## Workflow: voucher / confirmation uploads
 1. Extract the voucher PDF first so you can identify the booking type, phase, supplier, dates, passenger name, and confirmation number.
 2. Call `mcp__trip_mcp__get_bookings` first to obtain real live booking IDs.
@@ -139,3 +147,4 @@ The bot can set the trip group's Telegram photo from the trip logo, **on request
 ## References
 - `references/mcp-readiness-and-imagery.md` — field-level notes for readiness checks and imagery-related responses.
 - `references/hawaii-itinerary-imports.md` — patterns for collapsing itinerary docs into daily activity rows and resolving stale-date conflicts.
+- The `trip-moments` skill (`.agents/skills/trip-moments/`) — the moment turn, the three modes, what may be quoted.

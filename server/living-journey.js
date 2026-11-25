@@ -318,6 +318,10 @@ function schema(db) {
   addColumn(db, "ALTER TABLE trip_settings ADD COLUMN moment_capture_mode TEXT NOT NULL DEFAULT 'ask_in_chat' CHECK (moment_capture_mode IN ('ask_in_chat','organizer_draft','publish'))");
   addColumn(db, 'ALTER TABLE trip_moments ADD COLUMN source TEXT');
   addColumn(db, 'ALTER TABLE trip_moments ADD COLUMN photo_ids TEXT');
+  // Part B (the relay): whether the group has been told, once, that photos posted in it are saved (the relay owns the wording, the
+  // site owns whether it was said, so a relay restart does not say it twice). Cleared whenever an organizer turns automatic saving
+  // off, so turning it back on says it again. Additive, defaulted, idempotent.
+  addColumn(db, 'ALTER TABLE trip_settings ADD COLUMN photo_autosave_notified INTEGER NOT NULL DEFAULT 0');
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
   db.prepare('INSERT OR IGNORE INTO trip_settings (id, timezone) VALUES (1, NULL)').run();
 }
@@ -1475,9 +1479,11 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     const canonical = body.timezone !== undefined
       ? new Intl.DateTimeFormat(undefined, { timeZone: body.timezone }).resolvedOptions().timeZone
       : null;
+    // Turning automatic saving OFF forgets that the group was told it was on, so turning it back on tells the group again.
+    const clearsNotice = hasAutosave && body.group_photo_autosave === false;
     db.prepare(
-      "UPDATE trip_settings SET timezone = COALESCE(?, timezone), group_change_line = COALESCE(?, group_change_line), nav_app = COALESCE(?, nav_app), group_photo_autosave = COALESCE(?, group_photo_autosave), moment_capture_mode = COALESCE(?, moment_capture_mode), updated_by = ?, updated_at = datetime('now') WHERE id = 1"
-    ).run(canonical, hasLine ? (body.group_change_line ? 1 : 0) : null, hasNav ? body.nav_app : null, hasAutosave ? (body.group_photo_autosave ? 1 : 0) : null, hasMode ? body.moment_capture_mode : null, req.user.username);
+      "UPDATE trip_settings SET timezone = COALESCE(?, timezone), group_change_line = COALESCE(?, group_change_line), nav_app = COALESCE(?, nav_app), group_photo_autosave = COALESCE(?, group_photo_autosave), moment_capture_mode = COALESCE(?, moment_capture_mode), photo_autosave_notified = CASE WHEN ? THEN 0 ELSE photo_autosave_notified END, updated_by = ?, updated_at = datetime('now') WHERE id = 1"
+    ).run(canonical, hasLine ? (body.group_change_line ? 1 : 0) : null, hasNav ? body.nav_app : null, hasAutosave ? (body.group_photo_autosave ? 1 : 0) : null, hasMode ? body.moment_capture_mode : null, clearsNotice ? 1 : 0, req.user.username);
     res.json(tripSettings(db));
   });
 
@@ -2151,6 +2157,17 @@ function create(options) {
       return id;
     },
     dayContext: (rawPhase, date) => dayContextForPhase(rawPhase, date),
+    // Part B of trip photos and moments (the relay's internal photo routes, server/server.js). The settings as stored, the day a
+    // moment in time falls on in the trip's own zone, the stop whose dated range holds that day, and the once-only group notice.
+    tripSettings: () => tripSettings(db),
+    dayAt: (date) => localClock(db, options.getConfig ? options.getConfig() : config, date).date,
+    stopOnDay: (day) => {
+      const phases = (options.getConfig ? options.getConfig() : config).phases;
+      const hit = (Array.isArray(phases) ? phases : []).find((phase) => { const r = stopRange(phase); return r && r.start <= day && day <= r.end; });
+      return hit && typeof hit.id === 'string' ? hit.id : null;
+    },
+    autosaveNoticePending: () => db.prepare('SELECT photo_autosave_notified AS n FROM trip_settings WHERE id = 1').get()?.n === 0,
+    ackAutosaveNotice: () => db.prepare('UPDATE trip_settings SET photo_autosave_notified = 1 WHERE id = 1').run(),
   };
 }
 
