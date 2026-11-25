@@ -8,6 +8,7 @@
  * emitter today, a Hermes plugin's batches tomorrow.
  */
 import type pg from "pg";
+import { TELEGRAM_GROUP_CHAT_ID_SQL, WHATSAPP_GROUP_CHAT_ID_SQL } from "../identity.js";
 import { validateAssistantEvent, type AssistantEvent, EVENT_FIELDS } from "./contract.js";
 
 type Db = Pick<pg.Pool, "query">;
@@ -515,16 +516,18 @@ export async function rollupAssistantEvents(
     }
   }
 
-  // The groups' CURRENT levels, one read for every trip in the result. Group chat
-  // ids are negative; a private chat's binding is not a group and has no level to show.
+  // The groups' CURRENT levels, one read for every trip in the result. A group is a group by the shape of its id, the SQL
+  // form of `chatKind` (identity.ts): a Telegram group's id is negative, a WhatsApp group's is the alias `wa_<hex>@g`. A private chat's
+  // binding, on either platform, is not a group and has no level to show. Neither pattern reads the platform column, so
+  // this runs on a database from before the WhatsApp migration.
   const tripIds = [...new Set([...days.values()].map((d) => d.trip_id))];
   if (tripIds.length > 0) {
     const levels = await db.query<{ trip_id: string; level: number; groups: number }>(
       `SELECT trip_id, proactive_level AS level, count(*)::int AS groups
          FROM control_plane.telegram_chat_bindings
-        WHERE trip_id = ANY($1::text[]) AND closed_at IS NULL AND chat_id LIKE '-%'
+        WHERE trip_id = ANY($1::text[]) AND closed_at IS NULL AND (chat_id ~ $2 OR chat_id ~ $3)
         GROUP BY trip_id, proactive_level`,
-      [tripIds],
+      [tripIds, TELEGRAM_GROUP_CHAT_ID_SQL, WHATSAPP_GROUP_CHAT_ID_SQL],
     );
     for (const day of days.values()) {
       for (const r of levels.rows.filter((x) => x.trip_id === day.trip_id)) {

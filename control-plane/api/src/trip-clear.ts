@@ -327,6 +327,7 @@
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
 import type { TripState } from "./lifecycle.js";
+import { whatsappSchemaPresent } from "./chat-binding-codes.js";
 import { RETIRED_SLUG_PREFIX } from "./trip-retirement.js";
 
 function generateId(prefix: string): string {
@@ -1011,6 +1012,26 @@ export async function executeClear(
     // sounds like it would be safe at any point (F-R9-2, below).
     const payload: Record<string, unknown> = {};
 
+    // WhatsApp binding codes (spec 625, S2) — expired here, before the group-binding tokens, in the order redemption takes
+    // them (the code row first, `trips` last through its foreign key). One statement: a CTE locks and captures every code
+    // this trip has, the UPDATE expires the ones still live. A code never counts as a binding, so this is not an
+    // EVER_PROVISIONED signal; a trip that was ever BOUND, on whichever platform, is already refused by the
+    // `telegram_chat_bindings` signal (the WhatsApp rows live in that same table). A no-op on a database without the table.
+    if (await whatsappSchemaPresent(client)) {
+      const codeResult = await client.query<Record<string, unknown>>(
+        `WITH old AS (
+           SELECT * FROM control_plane.chat_binding_codes WHERE trip_id = $1 FOR UPDATE
+         )
+         UPDATE control_plane.chat_binding_codes c
+            SET state = CASE WHEN old.state = 'issued' THEN 'expired' ELSE old.state END
+           FROM old
+          WHERE c.id = old.id
+        RETURNING old.*`,
+        [tripId],
+      );
+      payload.chat_binding_codes = codeResult.rows;
+    }
+
     // Group-binding tokens — one statement: a CTE locks and captures every
     // row this trip has (regardless of current expiry, so an already-dead
     // token is archived too, exactly as before R7-4), the UPDATE revokes
@@ -1520,6 +1541,14 @@ export async function restoreFromArchive(db: pg.Pool, archiveId: string): Promis
       );
     }
     restored.telegram_group_binding_tokens = ((payload.telegram_group_binding_tokens ?? []) as unknown[]).length;
+
+    // WhatsApp codes (spec 625): only an archive made on a database that has the table carries them, and only they are put back.
+    if (Array.isArray(payload.chat_binding_codes)) {
+      for (const row of payload.chat_binding_codes as Record<string, unknown>[]) {
+        await client.query("UPDATE control_plane.chat_binding_codes SET state = $2 WHERE id = $1", [row.id, row.state]);
+      }
+      restored.chat_binding_codes = (payload.chat_binding_codes as unknown[]).length;
+    }
 
     await client.query("COMMIT");
   } catch (err) {

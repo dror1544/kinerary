@@ -495,6 +495,10 @@ type MetadataRule =
  *
  * `other` covers a DM from anyone the trip has not linked as its organizer,
  * and a channel (which the poll loop does not subscribe to today).
+ *
+ * WHATSAPP (spec 625): the relay passes the chat's kind from the SHAPE of its id (`chatKind`, identity.ts), `"private"` or
+ * `"group"`, and both classify here as they do for Telegram. An id of no accepted shape is passed as nothing and lands in
+ * `unclassified`, so a new kind of chat is never counted as family-group traffic.
  */
 export function channelTypeOf(telegramChatType: string | null | undefined, role: RequesterRole): ChannelType {
   switch (telegramChatType) {

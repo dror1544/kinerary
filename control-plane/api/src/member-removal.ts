@@ -12,6 +12,7 @@
  *   - their trip-password credential is deleted, so the password stops working;
  *   - the invite they redeemed is marked `revoked` (frees the username too);
  *   - any launch grant they hold for the trip and have not used is spent;
+ *   - their WhatsApp private chat, if they connected one, is closed (`membership_ended`) and its person link deleted;
  *   - if this was their last active membership anywhere, every portal session
  *     of theirs ends. If they still belong to other trips their sessions stay —
  *     a portal session is per person, not per trip, and every trip route checks
@@ -28,6 +29,7 @@
  * owner unless you are one.
  */
 import type pg from "pg";
+import { closeEndedMembershipBindings } from "./chat-binding-codes.js";
 
 export type RemoveMemberOutcome =
   | { ok: true }
@@ -91,6 +93,9 @@ export async function removeMember(
           AND NOT EXISTS (SELECT 1 FROM control_plane.trip_memberships m WHERE m.user_id = $1 AND m.status = 'active')`,
       [input.targetUserId],
     );
+    // The person's WhatsApp private chat ends with the membership (AC-14, spec 625): binding closed `membership_ended`,
+    // person link deleted, inside this same transaction. A no-op on a database without the WhatsApp schema.
+    await closeEndedMembershipBindings(client, input.tripId, input.targetUserId);
     await client.query("COMMIT");
     return { ok: true };
   } catch (error) {

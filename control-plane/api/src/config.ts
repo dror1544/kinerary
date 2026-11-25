@@ -74,6 +74,27 @@ function removedGoogleField(name: string) {
   }).optional();
 }
 
+/**
+ * The WhatsApp bridge's address: loopback only, and http. The bridge is a sidecar of the relay that holds a logged-in
+ * WhatsApp session, so this URL is never a place to send anything off the machine (`telegramApiRoot` is not reused: it
+ * accepts https to any host). Normalised to the origin.
+ */
+export function loopbackBridgeUrl(value: string, ctx: z.RefinementCtx): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    ctx.addIssue({ code: "custom", message: "must be an http URL on a loopback address" });
+    return z.NEVER;
+  }
+  const host = url.hostname === "[::1]" ? "::1" : url.hostname;
+  if (url.protocol !== "http:" || !["127.0.0.1", "::1", "localhost"].includes(host) || url.username || url.password || (url.pathname !== "/" && url.pathname !== "") || url.search || url.hash) {
+    ctx.addIssue({ code: "custom", message: "must be http://127.0.0.1:<port>, http://[::1]:<port> or http://localhost:<port> with no path" });
+    return z.NEVER;
+  }
+  return url.origin;
+}
+
 export const architectureProfileSchema = z.object({
   version: z.literal(1),
   environment: z.enum(["test", "development", "production"]),
@@ -321,6 +342,22 @@ export const architectureProfileSchema = z.object({
      * change, and an unreachable trip is reported rather than absorbed.
      */
     multiplex_gateway_id: z.string().min(1).optional(),
+    /**
+     * WhatsApp through the relay (docs/specs/sprint-9/625-whatsapp-via-relay.md). ABSENT means the feature is not
+     * present on this deployment: no WhatsApp loop, no bridge connection, no dashboard section. The portal reads
+     * `number` and `code_ttl_seconds` from the same profile; the relay reads the rest.
+     */
+    whatsapp: z.object({
+      /** The bridge sidecar, loopback only. How a containerised relay shares loopback with it is the deployment's concern. */
+      bridge_url: z.string().transform(loopbackBridgeUrl),
+      bridge_secret_ref: secretReference,
+      /** The key of the opaque sender id. Its own secret; rotating it orphans every WhatsApp private binding. */
+      sender_id_secret_ref: secretReference,
+      /** The deployment's WhatsApp number, digits only, country code first: what the dashboard's wa.me links open. Never in this repository. */
+      number: z.string().regex(/^[0-9]{6,15}$/, "must be digits only, country code first, no plus sign or spaces"),
+      code_ttl_seconds: z.number().int().min(60).max(86400).default(900),
+      code_attempts_per_hour: z.number().int().min(1).max(100).default(5),
+    }).strict().optional(),
   }).strict().optional(),
 }).strict().superRefine((profile, ctx) => {
   if (profile.relay) {
@@ -405,4 +442,14 @@ export async function loadArchitectureProfile(path: string): Promise<Architectur
 export function validateBeforeProvider<T>(raw: unknown, providerFactory: () => T): T {
   validateArchitectureProfile(raw);
   return providerFactory();
+}
+
+/**
+ * What the portal needs of the profile's `relay.whatsapp` block: the deployment's number and the code lifetime. ABSENT when
+ * the profile has no such block (the deployment has no WhatsApp number): the portal then answers 404 on every WhatsApp
+ * route and shows no section. server.ts passes this as `PortalDependencies.whatsapp`.
+ */
+export function whatsappPortalSettings(profile: ArchitectureProfile): { number: string; codeTtlSeconds: number } | undefined {
+  const block = profile.relay?.whatsapp;
+  return block ? { number: block.number, codeTtlSeconds: block.code_ttl_seconds } : undefined;
 }

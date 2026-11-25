@@ -497,6 +497,21 @@ WITH named AS (
          'sha256:' || encode(sha256(convert_to(b.chat_id, 'UTF8')), 'hex') AS digest
     FROM control_plane.telegram_chat_bindings b
    WHERE b.chat_id ~ '^[0-9]{1,20}$'
+), wa_owner AS (
+  -- An OPEN WhatsApp private binding of the trip's OWNER counts as the organizer's private chat (spec 625, AC-19), so a
+  -- trip whose organizer uses only WhatsApp keeps its companion running. The platform and the account are read through
+  -- to_jsonb so this still runs against a database from before the WhatsApp migration (the keys are then absent, the
+  -- CTE is empty, and every trip decides exactly as before).
+  SELECT DISTINCT b.trip_id
+    FROM control_plane.telegram_chat_bindings b
+    JOIN control_plane.trip_person_links p
+      ON p.trip_id = b.trip_id AND p.telegram_user_id || '@p' = b.chat_id
+    JOIN control_plane.trip_memberships m
+      ON m.trip_id = b.trip_id AND m.user_id = to_jsonb(p)->>'account_user_id' AND m.role = 'owner' AND m.status = 'active'
+   WHERE b.closed_at IS NULL
+     AND COALESCE(to_jsonb(b)->>'platform', 'telegram') = 'whatsapp'
+     AND COALESCE(to_jsonb(p)->>'platform', 'telegram') = 'whatsapp'
+     AND b.chat_id ~ '^wa_[0-9a-f]{32}@p$'
 )
 SELECT p.profile, t.id AS trip_id, t.slug,
        (t.slug LIKE 'retired-%%' OR EXISTS (
@@ -505,8 +520,9 @@ SELECT p.profile, t.id AS trip_id, t.slug,
        t.start_date::text AS start_date, t.end_date::text AS end_date,
        t.plan_snapshot #>> '{meta,departure}' AS departure,
        t.plan_snapshot #>> '{meta,returnDate}' AS return_date,
-       EXISTS (SELECT 1 FROM org o JOIN dm ON dm.digest = o.digest AND dm.closed_at IS NULL AND dm.trip_id = t.id
-                WHERE o.trip_id = t.id) AS is_current,
+       (EXISTS (SELECT 1 FROM org o JOIN dm ON dm.digest = o.digest AND dm.closed_at IS NULL AND dm.trip_id = t.id
+                 WHERE o.trip_id = t.id)
+        OR EXISTS (SELECT 1 FROM wa_owner w WHERE w.trip_id = t.id)) AS is_current,
        (SELECT max(dm.created_at) FROM org o JOIN dm ON dm.digest = o.digest AND dm.trip_id = t.id
          WHERE o.trip_id = t.id AND dm.created_at > %(revive_since)s) AS switched_at,
        (SELECT max(dm.closed_at) FROM org o JOIN dm ON dm.digest = o.digest AND dm.trip_id = t.id

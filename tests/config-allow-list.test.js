@@ -244,6 +244,46 @@ describe('publicAgent — allow-list, not deny-list', () => {
   });
 });
 
+// What a provisioned config may have WITHHELD: an organizer-only need or standing instruction, and a `features.<name>` for
+// a switch that is REGISTERED with `memberVisible: false` and for no other name. A withheld `features.zzz` (not in the
+// registry) or a withheld member-visible switch is a defect, so it is refused here and not waved through.
+const FEATURE_REGISTRY = createRequire(import.meta.url)('../shared/feature-switches.js').FEATURE_SWITCHES;
+function assertWithheldPathsAreKnown(withheld, label) {
+  const hidden = new Set(FEATURE_REGISTRY.filter((entry) => !entry.memberVisible).map((entry) => entry.name));
+  for (const p of withheld) {
+    const feature = /^features\.([a-z][a-z0-9_]*)$/.exec(p);
+    if (feature) {
+      assert.ok(hidden.has(feature[1]), `${label}: ${p} is withheld but is not a registered switch with memberVisible:false`);
+      continue;
+    }
+    assert.match(p, /^participants\[\d+\]\.needs\[\d+\]$|^agent\.standing_instructions\[\d+\]$/, `${label}: ${p}`);
+  }
+}
+
+describe('config allow-list — what may be withheld from a provisioned config', () => {
+  test('a withheld features.<name> is accepted only for a registered switch that is not member-visible', () => {
+    const hidden = FEATURE_REGISTRY.filter((entry) => !entry.memberVisible).map((entry) => entry.name);
+    const visible = FEATURE_REGISTRY.filter((entry) => entry.memberVisible).map((entry) => entry.name);
+    assert.ok(hidden.includes('whatsapp') && visible.length > 0, 'the registry no longer holds the cases this test needs');
+    assert.doesNotThrow(() => assertWithheldPathsAreKnown(hidden.map((n) => `features.${n}`), 'hidden'));
+    // negative cases: an unregistered name, a member-visible name, and a path that merely looks like one
+    assert.throws(() => assertWithheldPathsAreKnown(['features.zzz'], 'x'), /features\.zzz is withheld but is not a registered switch/);
+    assert.throws(() => assertWithheldPathsAreKnown([`features.${visible[0]}`], 'x'), /memberVisible:false/);
+    assert.throws(() => assertWithheldPathsAreKnown(['features.zzz.deep', 'features', 'meta.timezone'], 'x'));
+  });
+
+  test('the real projection: an unregistered feature name is reported as DROPPED (never silently withheld), a hidden registered one as withheld, a member-visible one is served', () => {
+    const visible = FEATURE_REGISTRY.find((entry) => entry.memberVisible).name;
+    const { dropped, withheld, value } = projectConfig({ meta: {}, features: { whatsapp: true, zzz: true, [visible]: true } });
+    assert.deepEqual(dropped, ['features.zzz']);
+    assert.deepEqual(withheld, ['features.whatsapp']);
+    assert.deepEqual(value.features, { [visible]: true });
+    // the helper agrees with the projection about which of these is acceptable
+    assert.doesNotThrow(() => assertWithheldPathsAreKnown(withheld, 'real'));
+    assert.throws(() => assertWithheldPathsAreKnown(dropped, 'real'));
+  });
+});
+
 describe('config allow-list — golden round trip (nothing the site needs is lost)', () => {
   test('trips/japan-2025 round-trips: nothing dropped, only identity links withheld', () => {
     const { value, dropped, withheld } = projectConfig(JAPAN);
@@ -285,9 +325,9 @@ describe('config allow-list — golden round trip (nothing the site needs is los
       // override-aware answer to "what timezone is this trip" — nothing
       // reads meta.timezone client-side.
       assert.deepEqual(dropped, ['meta.timezone'], `${name}: provisioner fields missing from the allow-list: ${dropped.join(', ')}`);
-      for (const p of withheld) {
-        assert.match(p, /^participants\[\d+\]\.needs\[\d+\]$|^agent\.standing_instructions\[\d+\]$/, `${name}: ${p}`);
-      }
+      // A switch that is not member-visible is withheld from the SERVED features block by design (the first such switch is
+      // `whatsapp`, spec 625): see assertWithheldPathsAreKnown.
+      assertWithheldPathsAreKnown(withheld, name);
       const expected = withoutWithheld(cfg, withheld);
       delete expected.meta.timezone;
       assert.deepEqual(value, expected, name);

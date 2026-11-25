@@ -208,6 +208,71 @@ class RetireInDb(unittest.TestCase):
         self.assertIn("AND expires_at > now()", tx)
 
 
+class RetireInDbWhatsApp(unittest.TestCase):
+    """AC-17 (docs/specs/sprint-9/625-whatsapp-via-relay.md): a torn-down trip's WhatsApp codes and addresses."""
+
+    TRIPS = (
+        {"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"},
+        {"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"},
+    )
+
+    def render(self, trip):
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db(trip)
+        return seen[-1]
+
+    def test_AC17_the_trips_live_codes_are_expired_before_any_other_statement_in_the_transaction(self):
+        for trip in self.TRIPS:
+            tx = self.render(trip)
+            first = tx.index("BEGIN;") + len("BEGIN;")
+            self.assertIn("UPDATE control_plane.chat_binding_codes SET state = 'expired'", tx[first:].lstrip()[:400])
+            self.assertIn("trip_id = 'trip_abcdefgh12' AND state = 'issued'", tx)
+            # ...and so before REVOKE_GROUP_TOKENS, the sessions, the bindings and the slug rename (the lock order)
+            for later in ("telegram_group_binding_tokens", "intake_sessions", "telegram_chat_bindings", "UPDATE control_plane.trips"):
+                if later in tx:
+                    self.assertLess(tx.index("chat_binding_codes"), tx.index(later), f"{later} comes first for {trip['slug']}")
+
+    def test_AC17_the_code_expiry_is_guarded_so_a_database_without_the_table_still_retires_a_trip(self):
+        # A bare UPDATE of a table an older database does not have fails the whole transaction for every Telegram trip.
+        for trip in self.TRIPS:
+            tx = self.render(trip)
+            self.assertIn("IF to_regclass('control_plane.chat_binding_codes') IS NOT NULL THEN", tx)
+
+    def test_AC17_every_whatsapp_binding_is_closed_and_cleared_in_one_statement_with_the_same_reason(self):
+        # The database requires `transport_address` on an OPEN WhatsApp row (group or private) and refuses it on a closed one,
+        # so it cannot be cleared first and closed after: one UPDATE does both, before the statement every platform shares.
+        for trip in self.TRIPS:
+            tx = self.render(trip)
+            self.assertIn("SET closed_at = now(), closed_reason = 'trip_destroyed', transport_address = NULL, phone_last4 = NULL", tx)
+            self.assertIn("AND closed_at IS NULL AND platform = 'whatsapp'", tx)
+            self.assertNotIn("SET transport_address = NULL, phone_last4 = NULL\n", tx, "no clear-then-close pair")
+            wa = tx.index("platform = 'whatsapp'")
+            shared = tx.index("UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'")
+            self.assertLess(wa, shared)
+            self.assertEqual(tx.count("closed_reason = 'trip_destroyed'"), 2, "one reason for both platforms")
+
+    def test_AC17_the_dry_run_counts_live_whatsapp_codes_and_an_older_stack_counts_none(self):
+        row = json.dumps({"id": "trip_abcdefgh12", "slug": "japan-2026", "lifecycle_state": "ready_private"})
+
+        def psql_for(has_table: bool):
+            def psql(sql: str) -> str:
+                if "row_to_json" in sql:
+                    return row
+                if "to_regclass('control_plane.chat_binding_codes')" in sql:
+                    return "t" if has_table else "f"
+                if "FROM control_plane.chat_binding_codes" in sql:
+                    return "3"
+                if "SELECT hermes_profile" in sql:
+                    return ""
+                return "0"
+            return psql
+        with mock.patch.object(teardown, "psql", side_effect=psql_for(True)):
+            self.assertEqual(teardown.resolve("japan-2026")["live_whatsapp_codes"], 3)
+        with mock.patch.object(teardown, "psql", side_effect=psql_for(False)):
+            self.assertEqual(teardown.resolve("japan-2026")["live_whatsapp_codes"], 0)
+
+
 class OriginalSlug(unittest.TestCase):
     def test_a_retired_slug_still_names_its_old_resources(self):
         self.assertEqual(teardown.original_slug("retired-japan-2026-20260911"), "japan-2026")

@@ -30,7 +30,12 @@ export interface AudienceMember {
 
 export type AudienceSkipReason = "binding_closed" | "binding_trip_mismatch" | "no_audience" | "target_unsupported";
 
-/** A Telegram group's chat id is negative. A private chat's is a plain number (identity.ts), and anything else is no group. */
+/**
+ * A Telegram group's chat id is negative. A private chat's is a plain number (identity.ts), and anything else is no group.
+ * WHATSAPP (spec 625, "Chat kind"): a WhatsApp group's chat id (`wa_<hex>@g`) matches neither shape, so it is EXCLUDED on
+ * purpose and no outbox message goes to a WhatsApp group in this slice (plan-change lines, scheduled messages and
+ * notifications stay on Telegram; whatsapp-exclusions.test.ts pins it). Do not widen this to `chatKind`: that would send them.
+ */
 function isGroupChatId(chatId: string): boolean {
   return !isPrivateChatId(chatId) && /^-\d{1,20}$/.test(chatId);
 }

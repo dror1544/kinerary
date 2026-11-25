@@ -46,6 +46,7 @@ REGISTERED_SWITCHES: tuple[str, ...] = (
     "delivery_probe",
     "plan_change_marks",
     "plan_change_group_line",
+    "whatsapp",
 )
 
 # The subset of REGISTERED_SWITCHES whose registry entry says `memberVisible: true`:

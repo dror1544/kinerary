@@ -55,6 +55,18 @@ const FEATURE_SWITCHES = Object.freeze([
     surfaces: Object.freeze(['control_plane', 'site', 'companion']),
     memberVisible: true,
   }),
+  // WhatsApp (docs/specs/sprint-9/625-whatsapp-via-relay.md). RECORDED EXCEPTION to "a switch never widens visibility or
+  // permission": this switch gates NEW WAYS TO BIND A CHAT (one-time dashboard codes, adding the number to a group, a
+  // traveller connecting from the group) and, in the spec's S5, a way to sign in. It enables code paths; it changes no
+  // allow-list and no auth middleware, and every route behind it still checks the session and the membership. Decision 5
+  // of the spec, agreed by the owner 2026-11-21; docs/specs/sprint-9/x-member-sign-in.md asks for the same exception.
+  // Not member-visible: the name of an unreleased feature is itself withheld.
+  Object.freeze({
+    name: 'whatsapp',
+    summary: 'The trip companion on WhatsApp through the relay: dashboard codes bind a private chat or a group, and the relay serves bound WhatsApp chats',
+    surfaces: Object.freeze(['relay', 'control_plane']),
+    memberVisible: false,
+  }),
 ]);
 
 // Fail loud at load: a malformed registry is a code bug, not a runtime state.
