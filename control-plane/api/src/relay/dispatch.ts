@@ -62,7 +62,7 @@ import {
 import { redeemTelegramLinkToken, telegramLinkTokenFromStartPayload } from "../telegram-link-token.js";
 import { bindSecondaryOrganizerChat, redeemSecondaryOrganizerToken, secondaryOrganizerTokenFromStartPayload } from "../secondary-organizers.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { companionGate, type GateDecision, type GateDeps, type InboundTurn } from "./companion-gate.js";
+import { companionGate, type GateDecision, type GateDeps, type InboundTurn, type MomentsPort } from "./companion-gate.js";
 import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
 import type { InboundFacts, LevelChangeFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
@@ -276,6 +276,11 @@ export type DispatchDecision =
     }
   /** A signup-approval callback — the pre-existing telegram-poller path. */
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
+  /**
+   * A tap on the Save button of a drafted trip moment (trip-moments.ts). The token is the one the relay put on the button, and is
+   * the whole of the payload: the draft, the trip and the chat are what the relay remembers about it, never what the tap says.
+   */
+  | { kind: "moment_save"; callbackQueryId: string; chatId: string; token: string; fromId: string; fromName: string | null; language: "en" | "he" }
   /** Nothing to do. */
   | { kind: "ignore"; reason: string; analytics?: InboundFacts };
 
@@ -427,6 +432,11 @@ export interface DispatchOptions {
    * 2026-09-20.
    */
   groupContext?: GroupContext;
+  /**
+   * Trip photos and moments (trip-moments.ts): the group's photos saved to the album, saves on request, the moment turn.
+   * Absent - the default - nothing of it happens and every turn is what it was before. Owned by the poller, like the stores above.
+   */
+  moments?: MomentsPort & { clearChat(chatId: string): void };
   /**
    * Whether a trip's companion gateway is connected right now.
    *
@@ -999,6 +1009,7 @@ export async function dispatchUpdate(
       // trip's overheard messages and held documents never reach the new trip's companion.
       options.groupContext?.clear(chatId);
       options.pendingAttachments?.clearChat(chatId);
+      options.moments?.clearChat(chatId);
       log(structuredLog("info", "trip_bot.group_moved", { from_trip_id: redeemed.movedFromTripId, to_trip_id: redeemed.tripId }));
     }
     const facts = await companionIntroFacts(db, redeemed.tripId);
@@ -1491,6 +1502,9 @@ function telegramTurn(message: TelegramMessage, chatId: string, botIdentity: Bot
     repliedToAttachment: repliedAttachment
       ? { ...repliedAttachment, ...(repliedTo?.caption ? { caption: repliedTo.caption } : {}) }
       : null,
+    // The platform's own send times (seconds since the epoch), for the half-hour window of "save the last photos".
+    ...(typeof message.date === "number" ? { sentAtMs: message.date * 1000 } : {}),
+    ...(typeof repliedTo?.date === "number" ? { repliedToSentAtMs: repliedTo.date * 1000 } : {}),
   };
 }
 
@@ -1569,6 +1583,7 @@ function telegramGateDeps(
     ...(options.media ? rehostDeps(options.media) : {}),
     ...(options.pendingAttachments ? { pendingAttachments: options.pendingAttachments } : {}),
     ...(options.groupContext ? { groupContext: options.groupContext } : {}),
+    ...(options.moments ? { moments: options.moments } : {}),
     ...(options.groupJudge ? { groupJudge: options.groupJudge } : {}),
     ...(options.deferJudge ? { deferJudge: true } : {}),
     ...(options.judgedOutcome !== undefined ? { judgedOutcome: options.judgedOutcome } : {}),
@@ -1761,6 +1776,25 @@ async function dispatchCallback(
   if (!callback?.data) return { kind: "ignore", reason: "NO_CALLBACK_DATA" };
 
   const chatId = callback.message?.chat?.id;
+
+  // The Save button of a drafted trip moment (`mom:s:<token>`, 64 bits of the relay's own). Claimed before the shapes below, none of
+  // which it can be mistaken for; the tapper is the update's own `from`, and everything else about the tap is what the relay remembers.
+  const momentTap = /^mom:s:([a-f0-9]{16})$/.exec(callback.data);
+  if (momentTap?.[1] && chatId !== undefined && chatId !== null) {
+    const fromId = callback.from?.id;
+    if (fromId === undefined || fromId === null) return { kind: "ignore", reason: "NO_CALLBACK_SENDER" };
+    const language = await resolveChatLanguage(db, String(chatId), callback.from?.language_code);
+    return {
+      kind: "moment_save",
+      callbackQueryId: callback.id,
+      chatId: String(chatId),
+      token: momentTap[1],
+      fromId: String(fromId),
+      fromName: typeof callback.from?.first_name === "string" ? callback.from.first_name.slice(0, 40) : null,
+      language: language === "he" ? "he" : "en",
+    };
+  }
+
   const parsed = parseCallbackData(callback.data);
 
   // The organizer's Approve / Decline of another Telegram account that opened their interview link (#519). Handled before

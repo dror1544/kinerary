@@ -115,6 +115,15 @@ export class ExplicitTurns {
     }
   }
 
+  /** The id of the latest live turn forwarded to this chat, if it had one. */
+  latestMessageId(chatId: string): string | undefined {
+    const list = this.chats.get(chatId);
+    if (!list) return undefined;
+    const cutoff = this.now() - TURN_MEMORY_MS;
+    const live = list.filter((t) => t.at >= cutoff);
+    return live.length > 0 ? live[live.length - 1]!.messageId : undefined;
+  }
+
   /** Whether the turn a reply answers was explicit; false when nothing is known. */
   wasExplicit(chatId: string, replyTo?: string): boolean {
     const list = this.chats.get(chatId);

@@ -193,6 +193,8 @@ import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import type { MediaDeps } from "./normalize.js";
 import { PendingAttachments } from "./pending-attachments.js";
 import { GroupContext } from "./group-context.js";
+import { photoText } from "./photo-copy.js";
+import type { TripMoments } from "./trip-moments.js";
 import {
   askText, askTextKnownConfirmed, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
   type Language,
@@ -260,6 +262,11 @@ export interface TripBotPollerDeps {
    */
   pendingAttachments?: PendingAttachments;
   groupContext?: GroupContext;
+  /**
+   * Trip photos and moments (trip-moments.ts). Absent - the default - the relay does none of it. Built by server.ts, which owns the
+   * gateway client and the key; the poller hands it to dispatch, runs its burst timer and answers a Save tap.
+   */
+  moments?: TripMoments;
   /**
    * The bounded-call runner behind the interpret path
    * (docs/interview-without-an-agent.md). Absent, `interpret_path` sessions
@@ -343,6 +350,8 @@ const DEFAULT_LONG_POLL_SECONDS = 25;
 // long-poll window.
 const DEFAULT_DELIVER_INTERVAL_MS = 700;
 const DEFAULT_MAX_BACKOFF_MS = 30_000;
+// How often the relay looks for a photo burst that has been quiet long enough (trip-moments.ts).
+const MOMENTS_TICK_MS = 15_000;
 
 // ── Acting on one decision ───────────────────────────────────────────────────
 
@@ -493,6 +502,15 @@ export async function applyDecision(
         chatId: decision.event.source.chat_id,
         text: strings.gatewayUnavailable,
       });
+      return;
+    }
+
+    case "moment_save": {
+      // The tap is always answered, so the button stops spinning; a refusal says why in the answer and posts nothing to the chat.
+      const answer = deps.moments
+        ? await deps.moments.onSaveTap({ chatId: decision.chatId, token: decision.token, fromId: decision.fromId, fromName: decision.fromName, language: decision.language })
+        : { text: photoText("tapUnavailable", decision.language) };
+      await deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId, text: answer.text }).catch(() => {});
       return;
     }
 
@@ -5963,6 +5981,7 @@ export function startTripBotPoller(
         media: deps.media,
         pendingAttachments,
         groupContext,
+        ...(deps.moments ? { moments: deps.moments } : {}),
         ...(deps.superAdminSubjectDigest ? { superAdminSubjectDigest: deps.superAdminSubjectDigest } : {}),
         ...(deps.opsChatId ? { opsChatId: deps.opsChatId } : {}),
         ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
@@ -6160,7 +6179,26 @@ export function startTripBotPoller(
     }));
   });
 
+  // The burst timer of trip moments, on its own beat and not on the delivery loop above: a moment turn is a quick push, but the
+  // interview's delivery must never wait behind anything of this feature. No `deps.moments`, no timer.
+  let momentsTimer: ReturnType<typeof setInterval> | null = null;
+  if (deps.moments) {
+    let ticking = false;
+    momentsTimer = setInterval(() => {
+      if (ticking || stopped) return;
+      ticking = true;
+      deps.moments!.tick()
+        .catch((error: unknown) => {
+          log(structuredLog("warn", "relay.moments_tick_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+        })
+        .finally(() => { ticking = false; });
+    }, MOMENTS_TICK_MS);
+    momentsTimer.unref?.();
+  }
+
   return () => {
     stopped = true;
+    if (momentsTimer) clearInterval(momentsTimer);
+    deps.moments?.stop();
   };
 }

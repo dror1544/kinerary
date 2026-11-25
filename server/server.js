@@ -472,6 +472,12 @@ try { db.exec('ALTER TABLE photos ADD COLUMN source TEXT'); } catch (err) {
   // Only "already there" is fine; anything else is a real fault and stops the boot.
   if (!/duplicate column name/i.test(String(err && err.message))) throw err;
 }
+// The relay's idempotency key for a photo saved from the trip's group (chat id + message id; trip photos and moments, Part B): a
+// retry after a timeout, or an edited message, finds the photo it already saved instead of saving it twice. Nullable.
+try { db.exec('ALTER TABLE photos ADD COLUMN source_ref TEXT'); } catch (err) {
+  if (!/duplicate column name/i.test(String(err && err.message))) throw err;
+}
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_source_ref ON photos(source_ref) WHERE source_ref IS NOT NULL'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN name_en TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN avatar_file TEXT'); } catch {}
 try { db.exec('ALTER TABLE bookings ADD COLUMN apple_wallet_url TEXT'); } catch {}
@@ -2008,44 +2014,154 @@ app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async 
   res.json({ ok: true, photo: { id, filename: req.file.filename, originalName: req.file.originalname, phase: phase || 'general', caption: caption || '', username: owner, uploadedAt: now, source, url: photoFileUrl(req.file.filename), shareUrl: photoShareUrl(id), user: safeUser } });
 
   // Push to Immich in background (non-blocking)
-  if (IMMICH_URL && IMMICH_KEY) {
-    (async () => {
-      try {
-        const form = new FormData();
-        form.append('assetData', fs.createReadStream(req.file.path), {
-          filename: req.file.originalname,
-          contentType: req.file.mimetype,
-          knownLength: req.file.size,
-        });
-        form.append('deviceAssetId', `${req.file.originalname}-${id}`);
-        form.append('deviceId', 'trip-website');
-        form.append('fileCreatedAt', now);
-        form.append('fileModifiedAt', now);
+  pushPhotoToImmich({ filePath: req.file.path, originalName: req.file.originalname, mime: req.file.mimetype, size: req.file.size, id, phase, now });
+});
 
-        const r = await fetch(`${IMMICH_URL}/api/assets`, {
-          method: 'POST',
-          headers: { 'x-api-key': IMMICH_KEY, ...form.getHeaders() },
-          body: form,
-        });
-        const data = await r.json();
-        if (data.id) {
-          db.prepare('UPDATE photos SET immich_id = ? WHERE id = ?').run(data.id, id);
-          if (phase) {
-            const albumId = await getOrCreateAlbum(phase).catch(() => null);
-            if (albumId) {
-              await fetch(`${IMMICH_URL}/api/albums/${albumId}/assets`, {
-                method: 'PUT',
-                headers: { 'x-api-key': IMMICH_KEY, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids: [data.id] }),
-              }).catch(() => {});
-            }
+// The background push of one saved photo to Immich (non-blocking, never fails the save). Shared by the album's own upload and the
+// relay's photos from the trip's group, so a photo reaches Immich the same way whichever door it came through.
+function pushPhotoToImmich({ filePath, originalName, mime, size, id, phase, now }) {
+  if (!(IMMICH_URL && IMMICH_KEY)) return;
+  (async () => {
+    try {
+      const form = new FormData();
+      form.append('assetData', fs.createReadStream(filePath), {
+        filename: originalName,
+        contentType: mime,
+        knownLength: size,
+      });
+      form.append('deviceAssetId', `${originalName}-${id}`);
+      form.append('deviceId', 'trip-website');
+      form.append('fileCreatedAt', now);
+      form.append('fileModifiedAt', now);
+
+      const r = await fetch(`${IMMICH_URL}/api/assets`, {
+        method: 'POST',
+        headers: { 'x-api-key': IMMICH_KEY, ...form.getHeaders() },
+        body: form,
+      });
+      const data = await r.json();
+      if (data.id) {
+        db.prepare('UPDATE photos SET immich_id = ? WHERE id = ?').run(data.id, id);
+        if (phase) {
+          const albumId = await getOrCreateAlbum(phase).catch(() => null);
+          if (albumId) {
+            await fetch(`${IMMICH_URL}/api/albums/${albumId}/assets`, {
+              method: 'PUT',
+              headers: { 'x-api-key': IMMICH_KEY, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ids: [data.id] }),
+            }).catch(() => {});
           }
         }
-      } catch (e) {
-        console.error('Immich background upload failed:', e.message);
       }
-    })();
+    } catch (e) {
+      console.error('Immich background upload failed:', e.message);
+    }
+  })();
+}
+
+// ── PHOTOS FROM THE TRIP'S GROUP (docs/specs/sprint-9/x-trip-photos-and-moments.md, Part B) ──────────────────────────────────────
+// What the control plane's relay reads and writes, through the runtime gateway with this trip's own key (control-plane-auth.js
+// `internal`: the dedicated key, this trip's id, the owner mapping). Nobody else can reach them: not a member, not the agent key.
+// All three answer 409 `feature_off` while the trip's `chat_photos_to_album` switch is not exactly true, and change nothing.
+//
+// The relay never names a username. It sends the sender's Telegram id and the site maps it to a participant; an id that maps to
+// nobody (or to a removed participant) is a GUEST, saved only while automatic saving is on and stored under a name no participant
+// can have, which the album shows as "a guest".
+const GUEST_USERNAME = '_guest';
+const CHAT_PHOTO_MAX_BYTES = 20 * 1024 * 1024; // Telegram's own download limit for a bot
+const chatPhotosOn = (_req, res, next) => (featureOn('chat_photos_to_album') ? next() : res.status(409).json({ error: 'feature_off' }));
+
+// The type decides by the bytes, never by what the sender's client declared: the extension that is stored is the one the bytes earn.
+function chatPhotoExtension(bytes) {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return '.jpg';
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return '.png';
+  if (bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('latin1'))) return '.gif';
+  if (bytes.length >= 12 && bytes.subarray(0, 4).toString('latin1') === 'RIFF' && bytes.subarray(8, 12).toString('latin1') === 'WEBP') return '.webp';
+  if (bytes.length >= 12 && bytes.subarray(4, 8).toString('latin1') === 'ftyp') {
+    const brand = bytes.subarray(8, 12).toString('latin1');
+    if (['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) return '.heic';
   }
+  return '';
+}
+
+app.get('/api/internal/control-plane/photo-settings', controlPlaneAuth.internal, (_req, res) => {
+  const photos = featureOn('chat_photos_to_album');
+  const settings = journey.tripSettings();
+  res.json({
+    chat_photos_to_album: photos,
+    trip_moments_capture: featureOn('trip_moments_capture'),
+    group_photo_autosave: settings.group_photo_autosave,
+    moment_capture_mode: settings.moment_capture_mode,
+    // True only while the group has not been told that photos posted in it are saved (and they are).
+    autosave_notice_pending: photos && settings.group_photo_autosave === true && journey.autosaveNoticePending(),
+    // Who the site knows by Telegram id: the same map a photo's sender is attributed by, so the relay's own checks (who may ask for a
+    // save, whose words may be quoted) and the album agree on who is a participant. Only participants whose id is bound and who
+    // have not been removed; names are the display names the family already sees. The internal key is the only way here.
+    participants: photos || featureOn('trip_moments_capture')
+      ? db.prepare('SELECT username, name, name_en, telegram_id FROM users WHERE telegram_id IS NOT NULL AND removed_at IS NULL ORDER BY username').all()
+          .map((u) => ({ telegram_id: String(u.telegram_id), username: u.username, name: u.name || null, name_en: u.name_en || null }))
+      : [],
+  });
+});
+
+app.post('/api/internal/control-plane/photo-notice', controlPlaneAuth.internal, chatPhotosOn, (_req, res) => {
+  // Acknowledged only while automatic saving is on: a notice for a setting that is off is not one that was given.
+  if (journey.tripSettings().group_photo_autosave === true) journey.ackAutosaveNotice();
+  res.json({ ok: true });
+});
+
+app.post('/api/internal/control-plane/photos', controlPlaneAuth.internal, chatPhotosOn, (req, res) => {
+  const body = req.body || {};
+  const mode = body.mode;
+  if (mode !== 'auto' && mode !== 'requested') return res.status(400).json({ error: 'invalid_mode' });
+  const sender = body.sender === null || body.sender === undefined ? null : body.sender;
+  if (sender !== null && !(typeof sender === 'string' && /^\d{1,20}$/.test(sender))) return res.status(400).json({ error: 'invalid_sender' });
+  const messageKey = body.messageKey;
+  if (typeof messageKey !== 'string' || !/^[A-Za-z0-9:_-]{1,120}$/.test(messageKey)) return res.status(400).json({ error: 'invalid_message_key' });
+  if (typeof body.data !== 'string' || body.data.length === 0 || body.data.length > Math.ceil(CHAT_PHOTO_MAX_BYTES / 3) * 4 + 8) {
+    return res.status(400).json({ error: 'invalid_photo' });
+  }
+  const settings = journey.tripSettings();
+  // The setting, enforced here and not only by the relay (AC-9): an automatic save with automatic saving off is refused.
+  if (mode === 'auto' && settings.group_photo_autosave !== true) return res.status(409).json({ error: 'autosave_off' });
+
+  // The same photo again (a retry after a timeout, an edited message): the photo already saved, nothing written.
+  const existing = db.prepare('SELECT id, username, phase FROM photos WHERE source_ref = ?').get(messageKey);
+  if (existing) return res.json({ ok: true, duplicate: true, photo: { id: existing.id, phase: existing.phase, username: existing.username, guest: existing.username === GUEST_USERNAME } });
+
+  const bytes = Buffer.from(body.data, 'base64');
+  if (bytes.length === 0 || bytes.length > CHAT_PHOTO_MAX_BYTES) return res.status(400).json({ error: 'invalid_photo' });
+  const extension = chatPhotoExtension(bytes);
+  if (!extension) return res.status(400).json({ error: 'unsupported_file_type' });
+
+  const participant = sender ? db.prepare('SELECT username FROM users WHERE telegram_id = ? AND removed_at IS NULL').get(sender) : null;
+  if (!participant && settings.group_photo_autosave !== true) return res.status(403).json({ error: 'guest_requires_autosave' });
+  const owner = participant ? participant.username : GUEST_USERNAME;
+
+  // When it was sent decides the day, and the day decides the stop; a trip with no stop on that day files it as 'general'.
+  const parsedSent = typeof body.sentAt === 'string' ? Date.parse(body.sentAt) : NaN;
+  const sentMs = Number.isFinite(parsedSent) && parsedSent <= Date.now() + 86_400_000 ? parsedSent : Date.now();
+  const sentAt = new Date(sentMs).toISOString();
+  const phase = journey.stopOnDay(journey.dayAt(new Date(sentMs))) || 'general';
+
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}${extension}`;
+  const filePath = path.join(UPLOADS_DIR, filename);
+  const originalName = `chat-photo${extension}`;
+  const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    fs.writeFileSync(filePath, bytes, { flag: 'wx' });
+    db.prepare('INSERT INTO photos (id, filename, original_name, phase, caption, username, uploaded_at, source, source_ref) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(id, filename, originalName, phase, '', owner, sentAt, 'chat', messageKey);
+  } catch (error) {
+    try { fs.unlinkSync(filePath); } catch {}
+    // A concurrent save of the same message won the unique index: that photo is the answer.
+    const raced = db.prepare('SELECT id, username, phase FROM photos WHERE source_ref = ?').get(messageKey);
+    if (raced) return res.json({ ok: true, duplicate: true, photo: { id: raced.id, phase: raced.phase, username: raced.username, guest: raced.username === GUEST_USERNAME } });
+    console.error(`chat_photo.save_failed: ${error && error.code ? error.code : 'unknown'}`);
+    return res.status(500).json({ error: 'save_failed' });
+  }
+  pushPhotoToImmich({ filePath, originalName, mime: { '.jpg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic' }[extension], size: bytes.length, id, phase, now: sentAt });
+  res.json({ ok: true, duplicate: false, photo: { id, phase, username: owner, guest: !participant } });
 });
 
 // A signed link for one gallery file: an <img> cannot send a bearer token, so
@@ -2080,7 +2196,8 @@ app.get('/api/photos', authRequired, (req, res) => {
     source: PHOTO_SOURCES.has(p.source) ? p.source : 'site',
     url: photoFileUrl(p.filename),
     shareUrl: photoShareUrl(p.id),
-    user: publicUser(getUser(p.username)) || { username: p.username },
+    // A photo saved from the group for someone who is not a participant (see GUEST_USERNAME): no name, only the label.
+    user: p.username === GUEST_USERNAME ? { username: GUEST_USERNAME, name: 'אורח', name_en: 'A guest', guest: true } : publicUser(getUser(p.username)) || { username: p.username },
   }));
   res.json(photos);
 });
