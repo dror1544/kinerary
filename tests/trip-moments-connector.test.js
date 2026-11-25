@@ -450,6 +450,43 @@ describe('F3: the consent page names exactly what a member\'s connection will be
     assert.equal(r.granted, null, 'nothing was granted');
   });
 
+  it('R3: if the scope request REJECTS (a network error) the page catches it: no text, Allow off, the error shown, no decision sent', async () => {
+    const r = await consent({ trip_moments_capture: true }, 'bob', { intercept: (path) => (path.includes('/oauth/authorize/scope') ? Promise.reject(new Error('network down')) : null), press: true });
+    assert.equal(r.can, '');
+    assert.equal(r.wants, '');
+    assert.equal(r.allowDisabled, true);
+    assert.ok(r.error);
+    assert.ok(!r.requests.some((q) => q.includes('/oauth/authorize/decision')));
+    assert.equal(r.granted, null);
+  });
+
+  it('R3: after a 409 whose re-read fails, the stale text is cleared and Allow is off', async () => {
+    let scopeCalls = 0;
+    const intercept = (path) => {
+      if (path.includes('/oauth/authorize/decision')) return Promise.resolve(new Response('{"error":"consent_changed","scope":"trip:read"}', { status: 409, headers: { 'content-type': 'application/json' } }));
+      if (path.includes('/oauth/authorize/scope') && ++scopeCalls > 1) return Promise.reject(new Error('network down'));
+      return null;
+    };
+    const r = await consent({ trip_moments_capture: true }, 'bob', { intercept, press: true });
+    assert.equal(scopeCalls, 2, 'it asked again after the 409');
+    assert.equal(r.can, '', 'the old moments text is not left on the page');
+    assert.equal(r.allowDisabled, true);
+    assert.ok(r.error);
+    assert.equal(r.granted, null);
+  });
+
+  it('R3: after a 409 whose re-read works, the page shows the new text and Allow is on again', async () => {
+    let scopeCalls = 0;
+    const intercept = (path) => {
+      if (path.includes('/oauth/authorize/decision')) return Promise.resolve(new Response('{"error":"consent_changed","scope":"trip:read"}', { status: 409, headers: { 'content-type': 'application/json' } }));
+      if (path.includes('/oauth/authorize/scope') && ++scopeCalls > 1) return Promise.resolve(new Response('{"scope":"trip:read"}', { status: 200, headers: { 'content-type': 'application/json' } }));
+      return null;
+    };
+    const r = await consent({ trip_moments_capture: true }, 'bob', { intercept, press: true });
+    assert.match(r.can, /but not change anything/);
+    assert.equal(r.allowDisabled, false);
+  });
+
   it('R3: the decision refuses (409, no code) when the scope shown is not the scope that would be granted', async () => {
     const ctx = await boot({ trip_moments_capture: true });
     try {

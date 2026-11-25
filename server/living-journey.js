@@ -1453,6 +1453,9 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
       return res.status(400).json({ error: 'nav_app must be "google" or "waze"' });
     }
     const hasAutosave = body.group_photo_autosave !== undefined;
+    // The photo and moment choices are the organizer's: the agent key (the companion, which a chat can talk to) may not change them.
+    // It keeps the settings it changes today (the timezone and the group line). Refused whole: nothing of a mixed body is applied.
+    if (req.user?.isAgent && (hasAutosave || body.moment_capture_mode !== undefined)) return res.status(403).json({ error: 'organizer_only_setting' });
     if (hasAutosave && typeof body.group_photo_autosave !== 'boolean') {
       return res.status(400).json({ error: 'group_photo_autosave must be true or false' });
     }
@@ -1992,6 +1995,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
   // ChatGPT, their own words). Provenance is what the publishing rule below turns on, so a member cannot claim `chat`.
   const MOMENT_SOURCES = new Set(['site', 'chat', 'connector']);
   const MEMBER_MOMENT_SOURCES = new Set(['site', 'connector']);
+  const AGENT_MOMENT_SOURCES = new Set(['chat']);
   const MAX_MOMENT_PHOTOS = 20;
   const PHOTO_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
   const momentOut = (row) => {
@@ -2028,7 +2032,9 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
   // `ask_in_chat` (the agent publishes after the chat says yes) and `publish` it may. Organizers are never limited by the mode. Only while
   // the trip has trip_moments_capture on: with it off there are no modes, and the agent behaves as before. An unreadable mode is
   // organizer_draft (tripSettings fails safe), so a damaged setting never lets the agent publish.
-  const agentMayPublishChat = (req) => !req.user?.isAgent || !switchOn('trip_moments_capture') || tripSettings(db).moment_capture_mode !== 'organizer_draft';
+  // Keyed on the CALLER, not on a label the row carries: with the mode organizer_draft the agent key is refused any publish, a POST
+  // or a PATCH, whatever source the moment has.
+  const agentMayPublish = (req) => !req.user?.isAgent || !switchOn('trip_moments_capture') || tripSettings(db).moment_capture_mode !== 'organizer_draft';
 
   app.get('/api/moments', authRequired, (req, res) => {
     // Everyone sees published moments and their own drafts. An organizer or the agent key also sees the drafts that came from the
@@ -2048,9 +2054,10 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (typeof body.caption !== 'string' || !body.caption.trim()) return res.status(400).json({ error: 'caption required' });
     const photos = readPhotoIds(body.photo_ids);
     if (photos.error) return res.status(400).json({ error: photos.error });
-    // `chat` only from the agent key; a member's moment is `site` or `connector`.
-    const allowedSources = req.user.isAgent ? MOMENT_SOURCES : MEMBER_MOMENT_SOURCES;
-    if (body.source !== undefined && !allowedSources.has(body.source)) return res.status(400).json({ error: req.user.isAgent ? 'source must be "site", "chat" or "connector"' : 'source must be "site" or "connector"' });
+    // Provenance is fixed by WHO writes: the agent key's moments are `chat`, always (it cannot relabel itself `site` or `connector` to
+    // dodge the organizer review that `chat` carries), and a member's are `site` or `connector`, never `chat`.
+    const allowedSources = req.user.isAgent ? AGENT_MOMENT_SOURCES : MEMBER_MOMENT_SOURCES;
+    if (body.source !== undefined && !allowedSources.has(body.source)) return res.status(400).json({ error: req.user.isAgent ? 'source must be "chat"' : 'source must be "site" or "connector"' });
     // `author` is the agent key's alone: the companion writes a moment in the name of the participant who said or sent it. A member
     // cannot write one in anyone's name (nor their own: the route already knows who they are), and a name that is not a participant
     // is refused, so the field can never mint an author the site has no person for.
@@ -2071,7 +2078,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     const id = revisionId('moment');
     const visibility = body.visibility === 'published' ? 'published' : 'draft';
     const sourceOut = body.source || (req.user.isAgent ? 'chat' : 'site');
-    if (visibility === 'published' && sourceOut === 'chat' && !agentMayPublishChat(req)) return res.status(403).json({ error: 'organizer_review_required' });
+    if (visibility === 'published' && !agentMayPublish(req)) return res.status(403).json({ error: 'organizer_review_required' });
     db.prepare(
       'INSERT INTO trip_moments (id,date,phase_id,item_uid,author,caption,body,photo_id,photo_ids,source,visibility) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
     ).run(id, body.date || null, body.phase_id || null, body.item_uid || null, author, body.caption.trim(), body.body || null, ids[0] || null, JSON.stringify(ids), sourceOut, visibility);
@@ -2086,7 +2093,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (isChatMoment(row) && !isStaff(req) && (req.body?.visibility === 'published' || row.visibility === 'published')) {
       return res.status(403).json({ error: 'organizer_review_required' });
     }
-    if (isChatMoment(row) && row.visibility !== 'published' && req.body?.visibility === 'published' && !agentMayPublishChat(req)) {
+    if (row.visibility !== 'published' && req.body?.visibility === 'published' && !agentMayPublish(req)) {
       return res.status(403).json({ error: 'organizer_review_required' });
     }
     const photos = req.body?.photo_ids !== undefined ? readPhotoIds(req.body.photo_ids) : null;

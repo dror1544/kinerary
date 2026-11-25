@@ -103,6 +103,51 @@ describe('switch ON: the moment tools work through the agent key, against the re
     assert.match(missing.content[0].text, /404/);
   });
 
+  test('F1 (R4) through the real mcp.js: in organizer_draft mode every way for the agent to publish — or to relabel itself to dodge the review — is refused', async () => {
+    const mode = async (m) => assert.equal((await api('/api/settings', { method: 'PATCH', body: { moment_capture_mode: m }, token: ctx.alice })).status, 200);
+    await mode('organizer_draft');
+    try {
+      const stored = async () => (await (await api('/api/moments', { token: ctx.alice })).json());
+      const before = (await stored()).length;
+      // A: published straight away, as chat / relabelled site / relabelled connector (the tool only knows "chat").
+      for (const source of ['chat', 'site', 'connector']) {
+        const r = await mcpCallTool('add_moment', { caption: `probe ${source}`, author: 'bob', source, visibility: 'published' });
+        assert.equal(r.isError, true, source);
+      }
+      assert.equal((await stored()).length, before, 'nothing was stored by any of them');
+      // B: a draft first, then update_moment to published.
+      const draft = json(await mcpCallTool('add_moment', { caption: 'draft then publish', author: 'bob', source: 'chat' }));
+      assert.equal(draft.source, 'chat');
+      assert.equal(draft.visibility, 'draft');
+      const publish = await mcpCallTool('update_moment', { id: draft.id, visibility: 'published' });
+      assert.equal(publish.isError, true);
+      assert.match(publish.content[0].text, /403/);
+      assert.match(publish.content[0].text, /organizer_review_required/);
+      // C: a member's own moment (site or connector) is not the agent's to publish in this mode either.
+      for (const source of ['site', 'connector']) {
+        const m = await (await api('/api/moments', { method: 'POST', token: ctx.bob, body: { caption: `bob ${source}`, source } })).json();
+        const r = await mcpCallTool('update_moment', { id: m.id, visibility: 'published' });
+        assert.equal(r.isError, true, source);
+      }
+      assert.ok((await stored()).filter((m) => m.caption.startsWith('probe') || m.caption === 'draft then publish' || m.caption.startsWith('bob ')).every((m) => m.visibility === 'draft'), 'everything is still a draft');
+      // Raw HTTP, the same refusals.
+      const post = await api('/api/moments', { method: 'POST', apiKey: 'test-hermes-key', body: { caption: 'raw', author: 'bob', source: 'connector', visibility: 'published' } });
+      assert.equal(post.status, 400);
+      const rawPost = await api('/api/moments', { method: 'POST', apiKey: 'test-hermes-key', body: { caption: 'raw', author: 'bob', visibility: 'published' } });
+      assert.equal(rawPost.status, 403);
+    } finally { await mode('ask_in_chat'); }
+  });
+
+  test('F2: through the agent key the moment mode and the photo saving cannot be changed; the timezone still can', async () => {
+    for (const body of [{ moment_capture_mode: 'publish' }, { group_photo_autosave: false }]) {
+      const r = await api('/api/settings', { method: 'PATCH', apiKey: 'test-hermes-key', body });
+      assert.equal(r.status, 403);
+      assert.deepEqual(await r.json(), { error: 'organizer_only_setting' });
+    }
+    const tz = json(await mcpCallTool('set_trip_timezone', { timezone: 'Europe/Paris' }));
+    assert.equal(tz.timezone, 'Europe/Paris');
+  });
+
   test('get_photo_settings reads the two choices and the two switches', async () => {
     assert.deepEqual(json(await mcpCallTool('get_photo_settings', {})), {
       group_photo_autosave: true, moment_capture_mode: 'ask_in_chat', switches: { chat_photos_to_album: true, trip_moments_capture: true },

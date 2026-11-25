@@ -126,10 +126,20 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
   const show = id => { for (const s of ['login', 'consent']) $(s).hidden = s !== id; };
   const fail = msg => { $('error').textContent = msg; $('error').hidden = !msg; };
   const json = async (path, init = {}) => {
-    const r = await fetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init.headers || {}) } });
+    // A network failure is an answer too (not ok, status 0): nothing here may throw past the caller and leave the page as it was.
+    let r;
+    try { r = await fetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init.headers || {}) } }); }
+    catch { return { ok: false, status: 0, body: null }; }
     let body = null; try { body = await r.json(); } catch {}
     return { ok: r.ok, status: r.status, body };
   };
+  // Nothing approvable is on the page: no text that could be wrong, Allow off, the error shown.
+  function noApproval() {
+    shown = null;
+    $('wants').textContent = ''; $('can').textContent = '';
+    $('allow').disabled = true;
+    fail(T.failed);
+  }
   async function adopt(token) {
     const me = await json('/api/auth/me', { headers: { authorization: 'Bearer ' + token } });
     if (!me.ok) return false;
@@ -146,8 +156,7 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
     shown = sc.ok && sc.body && ['trip', 'trip:moments', 'trip:read'].includes(sc.body.scope) ? sc.body.scope : null;
     $('wants').textContent = shown === 'trip' ? T.wants : shown === 'trip:moments' ? T.wantsMoments : shown === 'trip:read' ? T.wantsRead : '';
     $('can').textContent = shown === 'trip' ? T.can : shown === 'trip:moments' ? T.canMoments : shown === 'trip:read' ? T.canRead : '';
-    $('allow').disabled = !shown;
-    if (!shown) fail(T.failed);
+    if (shown) $('allow').disabled = false; else noApproval();
     const title = cfg.ok && cfg.body && cfg.body.meta && cfg.body.meta.title;
     $('trip').textContent = (title && typeof title === 'object' ? (title[document.documentElement.lang] || title.en || title.he) : title) || '';
     $('who').textContent = me.body.name_en || me.body.name || me.body.username;
@@ -165,8 +174,9 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
     if (decision === 'allow' && !shown) return fail(T.failed);
     const r = await json('/oauth/authorize/decision', { method: 'POST', headers: { authorization: 'Bearer ' + session }, body: JSON.stringify({ ...PARAMS, decision, consent_scope: shown }) });
     if (r.ok && r.body && r.body.redirect_to) { window.location.replace(r.body.redirect_to); return; }
-    // The scope moved while the page was open: show the new text and ask again.
-    if (r.status === 409 && decision === 'allow') { await adopt(session); return; }
+    // The scope moved while the page was open: show the new text and ask again. If it cannot be re-read, the old text must not stay
+    // approvable.
+    if (r.status === 409 && decision === 'allow') { if (!(await adopt(session))) noApproval(); return; }
     fail(r.status === 403 ? T.notOrganizer : T.failed);
   }
   $('allow').addEventListener('click', () => decide('allow'));

@@ -200,6 +200,65 @@ test('R4: the agent key obeys moment_capture_mode — organizer_draft: it cannot
   } finally { await setMode('ask_in_chat'); }
 });
 
+test('F1: anything the agent key creates is source chat — it cannot relabel itself site or connector (400, nothing stored)', async () => {
+  const n = (await moments(AGENT)).length;
+  for (const source of ['site', 'connector', 'telegram', 5]) {
+    const res = await api('/api/moments', { method: 'POST', body: { caption: 'relabel', author: 'bob', source }, ...AGENT });
+    assert.equal(res.status, 400, String(source));
+    assert.match((await res.json()).error, /source/);
+  }
+  assert.equal((await moments(AGENT)).length, n);
+  const ok = await (await api('/api/moments', { method: 'POST', body: { caption: 'explicit chat', author: 'bob', source: 'chat' }, ...AGENT })).json();
+  assert.equal(ok.source, 'chat');
+  const bare = await (await api('/api/moments', { method: 'POST', body: { caption: 'no source, attributed to bob', author: 'bob' }, ...AGENT })).json();
+  assert.equal(bare.source, 'chat', 'attributed to a member, still a chat moment: bob cannot publish it');
+  assert.equal((await api(`/api/moments/${bare.id}`, { method: 'PATCH', body: { visibility: 'published' }, token: bob })).status, 403);
+});
+
+test('F1 (R4, keyed on the caller): in organizer_draft mode the agent key is refused ANY publish, whatever the stored source', async () => {
+  const setMode = async (mode) => assert.equal((await patch({ moment_capture_mode: mode })).status, 200);
+  try {
+    // Moments the agent did not create, of every source a member can have.
+    const siteDraft = await (await moment({ caption: 'bob site draft' }, { token: bob })).json();
+    const connectorDraft = await (await moment({ caption: 'bob connector draft', source: 'connector' }, { token: bob })).json();
+    await setMode('organizer_draft');
+    for (const m of [siteDraft, connectorDraft]) {
+      const r = await api(`/api/moments/${m.id}`, { method: 'PATCH', body: { visibility: 'published' }, ...AGENT });
+      assert.equal(r.status, 403, m.source);
+      assert.deepEqual(await r.json(), { error: 'organizer_review_required' });
+    }
+    // Draft, then PATCH — the reviewer's variant: the draft is the agent's own.
+    const own = await (await api('/api/moments', { method: 'POST', body: { caption: 'draft first', author: 'bob' }, ...AGENT })).json();
+    assert.equal((await api(`/api/moments/${own.id}`, { method: 'PATCH', body: { visibility: 'published' }, ...AGENT })).status, 403);
+    // Direct publish, with and without relabelling.
+    for (const body of [{ visibility: 'published' }, { visibility: 'published', source: 'chat' }, { visibility: 'published', source: 'site' }, { visibility: 'published', source: 'connector' }]) {
+      const r = await api('/api/moments', { method: 'POST', body: { caption: 'direct', author: 'bob', ...body }, ...AGENT });
+      assert.ok([400, 403].includes(r.status), JSON.stringify(body));
+    }
+    const all = await moments({ token: alice });
+    assert.ok(all.filter((m) => [siteDraft.id, connectorDraft.id, own.id].includes(m.id)).every((m) => m.visibility === 'draft'), 'nothing was published');
+    // An organizer is not limited; ask_in_chat lets the agent publish again.
+    assert.equal((await api(`/api/moments/${connectorDraft.id}`, { method: 'PATCH', body: { visibility: 'published' }, token: alice })).status, 200);
+    await setMode('ask_in_chat');
+    assert.equal((await api(`/api/moments/${siteDraft.id}`, { method: 'PATCH', body: { visibility: 'published' }, ...AGENT })).status, 200);
+  } finally { await setMode('ask_in_chat'); }
+});
+
+test('F2: the agent key cannot change moment_capture_mode or group_photo_autosave (403, nothing half-written); it keeps the other settings it changes today', async () => {
+  const before = await settings();
+  for (const body of [{ moment_capture_mode: 'publish' }, { group_photo_autosave: false }, { group_change_line: false, moment_capture_mode: 'publish' }, { timezone: 'Asia/Tokyo', group_photo_autosave: false }]) {
+    const r = await patch(body, AGENT);
+    assert.equal(r.status, 403, JSON.stringify(body));
+    assert.deepEqual(await r.json(), { error: 'organizer_only_setting' });
+  }
+  assert.deepEqual(await settings(), before, 'nothing changed, not even the allowed half of a mixed body');
+  assert.equal((await patch({ timezone: 'Asia/Tokyo' }, AGENT)).status, 200, 'set_trip_timezone still works');
+  assert.equal((await patch({ group_change_line: false }, AGENT)).status, 200, 'set_group_change_line still works');
+  assert.equal((await patch({ group_change_line: true, timezone: before.timezone || 'Asia/Jerusalem' }, AGENT)).status, 200);
+  assert.equal((await patch({ moment_capture_mode: 'organizer_draft', group_photo_autosave: false })).status, 200, 'an organizer still can');
+  assert.equal((await patch({ moment_capture_mode: 'ask_in_chat', group_photo_autosave: true })).status, 200);
+});
+
 test('F1: a moment the agent writes with no source is a chat moment, and the agent may publish it directly', async () => {
   const made = await (await moment({ caption: 'Agent default source', author: 'bob', visibility: 'published' }, AGENT)).json();
   assert.equal(made.source, 'chat');
