@@ -402,6 +402,12 @@ services:
       # own doc comment, property 1). Turning it on anywhere real is a separate,
       # deliberate step that still waits on retention and the family-notice work.
       ASSISTANT_EVENTS_ENABLED: ${ASSISTANT_EVENTS_ENABLED:-}
+      # Trip photos and moments (docs/specs/sprint-9/x-trip-photos-and-moments.md, Part B): the relay reaches a trip's site
+      # through the runtime gateway with the exchange key, which the architecture profile names as
+      # `web.runtime_exchange_key_secret_ref: env://RUNTIME_EXCHANGE_KEY`. Without it the relay logs
+      # relay.trip_photos_unavailable at boot and saves no photo, whatever a trip's switches say. Same value the api and
+      # the runtime-gateway take above.
+      RUNTIME_EXCHANGE_KEY: ${RUNTIME_EXCHANGE_KEY:-}
     # CLAUDE_CODE_OAUTH_TOKEN, minted with `claude setup-token`; and
     # OPENROUTER_API_KEY — the same key Hermes holds, since an API key has no
     # rotating state (codex and anthropic OAuth are each logged into separately:
