@@ -23,10 +23,10 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
-import { confirmIntakeForChat, queueInboundMessage } from "../src/interview.js";
+import { confirmIntakeForChat, getSessionForChat, INTAKE_QUESTIONS, queueInboundMessage } from "../src/interview.js";
 import { uiString } from "../src/intake-copy.js";
 import { CONFIRM_CALLBACK_DATA } from "../src/chat-router.js";
-import { applyDecision, flushSettledInboundBursts } from "../src/relay/poller.js";
+import { applyDecision, flushSettledInboundBursts, forgetShownPreviewsForTests } from "../src/relay/poller.js";
 import { burstKey, claimInterpretation, setInterpretPath } from "../src/interpret.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
@@ -739,6 +739,248 @@ describe("typed changes: saying it in words, and everything the router must not 
         ["Avi Cohen", "Dror Cohen", "Mom Cohen", "Ruth Cohen"],
         "#205: the rest of the roster survives",
       );
+    });
+  });
+});
+
+// ── #666: "no, keep it" typed while a change waits ───────────────────────────
+//
+// Real-model run, 2026-11-25: a box was waiting (stay end 17 May -> 16 May); the organizer typed "לא, רגע — עד 17 במאי".
+// The held end already IS 17 May, the reader emitted no operation, and the draft stayed pending with the recap re-sent
+// beneath the live box.
+describe("a typed refusal that restates what is held cancels the waiting change (#666)", opts, () => {
+  const LJUBLJANA = [{ name: "לובליאנה", start: "2027-05-10", end: "2027-05-17" }];
+  const toTheSixteenth = () => [update("לובליאנה", { end: "2027-05-16" })];
+
+  async function waitingBox(pool: pg.Pool, a: Chat, tg: Telegram, ops: { current: unknown[] }) {
+    await hold(pool, a, "phases", LJUBLJANA);
+    await pool.query("UPDATE control_plane.intake_sessions SET language = 'he' WHERE id = $1", [a.sessionId]);
+    const model = fakeModel(() => ops.current);
+    await say(pool, a, "הלינה בלובליאנה עד 16 במאי", tg, model);
+    assert.ok(tg.button("a"), "the box is up");
+    assert.deepEqual(await draftStatuses(pool, a), ["pending"]);
+    return model;
+  }
+
+  async function sayLogged(pool: pg.Pool, a: Chat, text: string, tg: Telegram, model: { runner: unknown }): Promise<string[]> {
+    const logs: string[] = [];
+    seq += 1;
+    await queueInboundMessage(pool, a.chatId, { text, message_id: `m${seq}` } as never);
+    await flushSettledInboundBursts(
+      { db: pool, telegram: tg, connector: { pushInbound: () => true }, modelRunner: model.runner, log: (l: string) => { logs.push(l); } } as never,
+      (l: string) => { logs.push(l); },
+      0,
+    );
+    return logs;
+  }
+
+  test("the reader returns nothing: 'לא, רגע — עד 17 במאי' is the organizer's No - box collapsed, told once, interview resumed once", async () => {
+    await withChats(async (pool, a) => {
+      const edits: string[] = [];
+      const tg = new Telegram();
+      tg.editMessageText = async (p: { text?: string }) => { edits.push(p.text ?? ""); return { ok: true as const }; };
+      const ops = { current: toTheSixteenth() as unknown[] };
+      const model = await waitingBox(pool, a, tg, ops);
+      const before = tg.sent.length;
+
+      ops.current = [];
+      const logs = await sayLogged(pool, a, "לא, רגע — עד 17 במאי", tg, model);
+
+      assert.deepEqual(await draftStatuses(pool, a), ["cancelled"], `logged: ${logs.filter((l) => l.includes("change_")).join(" | ")}`);
+      assert.ok(logs.some((l) => l.includes("interview.change_no_restated")), "and it says why");
+      assert.equal(edits.length, 1, "the box lost its buttons");
+      assert.ok(edits[0]!.includes(`✖ ${uiString("change.cancelled", "he")}`), edits[0]);
+      const after = tg.sent.slice(before);
+      assert.equal(after.filter((m) => m.text === uiString("change.cancelled", "he")).length, 1, "told once");
+      assert.ok(after.length >= 2, "and the interview went on after it");
+      assert.ok(after.every((m) => !m.buttons.some((b) => b.callback_data.startsWith("pc:"))), "no second box, nothing to confirm");
+      assert.equal((await stored(pool, a, "phases"))[0].end, "2027-05-17");
+      assert.notEqual((await confirmIntakeForChat(pool, a.chatId) as { reason?: string }).reason, "PENDING_CHANGE");
+    });
+  });
+
+  test("the second wording of the run, and English, cancel the same way", async () => {
+    for (const text of ["לא, הלינה בלובליאנה נשארת עד 17 במאי", "no, keep it until 17 May"]) {
+      await withChats(async (pool, a) => {
+        const tg = new Telegram();
+        const ops = { current: toTheSixteenth() as unknown[] };
+        const model = await waitingBox(pool, a, tg, ops);
+        ops.current = [];
+        await sayLogged(pool, a, text, tg, model);
+        assert.deepEqual(await draftStatuses(pool, a), ["cancelled"], text);
+      });
+    }
+  });
+
+  test("the reader does emit the restating operation: #647's merged no-op cancels it and the backstop does not run twice", async () => {
+    await withChats(async (pool, a) => {
+      const edits: string[] = [];
+      const tg = new Telegram();
+      tg.editMessageText = async (p: { text?: string }) => { edits.push(p.text ?? ""); return { ok: true as const }; };
+      const ops = { current: toTheSixteenth() as unknown[] };
+      const model = await waitingBox(pool, a, tg, ops);
+      const before = tg.sent.length;
+      ops.current = [update("לובליאנה", { end: "2027-05-17" })];
+      const logs = await sayLogged(pool, a, "תחזירו את סוף הלינה בלובליאנה ל-17 במאי", tg, model);
+      assert.deepEqual(await draftStatuses(pool, a), ["cancelled"]);
+      assert.ok(logs.some((l) => l.includes("interview.change_noop") && l.includes('"merged":true')));
+      assert.ok(!logs.some((l) => l.includes("interview.change_no_restated")));
+      assert.equal(edits.length, 1);
+      assert.equal(tg.sent.slice(before).filter((m) => m.text === uiString("change.cancelled", "he")).length, 1);
+    });
+  });
+
+  test("the reader is told a change waits, and what it would do - only while one does", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", LJUBLJANA);
+      const prompts: string[] = [];
+      const runner = {
+        async run(args: { prompt: string }) {
+          prompts.push(args.prompt);
+          return { ok: true as const, value: { proposals: [], unclear: [], malformed: 0, ops: prompts.length === 1 ? toTheSixteenth() : [] }, attempts: 1, ms: 1 };
+        },
+      };
+      const tg = new Telegram();
+      await say(pool, a, "הלינה בלובליאנה עד 16 במאי", tg, { runner });
+      await say(pool, a, "לא, רגע — עד 17 במאי", tg, { runner });
+      assert.equal(prompts.length, 2);
+      assert.doesNotMatch(prompts[0]!, /A CHANGE IS WAITING/, "nothing waits at the first message");
+      assert.match(prompts[1]!, /A CHANGE IS WAITING/);
+      assert.ok(prompts[1]!.includes("2027-05-16"), "with what it would do");
+    });
+  });
+
+  test("a different new value is a correction, never a cancel: it merges and the new box shows it", async () => {
+    await withChats(async (pool, a) => {
+      const tg = new Telegram();
+      const ops = { current: toTheSixteenth() as unknown[] };
+      const model = await waitingBox(pool, a, tg, ops);
+      ops.current = [update("לובליאנה", { end: "2027-05-21" })];
+      await sayLogged(pool, a, "לא, עד 21 במאי", tg, model);
+      assert.deepEqual(await draftStatuses(pool, a), ["pending"]);
+      assert.match(tg.last!.text, /21/);
+      assert.ok(tg.button("a"), "a new box to confirm");
+    });
+  });
+
+  test("a refusal with a different value the reader missed is not cancelled either: the value is the organizer's, not ours to drop", async () => {
+    await withChats(async (pool, a) => {
+      const tg = new Telegram();
+      const ops = { current: toTheSixteenth() as unknown[] };
+      const model = await waitingBox(pool, a, tg, ops);
+      ops.current = [];
+      const logs = await sayLogged(pool, a, "לא, עד 21 במאי", tg, model);
+      assert.deepEqual(await draftStatuses(pool, a), ["pending"]);
+      assert.ok(!logs.some((l) => l.includes("interview.change_no_restated")));
+    });
+  });
+
+  test("no refusal, no cancel: a message about something else, or a 'no' that negates the next word, leaves the change waiting", async () => {
+    for (const text of ["we like sushi", "לא יודע אם עד 17", "I know it's 17 May"]) {
+      await withChats(async (pool, a) => {
+        const tg = new Telegram();
+        const ops = { current: toTheSixteenth() as unknown[] };
+        const model = await waitingBox(pool, a, tg, ops);
+        ops.current = [];
+        await sayLogged(pool, a, text, tg, model);
+        assert.deepEqual(await draftStatuses(pool, a), ["pending"], text);
+      });
+    }
+  });
+
+  test("a refusal that also answers a question is recorded as the answer, and does not cancel the change", async () => {
+    await withChats(async (pool, a) => {
+      const tg = new Telegram();
+      const ops = { current: toTheSixteenth() as unknown[] };
+      await waitingBox(pool, a, tg, ops);
+      const withAnswer = {
+        runner: {
+          async run() {
+            return {
+              ok: true as const, attempts: 1, ms: 1,
+              value: {
+                proposals: [{ questionId: "bot_name", value: { kind: "text", text: "Tripper" }, confidence: 0.95, evidence: "Tripper", sourceMessageId: "m" }],
+                unclear: [], malformed: 0, ops: [],
+              },
+            };
+          },
+        },
+      };
+      await sayLogged(pool, a, "לא, קראו לו Tripper", tg, withAnswer);
+      assert.deepEqual(await draftStatuses(pool, a), ["pending"]);
+    });
+  });
+
+  test("the run's own state: the summary re-sent beneath the live box - the refusal still cancels it", async () => {
+    await withChats(async (pool, a) => {
+      const tg = new Telegram();
+      const ops = { current: toTheSixteenth() as unknown[] };
+      const model = await waitingBox(pool, a, tg, ops);
+      // What the failed first attempt left behind: the recap on screen, the box still live above it.
+      for (const q of INTAKE_QUESTIONS.filter((x) => x.required && x.id !== "phases")) {
+        const answer = q.id === "travelers" ? structured([{ name: "Dana" }])
+          : q.id === "organizer_identity" ? { kind: "text", schema_version: 3, text: "Dana" }
+          : q.type === "choice" ? { kind: "choice", option_id: q.options![0]!.id, schema_version: 3, other_text: null }
+          : { kind: "text", schema_version: 3, text: "x" };
+        await pool.query(
+          "UPDATE control_plane.intake_sessions SET answers = answers || jsonb_build_object($2::text, $3::jsonb) WHERE id = $1",
+          [a.sessionId, q.id, JSON.stringify(answer)],
+        );
+      }
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET phase = 'recap', ui_state = ui_state || jsonb_build_object('last_prompt', 'recap')
+          WHERE id = $1`,
+        [a.sessionId],
+      );
+      const recapView = await getSessionForChat(pool, a.chatId);
+      assert.ok(recapView.ok && recapView.view.state === "awaiting_confirmation", "premise: the summary is what the interview is at");
+      ops.current = [];
+      const logs = await sayLogged(pool, a, "לא, הלינה בלובליאנה נשארת עד 17 במאי", tg, model);
+      assert.deepEqual(await draftStatuses(pool, a), ["cancelled"], logs.filter((l) => l.includes("change_")).join(" | "));
+      assert.ok(logs.some((l) => l.includes("interview.change_no_restated")));
+    });
+  });
+
+  test("another question or the boundary offer is on screen: 'no, that's all' answers THAT, and the change keeps waiting", async () => {
+    for (const [prompt, text] of [["q:trip_type", "לא, עוד לא"], ["optional_offer", "no, that's all"]] as const) {
+      await withChats(async (pool, a) => {
+        const tg = new Telegram();
+        const ops = { current: toTheSixteenth() as unknown[] };
+        const model = await waitingBox(pool, a, tg, ops);
+        await pool.query("UPDATE control_plane.intake_sessions SET ui_state = ui_state || jsonb_build_object('last_prompt', $2::text) WHERE id = $1", [a.sessionId, prompt]);
+        ops.current = [];
+        const logs = await sayLogged(pool, a, text, tg, model);
+        assert.deepEqual(await draftStatuses(pool, a), ["pending"], `${prompt}: ${text}`);
+        assert.ok(!logs.some((l) => l.includes("interview.change_no_restated")));
+      });
+    }
+  });
+
+  test("a date that merely collides with another held number is not a restatement: 'לא, עד 5 במאי' is left to the reader", async () => {
+    for (const text of ["לא, עד 5 במאי", "לא, עד 10 במאי"]) {
+      await withChats(async (pool, a) => {
+        const tg = new Telegram();
+        const ops = { current: toTheSixteenth() as unknown[] };
+        const model = await waitingBox(pool, a, tg, ops);
+        ops.current = [];
+        await sayLogged(pool, a, text, tg, model);
+        assert.deepEqual(await draftStatuses(pool, a), ["pending"], text);
+      });
+    }
+  });
+
+  test("a change the organizer has not seen is not cancelled by words they typed about something else", async () => {
+    await withChats(async (pool, a) => {
+      const tg = new Telegram();
+      const ops = { current: toTheSixteenth() as unknown[] };
+      const model = await waitingBox(pool, a, tg, ops);
+      // A relay restart forgets which messages carry the box, and the screen has moved on.
+      forgetShownPreviewsForTests();
+      await pool.query("UPDATE control_plane.intake_sessions SET ui_state = ui_state || jsonb_build_object('last_prompt', 'q:trip_type') WHERE id = $1", [a.sessionId]);
+      ops.current = [];
+      await sayLogged(pool, a, "לא, רגע — עד 17 במאי", tg, model);
+      assert.deepEqual(await draftStatuses(pool, a), ["pending"]);
     });
   });
 });
