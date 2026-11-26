@@ -33,8 +33,12 @@ WHATSAPP_BRIDGE_SECRET=<32+ chars, no whitespace> node src/bridge.js --session <
 - The relay's `bridge_url` must be exactly `http://127.0.0.1:<port>`: not
   `localhost`, not `[::1]`, not a numeric spelling of the address.
 - The listener binds `127.0.0.1` only. The host is not a parameter.
-- Starting, supervising and pairing the process on a real number is deployment
-  work (`kinerary-deploy`), not this package's.
+- On the control-plane VM it runs as a container built from this directory's
+  `Dockerfile` (`kinerary-cp/whatsapp-bridge:<rev>`), added by the optional overlay
+  `control-plane/deployment/compose.vm.whatsapp.yml` and paired with
+  `control-plane/deployment/vm-whatsapp-pair.sh`; the runbook is "WhatsApp
+  (optional)" in `docs/control-plane-vm-deployment.md`. The number, the secrets and
+  the session path are deployment values (`kinerary-deploy`), never this repository's.
 
 ## Endpoints (every one needs `Authorization: Bearer <secret>`)
 

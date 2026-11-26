@@ -43,8 +43,22 @@ done
 
 # The env files are root-only, so compose runs under sudo; the stand-in URL has
 # to survive sudo's environment reset to reach compose's interpolation.
+#
+# The compose file set follows vm.env: with WhatsApp on it includes compose.vm.whatsapp.yml,
+# which is what gives the relay its two WhatsApp secrets. A relay recreated from
+# compose.vm.yml alone would log relay.whatsapp_disabled and serve Telegram as ever, so this
+# is not optional (vm-compose-files.sh, and tests/scripts/test_vm_whatsapp.py).
+. "$DIR/vm-compose-files.sh"
+vm_compose_files_init "$DIR" "$PROVISIONING_ENV" "$VM_ENV" || die "cannot work out the compose file set from the env files"
+# With the overlay on, the relay is created WITH the two WhatsApp secret files; compose cannot create it
+# when one is missing, and --force-recreate has already removed the running one by then. Look first.
+if [ "${#VM_COMPOSE_FILES[@]}" -gt 2 ]; then
+  for name in whatsapp_bridge_secret whatsapp_sender_id_key; do
+    sudo test -f "$DIR/.local-secrets/$name" || die "WhatsApp is on in vm.env but .local-secrets/$name is missing: the relay would not start (docs/control-plane-vm-deployment.md, WhatsApp)"
+  done
+fi
 compose() {
-  sudo --preserve-env=TELEGRAM_API_ROOT docker compose -f "$DIR/compose.vm.yml" \
+  sudo --preserve-env=TELEGRAM_API_ROOT docker compose "${VM_COMPOSE_FILES[@]}" \
     --env-file "$PROVISIONING_ENV" --env-file "$VM_ENV" "$@"
 }
 

@@ -114,6 +114,9 @@ $C ps
 curl -s http://127.0.0.1:4310/readyz
 ```
 
+With WhatsApp switched on (`WHATSAPP_BRIDGE_ENABLED=1`, see [WhatsApp](#whatsapp-optional)) `$C` must also
+carry `-f compose.vm.whatsapp.yml`, or a recreated relay loses its WhatsApp secrets.
+
 Images are built on the VM and pinned by revision in `vm.env`
 (`KINERARY_REV`, `HERMES_REV`) — no dev `dist/` overlays, unlike
 `compose.local.yml`. **Change the version only with `kinerary-cp-release`**
@@ -1109,6 +1112,219 @@ Then, if the api should stop serving portal routes, remove
 (`$C up -d api`, which restarts it — a window, not a reflex), and take the two ingress
 routes down. The exchange key already written into trip sites stays; it is inert
 without a gateway holding the same key.
+
+## WhatsApp (optional)
+
+WhatsApp through the relay (spec `docs/specs/sprint-9/625-whatsapp-via-relay.md`) needs one more
+process on the VM: the **bridge**, a Node sidecar (`control-plane/whatsapp-bridge`) that holds one
+logged-in WhatsApp session and answers the relay over loopback HTTP. It is **off unless `vm.env`
+turns it on**, and off it asks for nothing: no file, no secret, no variable, no image, no line in
+`kinerary-cp-release` output. The relay logs `relay.whatsapp configured:false` and Telegram is
+exactly what it was.
+
+**How it is switched on, in three lines.** `WHATSAPP_BRIDGE_ENABLED=1` in `vm.env` makes every
+compose command add `compose.vm.whatsapp.yml` to `compose.vm.yml` (the release tool and the scripts
+that call compose all take the file set from one place). The overlay adds the `whatsapp-bridge`
+service and hands the relay the two secret *files* its `relay.whatsapp` block names. Pair the phone
+once, then switch the feature on for a trip with the feature-switch command.
+
+It is an overlay, not a compose profile, on purpose: the relay is always created, and a `file:` secret
+whose file is missing stops `up` for the relay, Telegram with it. A profile cannot attach a secret to
+the relay conditionally. `tests/scripts/test_vm_whatsapp.py` renders the stack both ways and fails
+unless switching the overlay on adds the bridge and the relay's two secrets and changes nothing else.
+
+**Two clocks.** The bridge, the overlay and the relay's profile block are control-plane changes: they
+reach every trip at the next restart. Whether a trip may use WhatsApp is a per-trip feature switch
+(`whatsapp`), a data change.
+
+### Before the first time
+
+1. The release tool that runs the upgrade is the one *already installed*; it is replaced at the end of
+   a successful upgrade. Upgrade to a release that carries this overlay **first**, let it finish (it
+   installs the new tool), and only then set `WHATSAPP_BRIDGE_ENABLED`. An older tool would
+   not bring the bridge up, and would remove it as an orphan.
+2. **A dedicated number with an empty address book.** Pairing hands the linked device the phone's
+   address book and history-sync notices. The bridge subscribes to neither and logs neither, but the
+   library keeps linked-identity-to-phone mappings in the session directory. Do not use a person's
+   number.
+3. Choose where the session lives: a **host directory outside every git checkout** (the bridge refuses
+   a session inside a work tree, but inside its container it only sees the mount, so the release tool
+   and `vm-whatsapp-pair.sh` check the host path), mode `0700`, owned by uid 1000 (the user the bridge
+   and the relay run as):
+
+   ```bash
+   sudo install -d -m 0700 -o 1000 -g 1000 <session dir>
+   ```
+
+   It is the WhatsApp account: anyone who copies it controls the number. Keep it on the VM's own disk:
+   it is then **in every VM snapshot** and in any backup of that disk (on the NFS export it would be in
+   neither). It is never in an image and never in the repository.
+
+4. **The order, so no step runs against a half-made setup.** Create the session directory and the two
+   secret files, add the `relay.whatsapp` block to the profile, and set `WHATSAPP_SESSION_DIR` first; set
+   `WHATSAPP_BRIDGE_ENABLED=1` **last**, because from then on every compose command carries the overlay and
+   compose refuses to parse without the session path. Then pair, then restart the relay once
+   (`vm-relay-restart.sh`), or let the first upgrade after this do it: a relay started before the block and
+   the secrets existed logs `relay.whatsapp configured:false` and does not look again on its own.
+
+### What to set (`vm.env`; names only — `vm.env.example` has the commented list)
+
+| Name | What |
+|---|---|
+| `WHATSAPP_BRIDGE_ENABLED` | `1` (or `true`, `yes`, `on`) switches the overlay on. Read from `provisioning.env`/`vm.env`, the later wins, so upgrade, verify and rollback follow it. Anything else, or unset, is off |
+| `WHATSAPP_SESSION_DIR` | **required when on.** The absolute host path above. Compose refuses to parse without it, and the bridge's mount does not create a missing path |
+| `WHATSAPP_BRIDGE_PORT` | the bridge's loopback port, `4340` unless set. Must equal the port in the profile's `bridge_url` |
+| `KINERARY_ARCHITECTURE_PROFILE` | the profile that carries the `relay.whatsapp` block (below) |
+
+### The two secrets (files, not variables)
+
+Two files in `.local-secrets/` (next to the other compose secrets, [Layout](#layout)), owned by uid 1000, mode
+`0600` (the bridge refuses a secret file readable by group or others):
+
+```bash
+cd <deployment dir>/.local-secrets
+( umask 077; openssl rand -hex 32 > whatsapp_bridge_secret; openssl rand -hex 32 > whatsapp_sender_id_key )
+sudo chown 1000:1000 whatsapp_bridge_secret whatsapp_sender_id_key
+```
+
+| File | Read by | What it is |
+|---|---|---|
+| `whatsapp_bridge_secret` | the bridge and the relay | the bearer secret on every request between them. Both read the same file; at least 32 characters, no whitespace. Rotate it by writing a new value and restarting the bridge **and** the relay; nothing is lost |
+| `whatsapp_sender_id_key` | the relay only | the key the opaque sender ids are derived from (HMAC-SHA256, at least 32 bytes). It must differ from the bridge secret (the relay refuses both equal) |
+
+**Generate `whatsapp_sender_id_key` once and never rotate it casually.** Every WhatsApp person id, private
+chat alias and group alias is derived from it (`identity.ts`, `whatsappOpaqueId`): a new key gives every
+person a new id, so **every WhatsApp private binding and person link is orphaned**: people have to bind
+again and the existing rows no longer match anyone. It lives in the VM snapshot and in every backup of
+`.local-secrets/`; restore it with the database, never apart from it. Losing the file is the same as
+rotating it. (Only the relay reads either secret: the api reads `relay.whatsapp.number` and the code
+lifetime for the dashboard and resolves no secret reference, so neither file is mounted in the api.)
+
+### The profile's `relay.whatsapp` block
+
+Added to the architecture profile `KINERARY_ARCHITECTURE_PROFILE` names (the api, `migrate`, the relay and
+`companion-mcp` all read that one file). It is not in `architecture.vm-web.example.json`: a test keeps
+that file equal to the local example plus its `web` block, and a block that needs a real number does not
+belong in a shared example. The placeholder number below is not one:
+
+```json
+{
+  "relay": {
+    "whatsapp": {
+      "bridge_url": "http://127.0.0.1:4340",
+      "bridge_secret_ref": "file:///run/secrets/whatsapp_bridge_secret",
+      "sender_id_secret_ref": "file:///run/secrets/whatsapp_sender_id_key",
+      "number": "15555550123"
+    }
+  }
+}
+```
+
+Merge it into the profile's existing `relay` object. `number` is the bot's number, digits only, country
+code first, no `+`: it is what the dashboard's `wa.me` links open. `code_ttl_seconds` and
+`code_attempts_per_hour` are optional. A block the schema refuses, or a secret that does not resolve,
+switches **WhatsApp** off and nothing else: the relay logs one `relay.whatsapp_disabled` line naming the
+field and the rule (never a value) and serves Telegram as ever.
+
+### Pairing
+
+```bash
+sudo KINERARY_PROVISIONING_ENV=<deploy root>/provisioning.env KINERARY_VM_ENV=<deploy root>/vm.env \
+  control-plane/deployment/vm-whatsapp-pair.sh
+```
+
+From an interactive terminal (the QR is drawn in it). It refuses unless WhatsApp is on and the session
+directory is set, outside every checkout and present. It stops the serving bridge if one is running
+(two processes on one session log each other out), runs the bridge image once with `--pair-only`, and
+starts the serving bridge again afterwards, also after a failed attempt if one was running. On the
+phone: WhatsApp > Settings > Linked devices > Link a device, then scan. When it prints `Paired`, the
+bridge is up. The first pairing needs no earlier upgrade: `compose run` builds the bridge image from the
+checkout if it is not there yet (checked with the overlay, no image, exit 3 on an empty session). A
+relay that was already running with the block and the secrets finds the bridge by itself (it retries with a
+30-second cap); one started without them (`relay.whatsapp configured:false`) needs `vm-relay-restart.sh`,
+or the next upgrade, as in step 4 above.
+
+### Releases and rollbacks
+
+With WhatsApp on, `kinerary-cp-release`:
+
+- **plan / upgrade** build `kinerary-cp/whatsapp-bridge:<rev>` beside the other images (only then:
+  a stack that never enabled WhatsApp builds nothing extra), validate the target's overlay with its own
+  `compose.vm.yml`, and refuse before anything changes when a secret file is missing, readable by group
+  or others, too short or equal to the other, or when the session directory is unset, missing, open to
+  others, owned by another uid or inside a git work tree. An unpaired session, or a profile that would leave
+  the bridge unused (wrong port, other secret refs, no block), is a warning, not a refusal.
+- **bring the bridge up on the new image before the relay restarts**, so the relay meets a bridge that
+  is already connecting. The bridge is not in the `--wait` list: an unpaired bridge exits 3 and would fail
+  the release. Its restart pauses WhatsApp (messages sent meanwhile are delivered when it reconnects,
+  within ten minutes); Telegram is not touched.
+- **verify** prints the bridge's `state` (read in-process from `/health` with the secret, which is never
+  shown; the bot's number in that answer is dropped before anything is printed), and looks in the relay's
+  log for `relay.whatsapp configured:true` and `whatsapp.bridge_state … connected`. **An unpaired,
+  logged-out, missing or unreachable bridge is a `WARNING` line, never a failed check:** a failed verify
+  rolls the release back, and WhatsApp being down must not take Telegram with it.
+- **rollback** brings the bridge to the target revision's image like any other service. A revision that
+  was never built with WhatsApp on has no bridge image: it is built from that revision's source before
+  the switch (and if that fails, rollback goes on and says so). Rolling back to a version from before the
+  overlay removes the bridge as an orphan: the overlay is left out of every compose command, which is
+  what the file-set rule above is for.
+- **dry-run** prints a line for each of these actions.
+
+The restart policy is `unless-stopped`, so the bridge comes back after a VM reboot or a Docker daemon
+restart. It cannot loop against WhatsApp: an **unpaired** session exits 3 before the WhatsApp library is
+even loaded, so its restarts stay on the VM and Docker backs them off (verify says `unpaired` until
+`vm-whatsapp-pair.sh` runs); a **logged-out** or **replaced** session does not exit at all (the process
+stays up and says so on `/health`; it never retries). `docker compose <the -f files> stop whatsapp-bridge`
+keeps it down until `up -d --no-deps whatsapp-bridge` starts it again.
+
+Every command that can recreate the relay or run `up --remove-orphans` must use the same file set. The
+release tool and these scripts do: `vm-relay-restart.sh`, `vm-interview-runner.sh`, `vm-manual-test.sh`,
+`vm-whatsapp-pair.sh` (all through `vm-compose-files.sh`). **A hand-typed `docker compose -f compose.vm.yml …`
+must add `-f compose.vm.whatsapp.yml` while WhatsApp is on** (the `$C` definition near the top of this
+runbook does not; `docs/e2e-full-test.md` reads the file set from `vm-compose-files.sh`): a relay recreated without it has no WhatsApp
+secrets and logs `relay.whatsapp_disabled` with nothing else wrong, and an `up --remove-orphans` without it
+removes the bridge.
+
+### The first switch
+
+The relay serves WhatsApp to a trip only when the trip's `whatsapp` switch is on (a switch nobody recognises
+is off). With the feature-switch command (`docs/specs/sprint-9/567-feature-switches.md`), from
+`control-plane/api` with the database URL set as for the other operator commands:
+
+```bash
+npm run feature -- show --trip <slug>
+npm run feature -- set whatsapp on --trip <slug>            # a trip before ready_private
+npm run feature -- set whatsapp on --trip <slug> --live     # a trip in use: a deploy
+```
+
+Start with a test trip. `--all` and `--new-trips` reach every family's trip and are the owner's call.
+
+### Checking it
+
+```bash
+sudo kinerary-cp-release verify            # the bridge's state, the relay's two lines; WARNING lines are WhatsApp-only
+sudo docker logs <relay container> 2>&1 | grep -E 'relay.whatsapp|whatsapp.bridge_state'
+sudo docker compose <the -f files> --env-file <provisioning.env> --env-file <vm.env> ps whatsapp-bridge
+```
+
+`relay.whatsapp configured:true`, then `whatsapp.bridge_state` `connected`. `relay.whatsapp_disabled` names
+the field that kept it off. A bridge log line carries states, codes and counts only (no id, number, name or
+message text).
+
+### Turning it off
+
+1. Switch the feature off for the trips that have it (`npm run feature -- set whatsapp off --trip <slug>`).
+   Nothing else is needed to stop WhatsApp reaching a trip.
+2. To remove the feature from the stack: delete the `relay.whatsapp` block from the profile, set
+   `WHATSAPP_BRIDGE_ENABLED=` (empty) in `vm.env`, restart the relay (`vm-relay-restart.sh`), and remove
+   the bridge: `docker compose <the -f files, with the overlay> rm -sf whatsapp-bridge` *before* the flag is
+   taken out, or the next `up --remove-orphans` removes it as an orphan. The next upgrade stops building
+   the image.
+3. To unlink the number: remove the device on the phone (Settings > Linked devices), then
+   `vm-whatsapp-pair.sh unlink` (stops and removes the bridge, empties the session directory). The bridge has
+   no logout command on purpose: a number that logs out and in is how it gets flagged. The two secret files can
+   stay (generate `whatsapp_sender_id_key` once, never again, if the feature may come back) or be deleted with
+   the feature for good.
 
 ## Upgrades and rollback
 
