@@ -182,7 +182,38 @@ async function apiDelete(path) {
   if (!r.ok) throw new Error(`DELETE ${path} → ${r.status}${await errorSuffix(r)}`);
   return r.json();
 }
-async function apiPostFile(path, filePath, fieldName, contentType, fields = {}) {
+// The filePath tools (add_photo, set_participant_avatar, upload_trip_logo, upload_booking_confirmation) read a
+// file on THIS host and send it to the trip, where get_booking_confirmation can hand it back. Unchecked, a caller
+// who can steer a companion reads any file this process can (boundary review, 2026-11-26: on a shared bridge that
+// includes every trip's key in MCP_ROUTES_DIR). MCP_UPLOAD_ROOTS (colon-separated directories) is where files
+// people sent are saved; set, a path is accepted only when it is a regular file (not a symlink) whose real path
+// lies inside one of them. Unset: a shared bridge accepts no path at all; a single-trip bridge is unchanged.
+// Every refusal has the same text, so the answer does not say whether a file exists.
+const UPLOAD_ROOTS = (process.env.MCP_UPLOAD_ROOTS || '').split(':').map((s) => s.trim()).filter(Boolean);
+const UPLOAD_REFUSED = 'filePath is not a file inside a folder this bridge accepts uploads from.';
+function checkedUploadPath(filePath) {
+  const fs = require('fs');
+  const nodePath = require('path');
+  if (!UPLOAD_ROOTS.length) {
+    if (SHARED) throw new Error(UPLOAD_REFUSED);
+    return filePath;
+  }
+  if (typeof filePath !== 'string' || !nodePath.isAbsolute(filePath)) throw new Error(UPLOAD_REFUSED);
+  let real;
+  try {
+    if (!fs.lstatSync(filePath).isFile()) throw new Error('not a regular file');
+    real = fs.realpathSync(filePath);
+  } catch { throw new Error(UPLOAD_REFUSED); }
+  const inside = UPLOAD_ROOTS.some((root) => {
+    let r;
+    try { r = fs.realpathSync(root); } catch { return false; }
+    return real.startsWith(r.endsWith(nodePath.sep) ? r : r + nodePath.sep);
+  });
+  if (!inside) throw new Error(UPLOAD_REFUSED);
+  return real;
+}
+async function apiPostFile(path, requestedPath, fieldName, contentType, fields = {}) {
+  const filePath = checkedUploadPath(requestedPath);
   const fs = require('fs');
   const FormData = require('form-data');
   const form = new FormData();
@@ -548,6 +579,7 @@ mcp.tool('upload_trip_logo',
     const config = await apiGet('/api/config');
     if (config?.features?.trip_logo !== true) return ok(NO_TRIP_LOGO);
     const fs = require('fs');
+    checkedUploadPath(filePath);  // before any look at the file: the same refusal whether or not it exists
     if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) throw new Error('No readable image file at that path on this machine.');
     const ext = require('path').extname(filePath).toLowerCase();
     const contentType = IMAGE_MIME_BY_EXT[ext] || 'application/octet-stream';

@@ -731,3 +731,72 @@ describe('AC-B1.9 nothing about a trip reaches the log', () => {
     assert.ok(!/127\.0\.0\.1:[234]\b/.test(log), `a trip address reached the log:\n${log}`);
   });
 });
+
+// Boundary review 2026-11-26 (F1): the filePath tools read a file on the bridge's host and send it to the
+// trip, where get_booking_confirmation hands it back. On a shared bridge MCP_ROUTES_DIR holds every trip's key,
+// so a path is accepted only inside MCP_UPLOAD_ROOTS, and with none set, not at all.
+describe('filePath tools read only inside MCP_UPLOAD_ROOTS', () => {
+  let dir, inbound, outside, site, bridge, bare, s, sBare;
+  const uploads = () => site.seen.filter((x) => x.url.startsWith('/api/photos/upload') || x.url.includes('/confirmation'));
+  before(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-'));
+    inbound = fs.mkdtempSync(path.join(os.tmpdir(), 'inbound-'));
+    outside = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-'));
+    site = await startSite('upload');
+    writeRoute(dir, 'alpha', { api_base_url: site.url });
+    fs.writeFileSync(path.join(inbound, 'ok.jpg'), 'jpeg-bytes');
+    fs.writeFileSync(path.join(outside, 'secret.env'), 'TRIP_API_KEY=do-not-read');
+    fs.symlinkSync(path.join(outside, 'secret.env'), path.join(inbound, 'link.jpg'));
+    fs.writeFileSync(path.join(inbound, '..', path.basename(inbound) + '-sibling.jpg'), 'sibling');
+    bridge = await startShared(dir, { MCP_UPLOAD_ROOTS: inbound });
+    bare = await startShared(dir);
+    s = await openSession(bridge.base, 'token-alpha');
+    sBare = await openSession(bare.base, 'token-alpha');
+  });
+  after(async () => {
+    s.close(); sBare.close(); await bridge.stop(); await bare.stop(); await site.close();
+    for (const d of [dir, inbound, outside]) fs.rmSync(d, { recursive: true, force: true });
+    fs.rmSync(inbound + '-sibling.jpg', { force: true });
+  });
+
+  test('a file inside the root is uploaded', async () => {
+    const before = uploads().length;
+    const r = await s.callTool('add_photo', { filePath: path.join(inbound, 'ok.jpg') });
+    assert.ok(!r.result?.isError, toolText(r));
+    assert.equal(uploads().length, before + 1);
+  });
+
+  for (const [what, p] of [
+    ['a file outside every root', () => path.join(outside, 'secret.env')],
+    ['a symlink inside the root pointing out', () => path.join(inbound, 'link.jpg')],
+    ['a path that climbs out with ..', () => path.join(inbound, '..', path.basename(outside), 'secret.env')],
+    ['a sibling whose name only starts with the root', () => inbound + '-sibling.jpg'],
+    ['a relative path', () => 'secret.env'],
+    ['a file that does not exist', () => path.join(outside, 'nope.pdf')],
+  ]) {
+    test(`refused, with nothing sent to the trip: ${what}`, async () => {
+      const before = uploads().length;
+      for (const [tool, args] of [['add_photo', {}], ['upload_booking_confirmation', { id: 1 }], ['set_participant_avatar', { username: 'a' }]]) {  // upload_trip_logo: off on this fake trip, it returns before any path
+
+        const r = await s.callTool(tool, { ...args, filePath: p() });
+        const text = JSON.stringify(r);
+        assert.ok(r.result?.isError || r.error, `${tool} accepted ${what}: ${text}`);
+        assert.ok(!text.includes('do-not-read'), `${tool} leaked the file`);
+      }
+      assert.equal(uploads().length, before, `${what} reached the trip site`);
+    });
+  }
+
+  test('the refusal is the same whether or not the file exists', async () => {
+    const a = toolText(await s.callTool('add_photo', { filePath: path.join(outside, 'secret.env') }));
+    const b = toolText(await s.callTool('add_photo', { filePath: path.join(outside, 'nope.png') }));
+    assert.equal(a, b);
+  });
+
+  test('a shared bridge with no MCP_UPLOAD_ROOTS accepts no path at all', async () => {
+    const before = uploads().length;
+    const r = await sBare.callTool('add_photo', { filePath: path.join(inbound, 'ok.jpg') });
+    assert.ok(r.result?.isError || r.error, JSON.stringify(r));
+    assert.equal(uploads().length, before);
+  });
+});
