@@ -1380,6 +1380,23 @@ sudo kinerary-cp-release prune --dry-run
    portal and gateway containers, the portal's `/v1` proxy and the gateway's `/health`.
    Dror gets the result on Telegram.
 
+**Where the release notices go.** The release tool reads the same
+`CONTROL_PLANE_OPERATOR_CHAT_ID` from `vm.env` as the control plane (see
+[A separate chat for operator notices](#a-separate-chat-for-operator-notices)), so no second
+setting exists; the same bot token sends to it. With it set, the informational notices
+("upgraded ... verify passed", "rolled back", a request locked after wrong codes, a gate
+run finished) go to that chat and no longer land in the owner's private chat with the bot.
+A failure ("upgraded but VERIFY FAILED", a rollback whose verify failed, a gate run that
+failed) goes to the operator chat **and** the private chat, because it is the one not to
+miss. If the operator chat cannot be reached (the bot is not in the group) the notice goes
+to the private chat instead and the run's output says so; a value that is empty, not a
+chat id, or the private chat itself means the private chat, as before the setting existed.
+The message that carries a gate request's **one-time approval code always stays on the
+private chat**, whatever is configured: a group other people or agents can read must never
+hold it (the control plane keeps its approval DM there for the same reason). `--dry-run`
+says which kind of chat it would use, never the id. It takes effect at the next run of the
+tool; nothing is restarted.
+
 **A trip marked `TRIP_MCP_BRIDGE_FAILED` is not skipped by any of this**
 (issue #193): `restart-bridges`, `verify`'s bridge check and the relay's
 post-restart wait all still include it, because that mark is exactly what
