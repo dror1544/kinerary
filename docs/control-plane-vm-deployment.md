@@ -1163,9 +1163,14 @@ reach every trip at the next restart. Whether a trip may use WhatsApp is a per-t
 4. **The order, so no step runs against a half-made setup.** Create the session directory and the two
    secret files, add the `relay.whatsapp` block to the profile, and set `WHATSAPP_SESSION_DIR` first; set
    `WHATSAPP_BRIDGE_ENABLED=1` **last**, because from then on every compose command carries the overlay and
-   compose refuses to parse without the session path. Then pair, then restart the relay once
-   (`vm-relay-restart.sh`), or let the first upgrade after this do it: a relay started before the block and
-   the secrets existed logs `relay.whatsapp configured:false` and does not look again on its own.
+   compose refuses to parse without the session path. Then pair, then **recreate the api, then restart
+   the relay** (`docker compose <the -f files> up -d --no-deps --force-recreate api`, then
+   `vm-relay-restart.sh`), or let the first upgrade after this do both. Each reads the profile once, at
+   start: an api started before the block shows no WhatsApp card and answers the WhatsApp routes 404, and
+   a relay started before the block and the secrets logs `relay.whatsapp configured:false`. Neither looks
+   again on its own. The api goes first because a bad profile then fails the api while Telegram (the
+   relay) keeps running. **Before either restart, check the edited profile parses**: invalid JSON stops
+   the api, migrate, the relay and companion-mcp at their next start, which may be days later.
 
 ### What to set (`vm.env`; names only — `vm.env.example` has the commented list)
 
@@ -1241,8 +1246,8 @@ phone: WhatsApp > Settings > Linked devices > Link a device, then scan. When it 
 bridge is up. The first pairing needs no earlier upgrade: `compose run` builds the bridge image from the
 checkout if it is not there yet (checked with the overlay, no image, exit 3 on an empty session). A
 relay that was already running with the block and the secrets finds the bridge by itself (it retries with a
-30-second cap); one started without them (`relay.whatsapp configured:false`) needs `vm-relay-restart.sh`,
-or the next upgrade, as in step 4 above.
+30-second cap); one started without them (`relay.whatsapp configured:false`) needs the api recreated and
+`vm-relay-restart.sh`, or the next upgrade, as in step 4 above.
 
 ### Releases and rollbacks
 

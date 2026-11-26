@@ -7,7 +7,7 @@ What is pinned here, and why each is a way this could fail without anyone notici
   and two secrets on the relay and changes nothing else.
 - the bridge's compose service has the properties a credential holder needs: loopback host network, the
   secret as a FILE (never an argument or an environment variable), a read-write session mount that does not
-  invent a missing host path, no ports, no capabilities, and a restart policy that stops after five failures.
+  invent a missing host path, no ports, no capabilities, and a restart policy that survives a reboot (unless-stopped).
 - every command that can recreate the relay uses ONE file set. A relay recreated without the overlay has no
   WhatsApp secrets, logs relay.whatsapp_disabled and Telegram looks fine: the release tool, the relay restart
   script and the other scripts that call compose must agree, and the shell and Python answers are compared on
@@ -170,7 +170,7 @@ class ComposeOverlay(unittest.TestCase):
         self.assertFalse(volume[0].get("read_only"))
         self.assertIs(volume[0]["bind"]["create_host_path"], False)
 
-    def test_it_restarts_on_a_crash_but_stops_after_five_failures(self):
+    def test_it_restarts_unless_stopped_so_a_reboot_brings_it_back(self):
         self.assertEqual(self.with_overlay["services"]["whatsapp-bridge"]["restart"], "unless-stopped")
         self.assertEqual(self.with_overlay["services"]["relay"]["restart"], "unless-stopped", "the relay's own policy is untouched")
 
