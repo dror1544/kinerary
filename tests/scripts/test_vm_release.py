@@ -1052,8 +1052,11 @@ class FleetCP(vr.ControlPlane):
     def relay_log(self):
         return self.events
 
+    #: Extra vm.env values a test sets (the shared trip-mcp bridge's two, for example).
+    extra_env: dict = {}
+
     def vm_env(self):
-        return {"KINERARY_REV": "rev1111", "HERMES_REV": "h1"}
+        return {"KINERARY_REV": "rev1111", "HERMES_REV": "h1", **self.extra_env}
 
     def core_checks(self, findings, events):
         if self.core:
@@ -1635,6 +1638,84 @@ class BridgeHealth(FleetWorld):
         vr.save_baseline(result.checks, path)
         self.assertNotIn(self.KEY, path.read_text())
         self.assertFalse([c for c in result.checks if self.KEY in c.id + c.code + c.text])
+
+    # ── the shared trip-mcp bridge: one process for every trip whose route file it reads ──
+
+    def shared_world(self, server, *, route=True, token=KEY, url=None, old_bridge_port=None):
+        """japan on the shared bridge: a route file in the routes dir, the token in the profile's .env.
+        An old per-trip mcp/.env can be left beside it (old_bridge_port) to prove the route wins."""
+        self.intake(); self.healthy("japan2026")
+        routes = self.tmp / "routes"
+        routes.mkdir(exist_ok=True)
+        if route:
+            (routes / "japan.json").write_text('{"slug":"japan"}')
+        if token is not None:
+            (self.data / "profiles" / "japan2026" / ".env").write_text(f"GATEWAY_RELAY_ID=japan2026\nTRIP_MCP_TOKEN={token}\n")
+        if old_bridge_port:
+            self.trip("japan", old_bridge_port, "old-per-trip-key-0000")
+        shell = FakeShell(slots=["trip-intake", "japan2026"], listening=[server.port])
+        cp = FleetCP(shell, live=[("japan", "japan2026")], events=[{"event": "relay.gateway_connected", "gateway_id": "japan2026"}])
+        cp.extra_env = {"KINERARY_SHARED_BRIDGE_ROUTES_DIR": str(routes),
+                        "KINERARY_SHARED_BRIDGE_URL": url or f"http://127.0.0.1:{server.port}"}
+        return cp, shell
+
+    def test_a_trip_with_a_route_file_is_checked_on_the_shared_bridge_with_its_profile_token(self):
+        server = self.bridge("ok")
+        cp, _sh = self.shared_world(server, old_bridge_port="3999")
+        check = self.by_id(cp.verify(None))["bridge:japan"]
+        self.assertEqual((check.ok, check.code), (True, "ok"))
+        self.assertEqual(server.seen_keys, [self.KEY], "asked with the profile's TRIP_MCP_TOKEN, not the old per-trip key")
+        self.assertIn("shared trip-mcp bridge", check.text)
+
+    def test_a_shared_trip_whose_bridge_cannot_reach_it_names_no_per_trip_repair(self):
+        server = self.bridge("unreachable")
+        cp, _sh = self.shared_world(server)
+        check = self.by_id(cp.verify(None))["bridge:japan"]
+        self.assertEqual((check.ok, check.code), (False, "EHOSTUNREACH"))
+        self.assertNotIn("restart-bridges", check.text, "restart-bridges does not restart the shared bridge")
+
+    def test_a_shared_trip_without_a_token_is_no_key(self):
+        server = self.bridge("ok")
+        cp, _sh = self.shared_world(server, token=None)
+        self.assertEqual(self.by_id(cp.verify(None))["bridge:japan"].code, "NO_KEY")
+        self.assertEqual(server.seen_keys, [])
+
+    def test_without_a_route_file_the_trip_keeps_its_per_trip_check(self):
+        shared, old = self.bridge("ok"), self.bridge("ok")
+        cp, shell = self.shared_world(shared, route=False, old_bridge_port=old.port)
+        shell.listening.add(old.port)
+        old.key = "old-per-trip-key-0000"
+        check = self.by_id(cp.verify(None))["bridge:japan"]
+        self.assertEqual((check.ok, check.code), (True, "ok"))
+        self.assertEqual(shared.seen_keys, [])
+        self.assertEqual(old.seen_keys, ["old-per-trip-key-0000"])
+
+    def test_one_shared_variable_alone_is_not_shared_mode_and_says_so(self):
+        server = self.bridge("ok")
+        cp, _sh = self.shared_world(server)
+        del cp.extra_env["KINERARY_SHARED_BRIDGE_URL"]
+        result = cp.verify(None)
+        self.assertNotIn("bridge:japan", self.by_id(result), "no mcp/.env and no shared mode: nothing to check")
+        self.assertIn("KINERARY_SHARED_BRIDGE_URL", cp.said())
+        self.assertEqual(server.seen_keys, [])
+
+    def test_a_shared_bridge_url_off_loopback_is_refused_never_asked(self):
+        server = self.bridge("ok")
+        cp, _sh = self.shared_world(server, url=f"http://192.0.2.10:{server.port}")
+        check = self.by_id(cp.verify(None))["bridge:japan"]
+        self.assertEqual((check.ok, check.code), (False, "BAD_SHARED_URL"))
+        self.assertEqual(server.seen_keys, [], "the token never travels off loopback")
+
+    def test_restart_bridges_leaves_a_shared_trip_s_bridge_alone_and_restarts_its_gateway(self):
+        server = self.bridge("ok")
+        cp, shell = self.shared_world(server, old_bridge_port="3999")
+        cp.verify = lambda *a, **k: None
+        cp.wait_for_registrations = lambda *a, **k: None
+        vr.cmd_restart_bridges(cp)
+        ran = [" ".join(a) for a in shell.argvs]
+        self.assertFalse([a for a in ran if "setup-mcp.sh" in a], "the old per-trip bridge is not started again")
+        self.assertTrue([a for a in ran if "gateway" in a and "japan2026" in a], "its gateway is still restarted")
+        self.assertIn("shared trip-mcp bridge", cp.said())
 
     def test_bridge_health_codes_match_the_install_script(self):
         # companion-install-host.sh bridge_health_code(): same bodies, same codes.

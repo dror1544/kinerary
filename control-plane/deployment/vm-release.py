@@ -875,6 +875,41 @@ def bridge_health(port: str, key: str, timeout: float = 15) -> str:
     return bridge_health_code(body)
 
 
+
+# The shared trip-mcp bridge (mcp/README.md "Shared mode"): one process for every trip whose route file
+# it reads. Named in vm.env with the same two variables scripts/companion-install-host.sh reads, so the
+# install path and this check agree on what "shared" means. Both set, or it is not shared mode.
+SHARED_BRIDGE_ENV = ("KINERARY_SHARED_BRIDGE_ROUTES_DIR", "KINERARY_SHARED_BRIDGE_URL")
+SHARED_BRIDGE_URL = re.compile(r"http://(?:127\.0\.0\.1|localhost):([0-9]{1,5})")
+
+
+def shared_bridge_of(env: Mapping[str, str]) -> Tuple[Optional[Path], Optional[str], str]:
+    """(routes dir, loopback port, problem) from vm.env. Neither variable: (None, None, "").
+    One alone, or a URL off loopback: a problem, said aloud; never a guess at the other half.
+    Loopback only because the companion's token travels on it in the clear."""
+    routes, url = (env.get(name, "").strip() for name in SHARED_BRIDGE_ENV)
+    if not routes and not url:
+        return None, None, ""
+    if not routes or not url:
+        missing = SHARED_BRIDGE_ENV[1] if routes else SHARED_BRIDGE_ENV[0]
+        return None, None, f"vm.env sets only one of {' and '.join(SHARED_BRIDGE_ENV)} ({missing} is unset): shared trip-mcp bridge checks are off"
+    match = SHARED_BRIDGE_URL.fullmatch(url.rstrip("/"))
+    if not match:
+        return Path(routes), None, f"{SHARED_BRIDGE_ENV[1]} is not http://127.0.0.1:<port>: the shared bridge is not asked"
+    return Path(routes), match.group(1), ""
+
+
+def profile_trip_mcp_token(profile_env: Path) -> str:
+    """The companion's TRIP_MCP_TOKEN, the key the shared bridge knows it by; empty when absent or
+    malformed. Read here and sent only as a request header, like the per-trip key."""
+    try:
+        values = read_env_text(profile_env.read_text())
+    except OSError:
+        return ""
+    token = values.get("TRIP_MCP_TOKEN", "").replace('"', "").replace("'", "").replace("\r", "")
+    return token if re.fullmatch(r"[A-Za-z0-9._~+/=-]{16,256}", token) else ""
+
+
 def parse_runner_output(text: str) -> Tuple[Dict[str, str], List[Tuple[str, str]], List[Tuple[str, int, str]]]:
     """proxmox-snapshot-runner.sh output → (values, checks, snapshots)."""
     values: Dict[str, str] = {}
@@ -2484,6 +2519,9 @@ class ControlPlane:
     def companion_checks(self, f: Findings, events: List[Dict]) -> None:
         awaited = [e for e in events if e.get("event") == "relay.gateways_awaited"]
         connected_ids = {e.get("gateway_id") for e in events if e.get("event") == "relay.gateway_connected"}
+        shared_routes, shared_port, problem = shared_bridge_of(self.vm_env())
+        if problem:
+            f.note(problem)
         for slug, profile in self.live_companions():
             if awaited:
                 gone = profile in (awaited[-1].get("missing") or [])
@@ -2492,6 +2530,10 @@ class ControlPlane:
                 ok = profile in connected_ids
             f.check(f"companion-connected:{profile}", ok, "NOT_CONNECTED",
                     f"trip {slug}: companion {profile} {'connected to the relay' if ok else 'NOT connected to the relay'}")
+            if shared_routes is not None and (shared_routes / f"{slug}.json").is_file():
+                f.bridge_of[profile] = slug
+                self.shared_bridge_check(f, slug, profile, shared_port)
+                continue
             env_file = DEPLOY_ROOT / "trips" / slug / "mcp" / ".env"
             if not env_file.exists():
                 f.note(f"trip {slug}: no trip-mcp bridge configured")
@@ -2512,6 +2554,23 @@ class ControlPlane:
             else:
                 text = f"trip {slug}: trip-mcp bridge on :{port} is not healthy ({code}){repair}"
             f.check(f"bridge:{slug}", code == "ok", code, text)
+
+    def shared_bridge_check(self, f: Findings, slug: str, profile: str, port: Optional[str]) -> None:
+        """A trip on the shared bridge, asked with its companion's own token. restart-bridges does not
+        restart that process (systemd supervises it), so no repair line points there."""
+        if port is None:
+            f.check(f"bridge:{slug}", False, "BAD_SHARED_URL", f"trip {slug}: on the shared trip-mcp bridge, whose URL in vm.env is not loopback — not asked")
+            return
+        token = profile_trip_mcp_token(HERMES_DATA / "profiles" / profile / ".env")
+        listening = bool(self.sh.text(["ss", "-ltnH", f"sport = :{port}"]).strip())
+        code = "none" if not listening else bridge_health(port, token)
+        if code == "ok":
+            text = f"trip {slug}: shared trip-mcp bridge answers /health on :{port} for it"
+        elif not listening:
+            text = f"trip {slug}: shared trip-mcp bridge NOT listening on :{port} — check its service"
+        else:
+            text = f"trip {slug}: shared trip-mcp bridge on :{port} is not healthy for it ({code})"
+        f.check(f"bridge:{slug}", code == "ok", code, text)
 
     def collect_checks(self) -> Findings:
         f = Findings()
@@ -3289,14 +3348,21 @@ def cmd_restart_bridges(cp: ControlPlane) -> int:
     trips = cp.live_companions()
     if not trips:
         r.ok("no live trip has a companion")
+    shared_routes, _port, problem = shared_bridge_of(cp.vm_env())
+    if problem:
+        r.note(problem)
     for slug, profile in trips:
         trip_dir = DEPLOY_ROOT / "trips" / slug
-        if not (trip_dir / "mcp" / ".env").exists():
+        if shared_routes is not None and (shared_routes / f"{slug}.json").is_file():
+            # Its old per-trip bridge, if one is still described beside the trip, is NOT started again.
+            r.note(f"{slug}: on the shared trip-mcp bridge (its own service); restarting only its companion")
+        elif not (trip_dir / "mcp" / ".env").exists():
             r.note(f"{slug}: no bridge configured")
             continue
-        cp.sh.act(["sudo", "-u", "hermes", "-H", "env", f"REPO_ROOT={REPO}", f"KINERARY_DEPLOY_ROOT={DEPLOY_ROOT}",
-                   str(DEPLOY_ROOT / "setup-mcp.sh"), "--restart-only", "--trip-dir", str(trip_dir)],
-                  describe=f"{slug}: setup-mcp.sh --restart-only", timeout=180, check=False)
+        else:
+            cp.sh.act(["sudo", "-u", "hermes", "-H", "env", f"REPO_ROOT={REPO}", f"KINERARY_DEPLOY_ROOT={DEPLOY_ROOT}",
+                       str(DEPLOY_ROOT / "setup-mcp.sh"), "--restart-only", "--trip-dir", str(trip_dir)],
+                      describe=f"{slug}: setup-mcp.sh --restart-only", timeout=180, check=False)
         # Where the log stands before the gateway goes, so verify asks for a registration written after it.
         cp.gateway_offsets[profile] = len(log_lines(cp.agent_log(profile)))
         cp.gateway_restarted.add(profile)
