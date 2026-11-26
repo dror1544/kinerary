@@ -211,6 +211,8 @@ import json, os, re, subprocess, sys
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
 GATEWAY = re.compile(r"(?:^|\s)(?:-p|--profile)(?:\s+|=)([a-z0-9][a-z0-9-]{1,62})\s+gateway\s+run(?:\s|$)")
 ROW = re.compile(r"\s*([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+(.*)")
+# `-c` followed by a launcher that imports Hermes's own entry point and exits with it.
+LAUNCHER = re.compile(r"\s-c\s.*\bfrom hermes_cli\.main import main;\s*sys\.exit\(main\(\)\)(?:\s|$)")
 
 
 def hermes_process(args):
@@ -221,20 +223,28 @@ def hermes_process(args):
 
       hermes -p NAME gateway run ...                      the CLI itself
       <venv>/python3 <venv>/bin/hermes -p NAME gateway run --replace
-                                                          the shape the VM runs today
-                                                          (Hermes ab0d98414, observed
+                                                          the shape the VM ran under
+                                                          Hermes ab0d98414 (observed
                                                           on the VM: uid 10000,
                                                           /opt/hermes/.venv/bin/python3
                                                           /opt/hermes/.venv/bin/hermes
                                                           -p <profile> gateway run, plus flags)
       <python> ... -m hermes_cli.main|stderr_timestamp ... a module invocation, -m anywhere in argv
+      <venv>/bin/python -P -c "<launcher>" -p NAME gateway run --replace
+                                                          the shape Hermes 4097709b0 runs
+                                                          (observed on the VM 2026-11-26: uid
+                                                          10000; the launcher is the one-line
+                                                          `import os, site, sys;
+                                                          sys.argv[0]='hermes'; ...;
+                                                          from hermes_cli.main import main;
+                                                          sys.exit(main())`, so there is no
+                                                          `hermes` argv entry and no -m)
 
-    TODO(rehearsal S4, #349 PR C): the newer Hermes (4097709b0c) may run a
-    gateway differently (a supervised wrapper, a different entry point). Its
-    command line is unknown until the container rehearsal; until S4 records it
-    and the matcher is extended, a gateway of that shape would read as stopped.
-    The confirming stop is therefore a REAL `hermes gateway stop`, so a
-    mis-read never leaves a running gateway merely "confirmed"."""
+    Until 2026-11-26 the third shape was unknown and every gateway of it read as
+    stopped (the reconciler recorded observed=stopped for four running gateways).
+    A gateway of any other shape still reads as stopped; the confirming stop is
+    therefore a REAL `hermes gateway stop`, so a mis-read never leaves a running
+    gateway merely "confirmed"."""
     tokens = args.split()
     if not tokens:
         return False
@@ -246,8 +256,10 @@ def hermes_process(args):
     rest = tokens[1:]
     if any(os.path.basename(t) == "hermes" for t in rest):
         return True
-    return any(t == "-m" and i + 1 < len(rest) and rest[i + 1].startswith("hermes_cli")
-               for i, t in enumerate(rest))
+    if any(t == "-m" and i + 1 < len(rest) and rest[i + 1].startswith("hermes_cli")
+           for i, t in enumerate(rest)):
+        return True
+    return LAUNCHER.search(args) is not None
 
 
 def fail(message):

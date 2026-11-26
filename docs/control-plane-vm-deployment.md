@@ -433,13 +433,18 @@ only), `companion_gateway_backfill` and `companion_gateway_action` (`start|stop`
 Every request is read up to 64 KiB (more is refused), a profile name is
 `[a-z0-9][a-z0-9-]{1,62}`, and a `slug` is absent or a string. Status counts only
 this account's processes that are Hermes: the program is `hermes`, or python running
-a script named `hermes` (the shape the VM runs today: `<venv>/bin/python3
+a script named `hermes` (the shape the VM ran under Hermes ab0d98414: `<venv>/bin/python3
 <venv>/bin/hermes -p <profile> gateway run --replace`, uid 10000) or a
-`-m hermes_cli...` module anywhere in its arguments; `-p NAME`, `--profile NAME`
+`-m hermes_cli...` module anywhere in its arguments, or (the shape Hermes
+4097709b0 runs, observed 2026-11-26) `<venv>/bin/python -P -c "<launcher>" -p
+<profile> gateway run --replace`, where the launcher is Hermes's own one-liner
+ending `from hermes_cli.main import main; sys.exit(main())`; `-p NAME`, `--profile NAME`
 and `--profile=NAME` all count. Argument text alone does not make a gateway.
-The newer Hermes may run its gateways differently - its command line is unknown
-until the container rehearsal (S4) records it, and a gateway of an unrecognised
-shape reads as stopped (which is why the confirming stop is a real stop). It refuses:
+A gateway of any other shape reads as stopped (which is why the confirming stop
+is a real stop); when a Hermes upgrade changes the command line, a fleet that
+reads `stopped` while `kinerary-cp-release verify` counts it running in the
+supervisor is this mismatch - `tests/scripts/test_companion_gateway_verbs.py`
+holds the captured shapes. It refuses:
 
 - any profile on `scripts/protected-profiles.txt` - ONE list, read by this script
   and by `teardown-trip.py` (which adds only the interviewer, which the

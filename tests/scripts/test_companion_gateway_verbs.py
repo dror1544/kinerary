@@ -175,8 +175,8 @@ class GatewayStatus(GatewayVerbSandbox):
         self.assertEqual(self.lines(self.send(self.status("running-one"))),
                          ["GATEWAY running-one stopped 0", "STATUS_END 1"])
 
-    def test_the_shape_the_vm_runs_today_is_recognised_verbatim(self) -> None:
-        """Read-only probe of the VM (Hermes ab0d98414): uid 10000, the hermes
+    def test_the_shape_hermes_ab0d98414_ran_is_recognised_verbatim(self) -> None:
+        """Read-only probe of the VM when it ran Hermes ab0d98414: uid 10000, the hermes
         user, the same uid as the forced command's account."""
         me = os.getuid()
         self.procs_full(
@@ -184,6 +184,38 @@ class GatewayStatus(GatewayVerbSandbox):
         )
         self.assertEqual(self.lines(self.send(self.status("running-one", "stopped-one"))),
                          ["GATEWAY running-one running 1", "GATEWAY stopped-one stopped 0", "STATUS_END 2"])
+
+    CODE_ARGV = ("-P -c import os, site, sys; sys.argv[0]='hermes'; site.addsitedir(os.environ['HERMES_SITE']); "
+                 "from hermes_cli.main import main; sys.exit(main())")
+
+    def test_the_shape_hermes_4097709b0_runs_is_recognised_verbatim(self) -> None:
+        """Captured read-only from the production VM on 2026-11-26 (profile names
+        replaced): the s6 slot launches the gateway with `python -P -c '<launcher>'`,
+        no `hermes` script and no `-m`. Every gateway read `stopped` there, and the
+        fleet monitor reported four running companions as down (the supervisor's
+        own listing said all four were up)."""
+        me = os.getuid()
+        self.procs_full(
+            f"  1572452 2101621 {me} /opt/hermes/.venv/bin/python {self.CODE_ARGV} -p running-one gateway run --replace",
+            f"  1572462 2880767 {me} /opt/hermes/.venv/bin/python {self.CODE_ARGV} -p other-one gateway run --replace",
+            # the supervisor's own processes name the slot, not a `-p NAME gateway run`
+            f"  2101621 2880447 0 s6-supervise gateway-running-one",
+            f"  2101629 2101628 {me} s6-log 1 n10 s1000000 T /opt/data/logs/gateways/running-one",
+        )
+        (self.home / ".hermes/profiles/other-one").mkdir()
+        self.assertEqual(self.lines(self.send(self.status("running-one", "other-one", "stopped-one"))), [
+            "GATEWAY running-one running 1", "GATEWAY other-one running 1", "GATEWAY stopped-one stopped 0",
+            "STATUS_END 3"])
+
+    def test_a_launcher_that_is_not_hermes_main_is_not_a_gateway(self) -> None:
+        me = os.getuid()
+        self.procs_full(
+            f"  1 1 {me} /opt/hermes/.venv/bin/python -P -c print(1) -p running-one gateway run",
+            f"  2 1 {me} /opt/hermes/.venv/bin/python -c import os; sys.argv[0]='hermes' -p running-one gateway run",
+            f"  3 1 {me} /bin/sh -c from hermes_cli.main import main; sys.exit(main()) -p running-one gateway run",
+        )
+        self.assertEqual(self.lines(self.send(self.status("running-one"))),
+                         ["GATEWAY running-one stopped 0", "STATUS_END 1"])
 
     def test_every_spelling_of_the_profile_flag_and_every_module_shape_counts(self) -> None:
         me = os.getuid()
