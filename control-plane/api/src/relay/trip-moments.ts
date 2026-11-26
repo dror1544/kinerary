@@ -149,6 +149,20 @@ export interface SaveTap {
   language: PhotoLanguage;
 }
 
+/** The prefix every WhatsApp chat and sender alias carries (`src/identity.ts`, spec 625 "Chat ids"). */
+const WHATSAPP_ALIAS_PREFIX = "wa_";
+
+/**
+ * Trip photos and moments are Telegram's (the photos spec puts WhatsApp out of scope). Read the turn's OWN platform field, never
+ * `event.source.platform`: that one is stamped "telegram" on WhatsApp events (spec 625, AC-0). Anything that is not exactly
+ * "telegram" - an unknown value included - is refused, and so is a turn whose chat or sender id is a WhatsApp alias.
+ */
+function isTelegramTurn(turn: InboundTurn): boolean {
+  return turn.platform === "telegram"
+    && !turn.chatId.startsWith(WHATSAPP_ALIAS_PREFIX)
+    && !(turn.senderId ?? "").startsWith(WHATSAPP_ALIAS_PREFIX);
+}
+
 /** An image the relay may save: a photo, or a photo sent as a file. Never an SVG, a video or a document. */
 export function isSavablePhoto(attachment: { kind: string; mime: string } | null | undefined): boolean {
   if (!attachment) return false;
@@ -284,6 +298,8 @@ export class TripMoments implements MomentsPort {
   // ── The gate's questions ─────────────────────────────────────────────────────
 
   async unaddressed(turn: InboundTurn, route: RoutedCompanionRoute): Promise<{ reply?: string }> {
+    // Telegram only (#670). Refused exactly as an absent port is: no hold, no fetch, no save, no notice.
+    if (!isTelegramTurn(turn)) return {};
     if (turn.chatType === "dm") return {};
     const cfg = await this.config(route.tripId);
     if (!cfg) return {};
@@ -301,6 +317,8 @@ export class TripMoments implements MomentsPort {
   }
 
   async addressed(turn: InboundTurn, route: RoutedCompanionRoute, how: { explicit: boolean }): Promise<{ reply: string } | { context: string } | null> {
+    // Telegram only (#670): null is what the gate gets from a port that is absent.
+    if (!isTelegramTurn(turn)) return null;
     const cfg = await this.config(route.tripId);
     if (!cfg || !cfg.photos) return null;
     const senderId = turn.senderId;
@@ -533,6 +551,8 @@ export class TripMoments implements MomentsPort {
    */
   async onSaveTap(tap: SaveTap): Promise<{ text: string }> {
     const { language } = tap;
+    // Telegram only (#670): a WhatsApp chat is never given a Save button, and an alias chat id is refused here too.
+    if (tap.chatId.startsWith(WHATSAPP_ALIAS_PREFIX)) return { text: photoText("tapUnavailable", language) };
     const token = this.tokens.get(tap.token);
     if (!token || token.chatId !== tap.chatId || token.used || this.now() > token.expiresAt) {
       return { text: photoText("tapExpired", language) };

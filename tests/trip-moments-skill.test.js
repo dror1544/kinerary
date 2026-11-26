@@ -121,6 +121,17 @@ describe('AC-11 / AC-14: what the skill makes the companion do', () => {
     assert.match(request, /Never upload a photo to attach it/);
   });
 
+  test('photos and moments are Telegram only: WhatsApp is out of scope, and the companion does not promise the relay saved photos there (#670)', () => {
+    assert.match(skill, /\*\*Telegram only\.\*\*[^\n]*WhatsApp is out of scope/);
+    assert.match(skill, /exists \*\*only in a Telegram chat\*\*/);
+    assert.match(skill, /"make a moment of this"/);
+    assert.match(skill, /photos and moments are not available in WhatsApp/);
+    assert.match(skill, /In WhatsApp nothing saves photos: say so, do not promise it/);
+    assert.match(skill, /\*\*A request\*\*, in a Telegram chat/);
+    assert.match(section(carried, 'Trip photos and moments'), /a request for a moment included, applies only in a Telegram chat/);
+    assert.match(section(carried, 'Trip photos and moments'), /\*\*Telegram only\.\*\*[^\n]*WhatsApp is out of scope/);
+  });
+
   test('a moment is only said to be saved after list_moments shows it', () => {
     assert.match(turn, /Never claim a moment is saved before `list_moments` shows it/);
   });

@@ -12,11 +12,13 @@ A **trip moment** is a short title and a few sentences, with the photos that go 
 
 Everything you write here is read on the site by the whole family, **children included**.
 
+**Telegram only.** Every path in this skill - the moment turn, the Save button, a "save this" / "save the photos" request, "make a moment of this", and a moment drafted in a private chat - exists **only in a Telegram chat**. WhatsApp is out of scope: the relay does not save, hold or ask about photos there, and sends no moment turn. In a WhatsApp chat never say or promise that you or the relay saved photos or can make a moment, and do not offer it: say plainly that photos and moments are not available in WhatsApp.
+
 ## When to use
 1. **The moment turn.** A message whose first line starts `[trip-moment turn`. The relay wrote it. Nobody in the group wrote it, it is **not addressed to you**, and nobody is waiting for an answer. It carries the ids of the photos just saved, who sent each one, the trip's moment mode, and the lines the group wrote around those photos.
-2. **A request.** "@bot save that as a trip moment", "make a moment of this", a photo and "write it up", from someone on the trip, in the group or in a private chat.
+2. **A request**, in a Telegram chat. "@bot save that as a trip moment", "make a moment of this", a photo and "write it up", from someone on the trip, in the group or in a private chat.
 
-Not for: saving photos (the relay does it; if someone asks you to "save the photos", the relay already answers that), reading the group's chatter for jokes, or anything about the album that is not a moment.
+Not for: saving photos (in a Telegram chat the relay does it; if someone asks you to "save the photos" there, the relay already answers that. In WhatsApp nothing saves photos: say so, do not promise it), reading the group's chatter for jokes, or anything about the album that is not a moment.
 
 ## The moment turn
 
