@@ -97,6 +97,11 @@ HERMES_DATA = Path(ENV.get("KINERARY_CP_HERMES_DATA", "/opt/hermes-data"))
 INSTALLED_TOOL = Path("/usr/local/sbin/kinerary-cp-release")
 INSTALLED_GATE = Path("/usr/local/sbin/kinerary-cp-release-gate")
 SECRETS_DIR = DEPLOYMENT_DIR / ".local-secrets"
+# The ops chat for informational release notices: the SAME vm.env key the control
+# plane reads for its operator notices (#649/#656). A Telegram chat id is a number,
+# negative for a group (-100… for a supergroup).
+OPERATOR_CHAT_KEY = "CONTROL_PLANE_OPERATOR_CHAT_ID"
+CHAT_ID_SHAPE = re.compile(r"^-?[0-9]{5,20}$")
 
 # This deployment's infrastructure — the VMID, the Proxmox host, the keys that
 # reach it, the bot's name — is deliberately NOT in this file: the kinerary repo
@@ -2243,15 +2248,82 @@ class ControlPlane:
         return result
 
     # ----------------------------------------------------------- notify --
-    def notify(self, text: str) -> bool:
+    def operator_chat(self, private_chat: Optional[str]) -> Optional[str]:
+        """The ops chat for INFORMATIONAL notices, or None to use the private chat.
+
+        The same setting the control plane reads (CONTROL_PLANE_OPERATOR_CHAT_ID in
+        vm.env, #649/#656), so there is one place to set it. Unset or empty is the
+        behaviour from before the setting existed. A value equal to the super-admin
+        chat is a mistake and is ignored, as the control plane ignores it; a value
+        that is not a Telegram chat id is ignored too, but says so — a notice is
+        never dropped, and the chat id is never written into the report."""
+        try:
+            value = self.vm_env().get(OPERATOR_CHAT_KEY, "").strip().strip("\"'").strip()
+        except OSError:
+            return None
+        if not value:
+            return None
+        if not CHAT_ID_SHAPE.match(value):
+            self.r.note(f"{OPERATOR_CHAT_KEY} in vm.env is not a Telegram chat id (a number; -100… for a group) — "
+                        "release notices go to the private chat")
+            return None
+        if private_chat is not None and value == private_chat:
+            self.r.note(f"{OPERATOR_CHAT_KEY} in vm.env is the same chat as the private one — "
+                        "release notices go to the private chat")
+            return None
+        return value
+
+    def notify(self, text: str, audience: str = "ops") -> bool:
         """Tell Dror through the trip bot. sendMessage only — never getUpdates,
-        which belongs to the relay. The token stays in this process's memory."""
+        which belongs to the relay. The token stays in this process's memory.
+
+        `audience` says where the notice goes:
+          "ops"     informational: the operator chat when one is configured, else the
+                    private chat; if the operator chat cannot be reached, the private
+                    chat once, so the notice is not lost.
+          "both"    a notice an operator must not miss (verify failed, a failed
+                    request): the operator chat AND the private chat.
+          "private" the private chat only, whatever is configured. For the message
+                    that carries a one-time approval code: it must reach only the
+                    person who approves, never a group other people or agents can
+                    read (the same reason the control plane keeps its approval DM
+                    on the super-admin chat, #656).
+        True only when at least one send was delivered."""
+        if audience not in ("ops", "both", "private"):
+            raise ValueError(f"unknown notice audience: {audience}")
+        private_chat: Optional[str] = None
+        try:
+            private_chat = (SECRETS_DIR / "telegram_super_admin_chat_id").read_text().strip()
+        except OSError:
+            pass
+        ops = None if audience == "private" else self.operator_chat(private_chat)
         if self.dry_run:
-            self.r.step("would send Dror a Telegram message through the trip bot")
+            where = "his private chat" if ops is None else ("the operator chat and his private chat" if audience == "both"
+                                                          else "the operator chat")
+            self.r.step(f"would send Dror a Telegram message through the trip bot, to {where}")
             return True
         try:
             token = (SECRETS_DIR / "telegram_creds").read_text().strip()
-            chat = (SECRETS_DIR / "telegram_super_admin_chat_id").read_text().strip()
+        except OSError:
+            return False
+        if private_chat is None:
+            return False
+        if ops is None:
+            return self._send(token, private_chat, text)
+        delivered_ops = self._send(token, ops, text)
+        if audience == "both":
+            delivered_private = self._send(token, private_chat, text)
+            if not delivered_ops:
+                self.r.note("the operator chat did not take the notice; it went to the private chat")
+            return delivered_ops or delivered_private
+        if delivered_ops:
+            return True
+        self.r.note("the operator chat did not take the notice (is the bot in the group?); sending it to the private chat")
+        return self._send(token, private_chat, text)
+
+    @staticmethod
+    def _send(token: str, chat: str, text: str) -> bool:
+        try:
             data = urllib.parse.urlencode({"chat_id": chat, "text": text, "disable_web_page_preview": "true"}).encode()
             request = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
             with urllib.request.urlopen(request, timeout=15) as response:
@@ -2566,7 +2638,7 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
     r.line(); r.line(f"Upgraded to {short}, but verify FAILED. To go back: {back}")
     cp.notify(f"Kinerary control plane upgraded {versions['KINERARY_REV']} -> {short} ({cp.actor}) but VERIFY FAILED.\n"
               f"Failing: {', '.join(f'{c.id} ({c.code})' for c in result.caused[:10] + result.unknown[:10])}\nTo go back: {back}"
-              + (f"\n{already}" if already else ""))
+              + (f"\n{already}" if already else ""), audience="both")  # the one notice not to miss: ops chat AND private
     return 2
 
 
@@ -2689,7 +2761,7 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     already = preexisting_summary(result)
     cp.notify(f"Kinerary control plane rolled back {versions['KINERARY_REV']} -> {short} ({cp.actor})"
               f"{' with the database restored' if restore_db else ''}. Verify {'passed' if ok else 'FAILED'}."
-              + (f"\n{already}" if already else ""))
+              + (f"\n{already}" if already else ""), audience="ops" if ok else "both")
     return 0 if ok else 2
 
 
@@ -3107,7 +3179,12 @@ def cmd_gate(tokens: Sequence[str]) -> int:
                 f"{' '.join(action)}\n{summary}\n\n"
                 f"Code: {secret}  (expires {expires}, {REQUEST_MAX_ATTEMPTS} tries)\n"
                 f"To approve, send to trip-monitor:  approve {request['id']} {secret}\n"
-                f"Do not reply here. Ignore this message to let it expire.")
+                f"Do not reply here. Ignore this message to let it expire.",
+                # Private chat ONLY, whatever CONTROL_PLANE_OPERATOR_CHAT_ID says: this text carries the
+                # one-time approval code, and the code must not land in a group other people or agents
+                # can read. The control plane keeps its approval DM on the super-admin chat for the same
+                # reason (#656); the requesting agent's own channel never carries the code either.
+                audience="private")
             del secret
             if not sent:
                 requests.mark(request["id"], status="cancelled", reason="could not reach Dror on Telegram")
@@ -3174,7 +3251,10 @@ def cmd_run_request(request_id: str) -> int:
     requests.mark(request_id, status="done" if code == 0 else "failed", exit_code=code, finished_at=time.time())
     tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-12:])
     ControlPlane(Report(io.StringIO()), actor="agent").notify(
-        f"Kinerary release {request_id} ({' '.join(request['action'])}) {'finished' if code == 0 else 'FAILED'} (exit {code}).\n{tail}")
+        f"Kinerary release {request_id} ({' '.join(request['action'])}) {'finished' if code == 0 else 'FAILED'} (exit {code}).\n{tail}",
+        # Informational: the tail is the run's own report lines (steps, verify results), no code and no
+        # secret. A FAILED run is one not to miss, so it also goes to the private chat.
+        audience="ops" if code == 0 else "both")
     return code
 
 
