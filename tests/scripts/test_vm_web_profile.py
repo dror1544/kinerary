@@ -186,7 +186,7 @@ class ComposeProfile(unittest.TestCase):
         added = set(self.with_env["services"]) - set(self.without["services"])
         self.assertEqual(added, {"portal", "runtime-gateway"})
         # The only things that follow the web env are the api's three pass-through variables and
-        # the worker's exchange key (both asserted below); every other service is untouched.
+        # the worker's and relay's exchange key (all asserted below); every other service is untouched.
         def comparable(name, service):
             service = json.loads(json.dumps(service))
             env = service.get("environment", {})
@@ -195,6 +195,8 @@ class ComposeProfile(unittest.TestCase):
                     env.pop(key, None)
             if name == "worker":
                 env.pop("CONTROL_PLANE_EXCHANGE_KEY", None)
+            if name == "relay":
+                env.pop("RUNTIME_EXCHANGE_KEY", None)
             return service
         for name, service in self.without["services"].items():
             self.assertEqual(comparable(name, self.with_env["services"][name]), comparable(name, service),
@@ -207,6 +209,11 @@ class ComposeProfile(unittest.TestCase):
     def test_the_worker_gets_the_exchange_key_only_when_one_is_set(self):
         self.assertEqual(self.without["services"]["worker"]["environment"]["CONTROL_PLANE_EXCHANGE_KEY"], "")
         self.assertEqual(self.with_env["services"]["worker"]["environment"]["CONTROL_PLANE_EXCHANGE_KEY"], WEB_ENV["RUNTIME_EXCHANGE_KEY"])
+
+    def test_the_relay_gets_the_exchange_key_only_when_one_is_set(self):
+        # Trip photos (#669): the relay reaches a trip's site through the runtime gateway with this key.
+        self.assertEqual(self.without["services"]["relay"]["environment"]["RUNTIME_EXCHANGE_KEY"], "")
+        self.assertEqual(self.with_env["services"]["relay"]["environment"]["RUNTIME_EXCHANGE_KEY"], WEB_ENV["RUNTIME_EXCHANGE_KEY"])
 
     def test_the_gateway_is_configured_from_env_alone(self):
         env = self.with_env["services"]["runtime-gateway"]["environment"]

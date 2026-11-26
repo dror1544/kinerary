@@ -1014,13 +1014,15 @@ export async function executeClear(
 
     // WhatsApp binding codes (spec 625, S2) — expired here, before the group-binding tokens, in the order redemption takes
     // them (the code row first, `trips` last through its foreign key). One statement: a CTE locks and captures every code
-    // this trip has, the UPDATE expires the ones still live. A code never counts as a binding, so this is not an
+    // this trip has, the UPDATE expires the ones still live. The CTE takes its rows in `created_at, id` order, the order
+    // `issueChatBindingCode` (and teardown) lock the same rows in: a multi-row lock with no ORDER BY visits the rows in
+    // whatever order its plan yields, and two statements that disagree meet in a 40P01 (issue #661). A code never counts as a binding, so this is not an
     // EVER_PROVISIONED signal; a trip that was ever BOUND, on whichever platform, is already refused by the
     // `telegram_chat_bindings` signal (the WhatsApp rows live in that same table). A no-op on a database without the table.
     if (await whatsappSchemaPresent(client)) {
       const codeResult = await client.query<Record<string, unknown>>(
         `WITH old AS (
-           SELECT * FROM control_plane.chat_binding_codes WHERE trip_id = $1 FOR UPDATE
+           SELECT * FROM control_plane.chat_binding_codes WHERE trip_id = $1 ORDER BY created_at, id FOR UPDATE
          )
          UPDATE control_plane.chat_binding_codes c
             SET state = CASE WHEN old.state = 'issued' THEN 'expired' ELSE old.state END
@@ -1544,6 +1546,13 @@ export async function restoreFromArchive(db: pg.Pool, archiveId: string): Promis
 
     // WhatsApp codes (spec 625): only an archive made on a database that has the table carries them, and only they are put back.
     if (Array.isArray(payload.chat_binding_codes)) {
+      // Lock the rows in the order every other writer of this table takes them (`created_at, id`, issue #661), not in the
+      // archive's order: the loop below locks one row at a time and an issuer of this trip may be holding several.
+      const archivedCodeIds = (payload.chat_binding_codes as Record<string, unknown>[]).map((row) => row.id);
+      await client.query(
+        "SELECT id FROM control_plane.chat_binding_codes WHERE id = ANY($1::text[]) ORDER BY created_at, id FOR UPDATE",
+        [archivedCodeIds],
+      );
       for (const row of payload.chat_binding_codes as Record<string, unknown>[]) {
         await client.query("UPDATE control_plane.chat_binding_codes SET state = $2 WHERE id = $1", [row.id, row.state]);
       }

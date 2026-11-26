@@ -233,6 +233,15 @@ class RetireInDbWhatsApp(unittest.TestCase):
                 if later in tx:
                     self.assertLess(tx.index("chat_binding_codes"), tx.index(later), f"{later} comes first for {trip['slug']}")
 
+    def test_AC17_the_code_expiry_locks_its_rows_in_the_issuers_order(self):
+        # Issue #661: an UPDATE with no ORDER BY locks the trip's codes in plan order, `issueChatBindingCode` locks them
+        # `ORDER BY created_at, id FOR UPDATE`, and the two met in a real 40P01. The rows are locked through a sorted sub-select.
+        for trip in self.TRIPS:
+            tx = self.render(trip)
+            self.assertIn("WHERE id IN (SELECT id FROM control_plane.chat_binding_codes", tx)
+            self.assertIn("ORDER BY created_at, id FOR UPDATE)", tx)
+            self.assertLess(tx.index("trip_id = 'trip_abcdefgh12' AND state = 'issued'"), tx.index("ORDER BY created_at, id FOR UPDATE)"))
+
     def test_AC17_the_code_expiry_is_guarded_so_a_database_without_the_table_still_retires_a_trip(self):
         # A bare UPDATE of a table an older database does not have fails the whole transaction for every Telegram trip.
         for trip in self.TRIPS:
