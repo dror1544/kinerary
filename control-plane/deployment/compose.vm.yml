@@ -413,6 +413,10 @@ services:
       # relay.trip_photos_unavailable at boot and saves no photo, whatever a trip's switches say. Same value the api and
       # the runtime-gateway take above.
       RUNTIME_EXCHANGE_KEY: ${RUNTIME_EXCHANGE_KEY:-}
+      # #597 K1: the derivation master for per-gateway relay keys, referenced from the architecture
+      # profile as `relay.gateway_key_master_refs: ["env://RELAY_GATEWAY_KEY_MASTER"]`. Empty and
+      # unreferenced (the default, gateway_key_mode `shared`) it does nothing. companion-mcp gets the same.
+      RELAY_GATEWAY_KEY_MASTER: ${RELAY_GATEWAY_KEY_MASTER:-}
     # CLAUDE_CODE_OAUTH_TOKEN, minted with `claude setup-token`; and
     # OPENROUTER_API_KEY — the same key Hermes holds, since an API key has no
     # rotating state (codex and anthropic OAuth are each logged into separately:
@@ -475,6 +479,7 @@ services:
     environment:
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
       COMPANION_MCP_PORT: "4313"
+      RELAY_GATEWAY_KEY_MASTER: ${RELAY_GATEWAY_KEY_MASTER:-}  # #597 K1, as on the relay
     secrets:
       - source: control_plane_database_url_host
         target: control_plane_database_url

@@ -222,6 +222,14 @@ class ComposeProfile(unittest.TestCase):
         with_suffix = compose_json({**BASE_ENV, **WEB_ENV, "TRIP_HOST_SUFFIX": "trips.example.org"})
         self.assertEqual(with_suffix["services"]["runtime-gateway"]["environment"]["TRIP_HOST_SUFFIX"], "trips.example.org")
 
+    def test_the_relay_key_master_reaches_the_relay_and_companion_mcp_only_when_set(self):
+        # #597 K1: the profile names env://RELAY_GATEWAY_KEY_MASTER; both checkers of a gateway token must see it.
+        for name in ("relay", "companion-mcp"):
+            self.assertEqual(self.with_env["services"][name]["environment"]["RELAY_GATEWAY_KEY_MASTER"], "", name)
+        with_master = compose_json({**BASE_ENV, **WEB_ENV, "RELAY_GATEWAY_KEY_MASTER": "master-value"})
+        for name in ("relay", "companion-mcp"):
+            self.assertEqual(with_master["services"][name]["environment"]["RELAY_GATEWAY_KEY_MASTER"], "master-value", name)
+
     def test_the_gateway_is_configured_from_env_alone(self):
         env = self.with_env["services"]["runtime-gateway"]["environment"]
         self.assertEqual(env["PORTAL_ORIGIN"], WEB_ENV["PORTAL_ORIGIN"])
