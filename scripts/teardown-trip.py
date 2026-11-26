@@ -790,6 +790,11 @@ REVOKE_GROUP_TOKENS = ("UPDATE control_plane.telegram_group_binding_tokens SET e
 # is the first lock redemption takes (code row, then the binding, then `trips` through the foreign key), so teardown must
 # queue for it in that same order or the two meet in a 40P01, the way issue #175's did.
 #
+# ROW ORDER (issue #661): a statement that locks several rows of one table with no ORDER BY visits them in whatever order its
+# plan yields (heap order, index order), and `issueChatBindingCode` locks the same rows `ORDER BY created_at, id FOR UPDATE`. The
+# two met in a real 40P01 in CI. The rows are therefore locked through a sorted sub-select, in the issuer's
+# order; the outer UPDATE then writes rows it already holds. `executeClear` takes the same order (trip-clear.ts).
+#
 # GUARDED like CLEAR_TEARDOWN_PIN: a database from before the WhatsApp migration has no such table, and a bare UPDATE would
 # fail the whole transaction for every Telegram trip. plpgsql plans a statement when it first runs, so the branch not taken
 # is never resolved against the missing table.
@@ -797,7 +802,9 @@ EXPIRE_CHAT_BINDING_CODES = """DO $wa_codes$
 BEGIN
   IF to_regclass('control_plane.chat_binding_codes') IS NOT NULL THEN
     UPDATE control_plane.chat_binding_codes SET state = 'expired'
-     WHERE trip_id = '{id}' AND state = 'issued';
+     WHERE id IN (SELECT id FROM control_plane.chat_binding_codes
+                   WHERE trip_id = '{id}' AND state = 'issued'
+                   ORDER BY created_at, id FOR UPDATE);
   END IF;
 END
 $wa_codes$"""
