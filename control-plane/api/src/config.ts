@@ -95,6 +95,53 @@ export function loopbackBridgeUrl(value: string, ctx: z.RefinementCtx): string {
   return url.origin;
 }
 
+/**
+ * WhatsApp through the relay (docs/specs/sprint-9/625-whatsapp-via-relay.md). ABSENT means the feature is not
+ * present on this deployment: no WhatsApp loop, no bridge connection, no dashboard section. The portal reads
+ * `number` and `code_ttl_seconds` from the same profile; the relay reads the rest.
+ */
+export const whatsappBlockSchema = z.object({
+  /** The bridge sidecar, loopback only. How a containerised relay shares loopback with it is the deployment's concern. */
+  bridge_url: z.string().transform(loopbackBridgeUrl),
+  bridge_secret_ref: secretReference,
+  /** The key of the opaque sender id. Its own secret; rotating it orphans every WhatsApp private binding. */
+  sender_id_secret_ref: secretReference,
+  /** The deployment's WhatsApp number, digits only, country code first: what the dashboard's wa.me links open. Never in this repository. */
+  number: z.string().regex(/^[0-9]{6,15}$/, "must be digits only, country code first, no plus sign or spaces"),
+  code_ttl_seconds: z.number().int().min(60).max(86400).default(900),
+  code_attempts_per_hour: z.number().int().min(1).max(100).default(5),
+}).strict();
+
+/**
+ * A PRESENT `relay.whatsapp` BLOCK THE SCHEMA REFUSES DISABLES WHATSAPP ONLY (owner's decision 2026-11-24; boundary
+ * review of #655, F1). Refusing it with the rest of the profile stopped the relay, and every trip's Telegram companion
+ * with it, for a typo in a feature that may not even be switched on. So the block is checked on its own first: if it
+ * fails, it is set aside and replaced by `whatsapp_invalid` — the first failing field and a fixed rule wording, never a
+ * value — which the relay logs once as `relay.whatsapp_disabled` and the portal treats as absent. A `whatsapp_invalid`
+ * the profile itself carries is renamed so the strict schema refuses it.
+ */
+function setAsideInvalidWhatsapp(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const relay: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
+  if ("whatsapp_invalid" in relay) {
+    relay["whatsapp_invalid (not a profile key)"] = relay.whatsapp_invalid;
+    delete relay.whatsapp_invalid;
+  }
+  if (relay.whatsapp === undefined) return relay;
+  const parsed = whatsappBlockSchema.safeParse(relay.whatsapp);
+  if (parsed.success) return relay;
+  const issue = parsed.error.issues[0];
+  const path = (issue?.path ?? []).filter((part) => typeof part === "string" || typeof part === "number");
+  const field = ["relay", "whatsapp", ...path.map(String)].join(".");
+  const reason = issue?.code === "unrecognized_keys" ? "has a key the schema does not know"
+    : issue?.code === "invalid_type" ? "is missing or of the wrong type"
+    : issue?.code === "too_small" || issue?.code === "too_big" ? "is out of range"
+    : "is invalid";
+  delete relay.whatsapp;
+  relay.whatsapp_invalid = { field, reason };
+  return relay;
+}
+
 export const architectureProfileSchema = z.object({
   version: z.literal(1),
   environment: z.enum(["test", "development", "production"]),
@@ -257,7 +304,7 @@ export const architectureProfileSchema = z.object({
    * API-only deployment simply omits it. Its absence is what keeps the bot
    * dark, which is a supported state, not a broken one.
    */
-  relay: z.object({
+  relay: z.preprocess(setAsideInvalidWhatsapp, z.object({
     /**
      * Private hosts only, and not merely by convention. The gateway
      * authenticates with an HMAC upgrade token and the connector holds the bot
@@ -347,18 +394,13 @@ export const architectureProfileSchema = z.object({
      * present on this deployment: no WhatsApp loop, no bridge connection, no dashboard section. The portal reads
      * `number` and `code_ttl_seconds` from the same profile; the relay reads the rest.
      */
-    whatsapp: z.object({
-      /** The bridge sidecar, loopback only. How a containerised relay shares loopback with it is the deployment's concern. */
-      bridge_url: z.string().transform(loopbackBridgeUrl),
-      bridge_secret_ref: secretReference,
-      /** The key of the opaque sender id. Its own secret; rotating it orphans every WhatsApp private binding. */
-      sender_id_secret_ref: secretReference,
-      /** The deployment's WhatsApp number, digits only, country code first: what the dashboard's wa.me links open. Never in this repository. */
-      number: z.string().regex(/^[0-9]{6,15}$/, "must be digits only, country code first, no plus sign or spaces"),
-      code_ttl_seconds: z.number().int().min(60).max(86400).default(900),
-      code_attempts_per_hour: z.number().int().min(1).max(100).default(5),
-    }).strict().optional(),
-  }).strict().optional(),
+    whatsapp: whatsappBlockSchema.optional(),
+    /**
+     * NOT A PROFILE KEY: the loader's own note that a `whatsapp` block was present and refused (see
+     * `setAsideInvalidWhatsapp`). A profile that spells it is refused like any unknown key.
+     */
+    whatsapp_invalid: z.object({ field: z.string(), reason: z.string() }).strict().optional(),
+  }).strict()).optional(),
 }).strict().superRefine((profile, ctx) => {
   if (profile.relay) {
     // All three services default into the same 431x range, and a collision

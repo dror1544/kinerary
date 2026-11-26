@@ -192,6 +192,30 @@ test("pairing: a close that is not restart-required fails it, and a successful r
   await paired;
 });
 
+test("pairing: offers WhatsApp the current web version, as serving does (without it the socket is refused with 405)", async () => {
+  const fake = makeFakeLib();
+  fake.lib.fetchLatestBaileysVersion = async () => ({ version: [2, 3000, 42] });
+  const done = pair({ lib: fake.lib, sessionDir: tempDir(), onQr: () => {}, log: () => {}, settleMs: 1 });
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(fake.sock.options.version, [2, 3000, 42]);
+  await fake.sock.emit("connection.update", closeWith(DISCONNECT.restartRequired));
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(fake.sockets.length, 2);
+  assert.deepEqual(fake.sockets[1].options.version, [2, 3000, 42]);
+  await fake.sock.emit("connection.update", { connection: "open" });
+  await done;
+
+  const failing = makeFakeLib();
+  const logs = [];
+  failing.lib.fetchLatestBaileysVersion = async () => { throw new Error("offline"); };
+  const still = pair({ lib: failing.lib, sessionDir: tempDir(), onQr: () => {}, log: (event) => logs.push(event), settleMs: 1 });
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(failing.sock.options.version, undefined);
+  assert.ok(logs.includes("version_fetch_failed"));
+  await failing.sock.emit("connection.update", { connection: "open" });
+  await still;
+});
+
 test("createBridge never touches a real library: it only knows the object it is given", async () => {
   const fake = makeFakeLib();
   const bridge = createBridge({ lib: fake.lib, sessionDir: tempDir(), log: () => {} });

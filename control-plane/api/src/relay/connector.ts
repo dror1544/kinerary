@@ -29,7 +29,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { InlineKeyboard } from "../chat-router.js";
-import { digestTelegramId, isPrivateChatId } from "../identity.js";
+import { chatKind, chatPlatformOf, digestTelegramId } from "../identity.js";
 import { structuredLog } from "../redaction.js";
 import { detectInternalLeak } from "./internal-leak.js";
 import {
@@ -53,6 +53,9 @@ import {
   type WireMessageEvent,
 } from "./protocol.js";
 import { TIMEOUT_ERROR, type TelegramClient } from "./telegram-api.js";
+import type { WhatsAppClient } from "./whatsapp/client.js";
+import { PLATFORM_UNAVAILABLE, WhatsAppOutbound } from "./whatsapp/outbound.js";
+import { BridgeStateTracker, WhatsAppMessageLedger } from "./whatsapp/state.js";
 
 /**
  * What the gateway is told when a send or edit to Telegram TIMED OUT (#225,
@@ -168,6 +171,22 @@ export interface ConnectorOptions {
    */
   fallbackGatewayId?: string;
   telegram: TelegramClient;
+  /**
+   * The WhatsApp bridge's client (#625 S3), present only when the profile has a
+   * `relay.whatsapp` block. The transport of an action is chosen from the chat's
+   * BINDING ROW (`route.platform`), never from the frame: a WhatsApp chat with no
+   * client here is refused `PLATFORM_UNAVAILABLE`, and no Telegram call is made.
+   */
+  whatsapp?: WhatsAppClient;
+  /**
+   * The open WhatsApp binding's real address for a chat alias (`transport_address`),
+   * asked once per WhatsApp action after the scope check and never for a Telegram one.
+   * Absent with a client: every WhatsApp action fails closed.
+   */
+  whatsappAddressOf?: (alias: string, tripId: string) => Promise<string | null>;
+  /** Shared with the WhatsApp loop, so the two halves agree (edit targets, reply targets, one state line). */
+  whatsappLedger?: WhatsAppMessageLedger;
+  whatsappState?: BridgeStateTracker;
   port: number;
   host?: string;
   path?: string;
@@ -284,6 +303,8 @@ export class RelayConnector {
   /** Buttons the relay put on a message (trip moments' Save), by chat and message id, so an edit does not lose them. Bounded. */
   private readonly keyboards = new Map<string, InlineKeyboard>();
   private readonly path: string;
+  /** The WhatsApp transport, when a client is configured. */
+  private readonly whatsapp: WhatsAppOutbound | null;
 
   constructor(private readonly options: ConnectorOptions) {
     // A connector in `both`/`derived` with no usable derivation master, or one
@@ -297,6 +318,15 @@ export class RelayConnector {
     if (masterProblem) throw new Error(masterProblem);
     this.log = options.log ?? (() => {});
     this.path = options.path ?? "/relay";
+    this.whatsapp = options.whatsapp
+      ? new WhatsAppOutbound({
+          client: options.whatsapp,
+          addressOf: options.whatsappAddressOf ?? (async () => null),
+          ledger: options.whatsappLedger ?? new WhatsAppMessageLedger(),
+          state: options.whatsappState ?? new BridgeStateTracker(this.log),
+          log: this.log,
+        })
+      : null;
     this.http = createServer((req, res) => {
       // The media plane is the one HTTP surface here: the gateway GETs a
       // re-hosted attachment it was handed by reference on an inbound event.
@@ -562,6 +592,16 @@ export class RelayConnector {
     if (!scope.ok) return scope.result;
     const route = scope.route;
     const telegram = this.options.telegram;
+    // The transport, from the binding row (checkScope has already refused a chat whose
+    // id shape and row platform disagree). A WhatsApp chat on a relay with no WhatsApp
+    // client is refused here, before any branch below, so no Telegram call is made.
+    const whatsapp = route.kind === "companion" && route.platform === "whatsapp";
+    // The trip the scope check approved: the WhatsApp address is read for THIS trip's binding only.
+    const tripId = route.kind === "companion" ? route.tripId : "";
+    if (whatsapp && !this.whatsapp) {
+      this.log(structuredLog("warn", "relay.outbound_platform_unavailable", { op: action.op, platform: "whatsapp" }));
+      return { success: false, error: PLATFORM_UNAVAILABLE };
+    }
     switch (action.op) {
       case "send": {
         // Last gate before the organizer. See internal-leak.ts: the agent has
@@ -652,8 +692,14 @@ export class RelayConnector {
           return { success: true };
         }
         // A send that THROWS is a failed delivery too: recorded, then rethrown
-        // untouched so onOutbound answers the gateway exactly as before.
-        const sent = await telegram.sendMessage({
+        // untouched so onOutbound answers the gateway exactly as before. The
+        // WhatsApp transport (chosen from the row above) converts its own dialect.
+        const sent = whatsapp
+          ? await this.whatsapp!.send(action.chat_id, tripId, content, action.reply_to).catch((error: unknown) => {
+              this.options.assistantEvents?.replySent(action.chat_id, "failed", content.length, action.reply_to);
+              throw error;
+            })
+          : await telegram.sendMessage({
           chatId: action.chat_id,
           // Agent-authored, so it is written in the dialect TELEGRAM_DESCRIPTOR
           // advertises. Sending it unparsed was why formatting arrived as
@@ -745,6 +791,10 @@ export class RelayConnector {
           this.log(structuredLog("info", "trip_bot.companion_stayed_silent", { silent: true }));
           return { success: true };
         }
+        if (whatsapp) {
+          const done = await this.whatsapp!.edit(action.chat_id, tripId, action.message_id, editVerdict.content);
+          return done.ok ? { success: true } : { success: false, error: done.error };
+        }
         const edited = await telegram.editMessageText({
           chatId: action.chat_id,
           messageId: action.message_id,
@@ -760,9 +810,17 @@ export class RelayConnector {
         return edited.ok ? { success: true } : { success: false, error: gatewayError(edited.error, "EDIT_FAILED") };
       }
       case "typing":
+        if (whatsapp) {
+          const typed = await this.whatsapp!.typing(action.chat_id, tripId);
+          return typed.ok ? { success: true } : { success: false, error: typed.error };
+        }
         await telegram.sendChatAction({ chatId: action.chat_id });
         return { success: true };
       case "get_chat_info": {
+        if (whatsapp) {
+          const info = await this.whatsapp!.chatInfo(action.chat_id, tripId);
+          return info.ok ? { success: true, name: info.name, type: info.type } : { success: false, error: info.error };
+        }
         const info = await telegram.getChatInfo(action.chat_id);
         return info
           ? { success: true, name: info.name, type: info.type }
@@ -792,7 +850,7 @@ export class RelayConnector {
         op: action.op,
         gateway_id: gatewayId,
         chat_ref: digestTelegramId(action.chat_id),
-        chat_kind: isPrivateChatId(action.chat_id) ? "private" : "group",
+        chat_kind: chatKind(action.chat_id),
         route_kind: routeKind,
         reason,
       }));
@@ -821,6 +879,14 @@ export class RelayConnector {
       multiplexGatewayId: this.options.fallbackGatewayId,
     });
     if (!verdict.allowed) return refuse(CHAT_NOT_IN_SCOPE, verdict.routeKind, verdict.reason);
+    // One chat id, one platform (spec 625, Chat ids): a WhatsApp alias never goes
+    // through Telegram and a Telegram id never through WhatsApp. The row decides; an id
+    // whose shape disagrees with its row is refused, whichever way round.
+    const rowIsWhatsapp = route.kind === "companion" && route.platform === "whatsapp";
+    const idIsWhatsapp = chatPlatformOf(action.chat_id) === "whatsapp";
+    if (rowIsWhatsapp !== idIsWhatsapp) {
+      return refuse(CHAT_NOT_IN_SCOPE, route.kind === "companion" ? "companion" : "unbound", "platform_mismatch");
+    }
     return { ok: true, route };
   }
 

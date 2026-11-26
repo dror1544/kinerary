@@ -56,6 +56,9 @@ import { assistantEventsFromEnv, assistantEventsSetting } from "../analytics/emi
 import { startAssistantEventsPurge } from "../analytics/purge-schedule.js";
 import { organizerDocumentRouteFromEnv } from "../document-correction.js";
 import { groupJudgeFromEnv } from "./group-judge.js";
+import { OutageNoticeLimiter } from "./dispatch.js";
+import { startWhatsAppLoop } from "./whatsapp/poller.js";
+import { WhatsAppConfigError, createWhatsAppTransport, whatsappRuntimeConfig, type WhatsAppRuntimeConfig, type WhatsAppTransport } from "./whatsapp/runtime.js";
 import { GroupContext } from "./group-context.js";
 import { HttpTripPhotoGateway } from "./trip-photo-gateway.js";
 import { TripMoments } from "./trip-moments.js";
@@ -148,12 +151,28 @@ interface Runtime {
    */
   approvals?: { config: SignupConfig };
   /**
+   * From `relay.whatsapp`, validated and with both secrets resolved. ABSENT when the
+   * profile has no such block: then no WhatsApp loop runs and no bridge is contacted
+   * (spec 625, AC-20).
+   */
+  whatsapp?: WhatsAppRuntimeConfig;
+  /**
    * Where the relay reaches a trip's site for photos (trip-moments.ts): the runtime gateway's origin and the control-plane exchange
    * key, from the profile's `web` block exactly as the portal and the group-line poller read them. Absent when the profile has
    * no `web` block or its key does not resolve; said loudly at start, because then no photo is saved and no moment is sent
    * whatever a trip's switches say.
    */
   tripPhotos?: { runtimeOrigin: string; exchangeKey: string };
+}
+
+/** The one line a WhatsApp block that cannot work leaves, naming the field and the rule (never a value). */
+function whatsappDisabled(error: unknown): void {
+  const known = error instanceof WhatsAppConfigError;
+  log(structuredLog("error", "relay.whatsapp_disabled", {
+    field: known ? error.field : "relay.whatsapp",
+    reason: known ? error.reason : (error instanceof Error ? error.name : "UNKNOWN"),
+    effect: "WhatsApp is off on this relay: no bridge connection, WhatsApp chats answered PLATFORM_UNAVAILABLE; Telegram unaffected",
+  }));
 }
 
 async function serveRuntime(path: string): Promise<Runtime> {
@@ -194,6 +213,18 @@ async function serveRuntime(path: string): Promise<Runtime> {
     mode: relay.gateway_key_mode,
     ...(relay.gateway_key_mode === "both" ? { hint: "accepts shared and derived keys; move to derived once every gateway is re-keyed" } : {}),
   }));
+
+  // WhatsApp (#625 S3): absent block, nothing built and nothing read. A present block that
+  // cannot work disables WHATSAPP ONLY (owner's decision 2026-11-24): one error line naming the
+  // field and the rule, never a value; no loop, no bridge connection; every action for a
+  // WhatsApp chat answers PLATFORM_UNAVAILABLE (the connector has no client); Telegram as ever.
+  let whatsapp: WhatsAppRuntimeConfig | null = null;
+  try {
+    whatsapp = await whatsappRuntimeConfig(relay.whatsapp, resolveSecretRef, relay.whatsapp_invalid);
+  } catch (error) {
+    whatsappDisabled(error);
+  }
+  log(structuredLog("info", "relay.whatsapp", { configured: whatsapp !== null }));
 
   const db = createDatabasePool(connectionString, () => {
     log(structuredLog("error", "database.pool_idle_error", {
@@ -345,6 +376,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
     interviewerProfile: relay.interviewer_profile,
     multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
+    ...(whatsapp ? { whatsapp } : {}),
     ...(tripPhotos ? { tripPhotos } : {}),
     ...(opsChatId ? { opsChatId } : {}),
     ...(profile.signup?.super_admin_subject_digest
@@ -453,6 +485,18 @@ async function main(): Promise<void> {
   // once, and its state logged either way (`relay.organizer_document_route`).
   const organizerDocumentRoute = organizerDocumentRouteFromEnv(process.env, log);
 
+  // One client, ledger and state line shared by the connector (outbound) and the loop
+  // (inbound); only with a `relay.whatsapp` block AND a database (serve mode).
+  let whatsapp: WhatsAppTransport | null = null;
+  if (runtime.whatsapp && runtime.db) {
+    try {
+      whatsapp = createWhatsAppTransport(runtime.whatsapp, log);
+    } catch (error) {
+      // The client re-checks what whatsappRuntimeConfig checked; a refusal here is still WhatsApp's alone.
+      whatsappDisabled(error);
+    }
+  }
+
   // Trip photos and moments (trip-moments.ts): built after the connector, which it hands turns to, so the connector's send guard
   // reads it through this holder. Absent - no database, or no way to reach the sites - the guard delivers everything.
   let moments: TripMoments | undefined;
@@ -475,7 +519,10 @@ async function main(): Promise<void> {
     // route (binding or live session), never from anything the gateway says
     // about itself — same rule as inbound routing. No database, no resolver:
     // every outbound action is refused.
+    // (The switch read inside it logs through feature-switches' own default, which is
+    // this process's stderr too: the same sink as `log`.)
     ...outboundScopeOptions(runtime.db, runtime.interviewerProfile),
+    ...(whatsapp ? { whatsapp: whatsapp.client, whatsappLedger: whatsapp.ledger, whatsappState: whatsapp.state } : {}),
     ...(runtime.db
       ? {
           // Anything the agent writes to an organizer mid-interview is routed
@@ -536,6 +583,7 @@ async function main(): Promise<void> {
   let stopSweeping: (() => void) | undefined;
   let stopOverrides: (() => void) | undefined;
   let stopEventsPurge: (() => void) | undefined;
+  let stopWhatsApp: (() => void) | undefined;
   if (runtime.db) {
     // …and poll only once the companions are back. Every restart (upgrade,
     // rollback, reboot, runner switch) otherwise answers the messages Telegram
@@ -606,6 +654,25 @@ async function main(): Promise<void> {
       ...(organizerDocumentRoute ? { organizerDocumentRoute: true } : {}),
       log,
     });
+    // The WhatsApp loop (#625 S3), beside the Telegram one and independent of it: a
+    // bridge that is down pauses WhatsApp and nothing else (AC-32).
+    if (whatsapp) {
+      const loop = startWhatsAppLoop({
+        db: runtime.db,
+        client: whatsapp.client,
+        senderKey: whatsapp.senderKey,
+        connector,
+        ledger: whatsapp.ledger,
+        state: whatsapp.state,
+        codeLimiter: whatsapp.codeLimiter,
+        log,
+        media: { store: mediaStore, baseUrl: mediaBaseUrl, log },
+        ...(groupJudge ? { groupJudge } : {}),
+        ...(assistantEvents ? { assistantEvents } : {}),
+        outageNotices: new OutageNoticeLimiter(),
+      });
+      stopWhatsApp = () => loop.stop();
+    }
     // Clears interrupted document writes and claims — see document-sweeper.ts.
     stopSweeping = startDocumentSweeper(runtime.db, documentStore, log);
     // Retention for assistant events (#186): a daily purge, scheduled only
@@ -622,6 +689,7 @@ async function main(): Promise<void> {
     port: runtime.port,
     host: runtime.host,
     polling: Boolean(runtime.db),
+    whatsapp: Boolean(whatsapp),
     // Says out loud which routing regime this process is in. "Exact" is the
     // destination state; a named multiplex gateway is the transition.
     routing: runtime.multiplexGatewayId ? "fallback" : "exact",
@@ -631,6 +699,7 @@ async function main(): Promise<void> {
     process.on(signal, () => {
       log(structuredLog("info", "relay.shutting_down", { signal }));
       stopPolling?.();
+      stopWhatsApp?.();
       runtime.tripApp?.stop();
       stopSweeping?.();
       stopOverrides?.();

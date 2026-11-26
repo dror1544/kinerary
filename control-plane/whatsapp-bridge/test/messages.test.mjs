@@ -223,6 +223,49 @@ test("a display name that is really a number is delivered as empty", async () =>
   assert.equal((await events(bridge))[0].senderName, "");
 });
 
+test("a reply carries the chat's disappearing-message timer, learned from what the chat sends (else WhatsApp marks it '(!) old version')", async () => {
+  const { bridge, sock } = await startBridge();
+  // Nothing seen yet in a private chat: no timer is invented.
+  await bridge.send({ chatId: ALICE.lid, text: "first" });
+  assert.equal(sock.sent.at(-1).options.ephemeralExpiration, undefined);
+
+  // A message from a chat with a 90-day timer arrives wrapped, its contextInfo naming the timer.
+  const timed = privateText({ id: "MSGTIMED1" });
+  timed.message = { ephemeralMessage: { message: { extendedTextMessage: { text: "hi", contextInfo: { expiration: 7776000 } } } } };
+  await sock.emit("messages.upsert", upsertOf([timed]));
+  await bridge.send({ chatId: ALICE.lid, text: "reply" });
+  assert.equal(sock.sent.at(-1).options.ephemeralExpiration, 7776000);
+
+  // The chat turns the timer off: the setting notice is not a message, but the timer follows it.
+  const off = privateText({ id: "MSGTIMEROFF" });
+  off.message = { protocolMessage: { type: 3, ephemeralExpiration: 0 } };
+  await sock.emit("messages.upsert", upsertOf([off]));
+  await bridge.send({ chatId: ALICE.lid, text: "after off" });
+  assert.equal(sock.sent.at(-1).options.ephemeralExpiration, undefined);
+
+  // On again (7 days), then a plain message with no timer means the chat has none.
+  const on = privateText({ id: "MSGTIMERON" });
+  on.message = { protocolMessage: { type: "EPHEMERAL_SETTING", ephemeralExpiration: 604800 } };
+  await sock.emit("messages.upsert", upsertOf([on]));
+  await bridge.send({ chatId: ALICE.lid, text: "after on" });
+  assert.equal(sock.sent.at(-1).options.ephemeralExpiration, 604800);
+  await sock.emit("messages.upsert", upsertOf([privateText({ id: "MSGPLAIN" })]));
+  await bridge.send({ chatId: ALICE.lid, text: "after plain" });
+  assert.equal(sock.sent.at(-1).options.ephemeralExpiration, undefined);
+});
+
+test("a group with no message seen yet takes its timer from the group's metadata", async () => {
+  const { bridge, sock } = await startBridge();
+  sock.groups.set(NEW_GROUP, group(NEW_GROUP, [ALICE, OWN], { ephemeralDuration: 86400 }));
+  await bridge.send({ chatId: NEW_GROUP, text: "introduction" });
+  assert.equal(sock.sent.at(-1).options.ephemeralExpiration, 86400);
+
+  // A message in the group outranks the cached metadata.
+  await sock.emit("messages.upsert", upsertOf([groupText({ id: "MSGGRPPLAIN" })]));
+  await bridge.send({ chatId: NEW_GROUP, text: "answer" });
+  assert.equal(sock.sent.at(-1).options.ephemeralExpiration, undefined);
+});
+
 test("an ephemeral wrapper is peeled", async () => {
   const { bridge, sock } = await startBridge();
   const msg = privateText();

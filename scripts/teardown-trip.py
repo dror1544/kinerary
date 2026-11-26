@@ -824,6 +824,23 @@ BEGIN
 END
 $wa_close$"""
 
+# The close every platform shares, run right after CLOSE_WHATSAPP_BINDINGS. It ALSO clears `transport_address` and
+# `phone_last4` (#655 F6): under READ COMMITTED each statement takes a fresh snapshot, so a WhatsApp binding that a
+# concurrent add-to-bind or code redemption commits BETWEEN the two statements is found here, open and holding its address,
+# and closing it without clearing would trip the CHECK (23514) and abort the whole teardown. On a database without the
+# columns it is the plain close it always was (the same guard as above; the branch not taken is never planned).
+CLOSE_ALL_BINDINGS = """DO $close_all$
+BEGIN
+  IF to_regclass('control_plane.chat_binding_codes') IS NOT NULL THEN
+    UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed', transport_address = NULL, phone_last4 = NULL
+     WHERE trip_id = '{id}' AND closed_at IS NULL;
+  ELSE
+    UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
+     WHERE trip_id = '{id}' AND closed_at IS NULL;
+  END IF;
+END
+$close_all$"""
+
 
 # The trip's gateway route (control_plane.runtime_routes): its hostname and LAN
 # upstream are cleared and the route is suspended, so the runtime gateway
@@ -879,8 +896,7 @@ def retire_in_db(trip: dict) -> str:
 {REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 {CLOSE_SESSIONS.format(id=trip['id'])};
 {CLOSE_WHATSAPP_BINDINGS.format(id=trip['id'])};
-UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
- WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
+{CLOSE_ALL_BINDINGS.format(id=trip['id'])};
 {CLEAR_RUNTIME_ROUTE.format(id=trip['id'])};
 {CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
 COMMIT;""")
@@ -896,8 +912,7 @@ COMMIT;""")
 {REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 {CLOSE_SESSIONS.format(id=trip['id'])};
 {CLOSE_WHATSAPP_BINDINGS.format(id=trip['id'])};
-UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
- WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
+{CLOSE_ALL_BINDINGS.format(id=trip['id'])};
 {CLEAR_RUNTIME_ROUTE.format(id=trip['id'])};
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
  WHERE id = '{trip['id']}' AND slug = '{trip['slug']}';

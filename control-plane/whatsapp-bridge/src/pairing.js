@@ -25,9 +25,29 @@ export function pair({ lib, sessionDir, onQr, log, timeoutMs = 5 * 60_000, settl
     };
     const deadline = t.setTimeout(() => done(new Error("pairing timed out")), timeoutMs);
 
+    // WhatsApp refuses a socket that offers a stale web version (close code
+    // 405, before any QR). Serving fetches the current one; pairing must too.
+    let version;
+    async function currentVersion() {
+      if (version !== undefined || typeof lib.fetchLatestBaileysVersion !== "function") return version;
+      let timer;
+      try {
+        const timeout = new Promise((_, reject) => { timer = t.setTimeout(() => reject(new Error("version")), 15_000); });
+        version = (await Promise.race([lib.fetchLatestBaileysVersion(), timeout])).version ?? null;
+      } catch {
+        version = null;
+        log("version_fetch_failed", {});
+      } finally {
+        t.clearTimeout(timer);
+      }
+      return version;
+    }
+
     async function open() {
+      const v = await currentVersion();
       const { state, saveCreds } = await lib.useMultiFileAuthState(sessionDir);
       const sock = lib.makeWASocket({
+        ...(v ? { version: v } : {}),
         auth: state,
         logger: createSilentLibraryLogger(),
         printQRInTerminal: false,

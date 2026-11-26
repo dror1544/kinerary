@@ -18,9 +18,9 @@
  *
  * S1 moves code; it does not change it. Every await, log line, mark and fixed
  * text below is what `dispatchUpdate` did before, in the same order, and the
- * existing relay suites are the proof. In particular there is NO per-platform
- * wording here yet: the judge's prompt and the addressed mark name the same
- * platform for everyone until S3.
+ * existing relay suites are the proof. S3 adds the one per-platform difference:
+ * with `platformWording: "whatsapp"` (set only by the WhatsApp loop) the addressed
+ * mark and the judge's prompt name WhatsApp; absent, every byte is Telegram's.
  *
  * The order of the steps in `eventTurn` is the security-relevant part: nothing is
  * downloaded for a turn that is not for the assistant, an addressed turn marks
@@ -47,7 +47,7 @@ import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
 import { MEDIA_MAX_BYTES, type MediaKind } from "./media-store.js";
 import type { AttachmentRef, HeldAttachment, PendingAttachments } from "./pending-attachments.js";
 import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
-import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
+import { addressedMark, conversationMark, reactionAnswerMark, whatsappMark } from "./stay-silent.js";
 
 export type { AttachmentRef, HeldAttachment };
 
@@ -206,6 +206,14 @@ export interface GateDeps<Extra = never> {
   outageNotices: { allow(chatId: string): boolean };
   /** The fixed text for a trip whose assistant has not been announced as up. */
   companionPendingText: string;
+  /**
+   * Which platform's words the marks and the judge's prompt use (#625 S3). Absent is
+   * Telegram, byte for byte as before. Supplied by the platform's own loop rather than
+   * read off `turn.platform`: the gate's DECISIONS are the same for both platforms
+   * (companion-gate.test.ts pins that, WhatsApp turns included), and only the loop
+   * that will deliver the turn knows which chat app the companion is answering in.
+   */
+  platformWording?: "telegram" | "whatsapp";
 }
 
 /** What re-hosting needs of the media plane's store. */
@@ -339,7 +347,7 @@ async function eventTurn<Extra>(
       // Second pass of a deferred judgement: the verdict is already in.
       judged = deps.judgedOutcome;
     } else {
-      const ask = await prepareGroupJudge(db, deps.groupJudge, outcome.route, chatId, outcome.event.text, log);
+      const ask = await prepareGroupJudge(db, deps.groupJudge, outcome.route, chatId, outcome.event.text, log, deps.platformWording);
       if (ask === null) judged = null;
       else if (deps.deferJudge) return { kind: "judge_pending", chatId, ask };
       else judged = await ask();
@@ -499,6 +507,12 @@ async function eventTurn<Extra>(
   // The judge's yes is marked the same way, for the same reason: the companion
   // is told it was not addressed by name and may stay silent (the second guard
   // against a wrong yes).
+  // WhatsApp only (S3, spec Behaviour 8): a forwarded turn that the WhatsApp addressed mark below will not carry (a
+  // private turn; a group turn let in by a window or the judge) says it is on WhatsApp and to answer in plain text.
+  // Innermost, so the conversation and reaction marks keep their place at the front. Absent wording: nothing changes.
+  if (deps.platformWording === "whatsapp" && !(inGroup && explicitHere)) {
+    outcome.event.text = `${whatsappMark()}\n\n${outcome.event.text}`.trimEnd();
+  }
   if (capturedByConversation || capturedByJudge) {
     outcome.event.text = `${conversationMark()}\n\n${outcome.event.text}`.trimEnd();
   }
@@ -513,7 +527,7 @@ async function eventTurn<Extra>(
   // keeps today's unmarked form. A DM is addressed by construction, never marked.
   const explicit = inGroup && explicitHere;
   if (explicit) {
-    outcome.event.text = `${addressedMark(deps.assistantHandle)}\n\n${outcome.event.text}`.trimEnd();
+    outcome.event.text = `${deps.platformWording === "whatsapp" ? addressedMark(undefined, "whatsapp") : addressedMark(deps.assistantHandle)}\n\n${outcome.event.text}`.trimEnd();
   } else if (inGroup && reactionOnly && capturedAsReply) {
     // A reaction that took the "?" window: not addressed by name, so a silence
     // is allowed, but it is told what the bare emoji answers.
@@ -674,6 +688,7 @@ async function prepareGroupJudge(
   chatId: string,
   text: string,
   log: (line: string) => void,
+  platformWording?: "telegram" | "whatsapp",
 ): Promise<(() => Promise<JudgeOutcome>) | null> {
   try {
     if ((await groupProactiveLevel(db, chatId)) !== PROACTIVE_JOINS_IN) return null;
@@ -685,7 +700,11 @@ async function prepareGroupJudge(
   }
   const language = await tripLanguage(db, route.tripId).catch(() => "en" as const);
   return async () => {
-    const judged = await judge.judge({ chatId, text, assistantNames: route.assistantNames, language });
+    // The platform rides along only for WhatsApp, so a Telegram judge input is what it always was.
+    const judged = await judge.judge({
+      chatId, text, assistantNames: route.assistantNames, language,
+      ...(platformWording === "whatsapp" ? { platform: "whatsapp" as const } : {}),
+    });
     log(structuredLog("info", "trip_bot.group_judged", {
       verdict: judged.kind,
       latency_ms: judged.ms,

@@ -259,7 +259,23 @@ class RetireInDbWhatsApp(unittest.TestCase):
             wa = tx.index("platform = 'whatsapp'")
             shared = tx.index("UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'")
             self.assertLess(wa, shared)
-            self.assertEqual(tx.count("closed_reason = 'trip_destroyed'"), 2, "one reason for both platforms")
+            # The WhatsApp close, and the shared close's two guarded branches (new schema / old schema): one reason throughout.
+            self.assertEqual(tx.count("closed_reason = 'trip_destroyed'"), 3, "one reason for both platforms")
+            self.assertEqual(tx.count("closed_reason = "), 3, "and no other reason")
+
+    def test_655_F6_the_shared_close_also_clears_the_address_so_a_late_whatsapp_binding_cannot_abort_the_teardown(self):
+        # A WhatsApp binding committed between the WhatsApp close and the shared close (READ COMMITTED: a fresh snapshot per
+        # statement) reaches the shared close open and holding its address; closing it without clearing trips the CHECK.
+        for trip in self.TRIPS:
+            tx = self.render(trip)
+            shared = tx[tx.index("DO $close_all$"):]
+            self.assertIn("IF to_regclass('control_plane.chat_binding_codes') IS NOT NULL THEN", shared)
+            self.assertIn(
+                "SET closed_at = now(), closed_reason = 'trip_destroyed', transport_address = NULL, phone_last4 = NULL\n"
+                "     WHERE trip_id = 'trip_abcdefgh12' AND closed_at IS NULL;",
+                shared,
+            )
+            self.assertLess(tx.index("$wa_close$;"), tx.index("DO $close_all$"), "after the WhatsApp close")
 
     def test_AC17_the_dry_run_counts_live_whatsapp_codes_and_an_older_stack_counts_none(self):
         row = json.dumps({"id": "trip_abcdefgh12", "slug": "japan-2026", "lifecycle_state": "ready_private"})
