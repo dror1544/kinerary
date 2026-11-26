@@ -75,7 +75,7 @@ interface Harness {
   switches: { photos: boolean; moments: boolean };
   clock: { t: number };
   deliverTo: { open: boolean };
-  gate(turn: InboundTurn, options?: { withMoments?: boolean }): Promise<GateDecision>;
+  gate(turn: InboundTurn, options?: { withMoments?: boolean; sourcePlatform?: string }): Promise<GateDecision>;
   advance(ms: number): void;
   settle(): Promise<void>;
   language: { value: string };
@@ -137,7 +137,7 @@ function harness(): Harness {
           text: turn.text,
           message_type: "text",
           message_id: turn.messageId,
-          source: { platform: turn.platform, chat_id: turn.chatId, chat_type: turn.chatType, chat_name: null, user_id: turn.senderId, user_name: turn.senderName, thread_id: null, chat_topic: null, profile: PROFILE },
+          source: { platform: (options?.sourcePlatform ?? turn.platform) as "telegram", chat_id: turn.chatId, chat_type: turn.chatType, chat_name: null, user_id: turn.senderId, user_name: turn.senderName, thread_id: null, chat_topic: null, profile: PROFILE },
         },
         route: { kind: "companion", tripId: TRIP, hermesProfile: PROFILE, assistantNames: NAMES } as never,
       };
@@ -1034,5 +1034,105 @@ describe("what a private chat's save does not do, and how slow a site is allowed
     assert.ok(Date.now() - started < 30);
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal((await h.moments.config(TRIP))?.autosave, true);
+  });
+});
+
+describe("#670: a WhatsApp turn never reaches trip photos and moments", () => {
+  // The turn's OWN platform decides. This variant keeps the ids a Telegram group would carry, so the platform field is the only
+  // difference (the gate's own check and TripMoments' own check are each tested by it).
+  const wa = (t: InboundTurn): InboundTurn => ({ ...t, platform: "whatsapp" });
+  // The WhatsApp shape for real: alias chat and sender ids (spec 625 "Chat ids").
+  const WA_GROUP = `wa_${"1".repeat(32)}@g`;
+  const WA_DM = `wa_${"2".repeat(32)}@p`;
+  const WA_SENDER = `wa_${"3".repeat(32)}`;
+  const waAlias = (t: InboundTurn): InboundTurn => ({
+    ...t,
+    platform: "whatsapp",
+    chatId: t.chatType === "dm" ? WA_DM : WA_GROUP,
+    senderId: WA_SENDER,
+  });
+  const route = { kind: "companion", tripId: TRIP, hermesProfile: PROFILE, assistantNames: NAMES } as never;
+  const noticeSettings: SitePhotoSettings = { photosSwitch: true, momentsSwitch: true, autosave: true, mode: "ask_in_chat", noticePending: true, participants: [] };
+
+  /** The three turns of the issue: a group photo, a "save this" reply to a photo, a private photo with no words. */
+  function whatsappTurns(shape: (t: InboundTurn) => InboundTurn): InboundTurn[] {
+    const sent = T0 - 1000;
+    return [
+      shape(photoTurn("w1", { at: sent })),
+      shape(turn({ text: "@KinneryBot save this", messageId: "w2", replyTo: { messageId: "w0", attachment: PHOTO, sender: "102", sentAtMs: sent }, at: sent })),
+      shape(photoTurn("w3", { group: false, at: sent })),
+    ];
+  }
+
+  /** Counts how often the site is asked about photo settings: a refused turn must not even cause that read. */
+  function watch(h: Harness): { reads: () => number } {
+    let reads = 0;
+    const original = h.site.settings.bind(h.site);
+    h.site.settings = async () => { reads += 1; return original(); };
+    return { reads: () => reads };
+  }
+
+  for (const [label, shape] of [["the platform field alone", wa], ["WhatsApp's alias ids", waAlias]] as const) {
+    test(`a gate that has moments holds, fetches, saves and says nothing for WhatsApp turns (${label})`, async () => {
+      const h = harness();
+      h.site.settingsNow = noticeSettings;
+      const watched = watch(h);
+      for (const whatsapp of whatsappTurns(shape)) {
+        // As in production (spec 625, AC-0/AC-23): the wire event of a WhatsApp turn is stamped "telegram"; only the turn's own
+        // platform says which it is. A gate that read the event's field would let these through.
+        const withMoments = await h.gate(whatsapp, { sourcePlatform: "telegram" });
+        const without = await h.gate(whatsapp, { withMoments: false, sourcePlatform: "telegram" });
+        assert.deepEqual(withMoments, without, `message ${whatsapp.messageId}: exactly what a gate with no moments decides`);
+        assert.notEqual(withMoments.kind, "reply", "no relay-owned reply: no notice, no 'saving'");
+      }
+      await h.settle();
+      assert.equal(watched.reads(), 0, "the site's photo settings are not even read");
+      assert.deepEqual(h.fetched, [], "no file is fetched");
+      assert.deepEqual(h.site.saved, [], "nothing is saved");
+      assert.equal(h.site.acks, 0, "the once-only notice is not acknowledged, so it was not said");
+      assert.equal(h.moments.saver.pending, 0);
+      assert.equal(h.moments.bursts.open, 0);
+      for (const chat of [GROUP, WA_GROUP, WA_DM, "101"]) assert.deepEqual(h.moments.held.recent(chat), [], `nothing is held for ${chat}`);
+      assert.deepEqual(h.pushed, []);
+    });
+  }
+
+  test("TripMoments called directly with a WhatsApp turn refuses it the way an absent port is refused", async () => {
+    for (const shape of [wa, waAlias]) {
+      const h = harness();
+      h.site.settingsNow = noticeSettings;
+      const watched = watch(h);
+      const [groupPhoto, saveThis, privatePhoto] = whatsappTurns(shape);
+
+      assert.deepEqual(await h.moments.unaddressed(groupPhoto!, route), {}, "no hold, no notice");
+      assert.equal(await h.moments.addressed(saveThis!, route, { explicit: true }), null);
+      assert.equal(await h.moments.addressed(shape(turn({ text: "@KinneryBot save the last photos", messageId: "w5" })), route, { explicit: true }), null);
+      assert.equal(await h.moments.addressed(privatePhoto!, route, { explicit: true }), null, "no question is asked about the private photo");
+      // Had the private photo been remembered as a question, this "yes" would save it.
+      assert.equal(await h.moments.addressed(shape(turn({ group: false, text: "yes", messageId: "w4" })), route, { explicit: true }), null);
+
+      await h.settle();
+      assert.equal(watched.reads(), 0);
+      assert.deepEqual(h.fetched, []);
+      assert.deepEqual(h.site.saved, []);
+      assert.equal(h.site.acks, 0);
+      assert.equal(h.moments.saver.pending, 0);
+      for (const chat of [GROUP, WA_GROUP, WA_DM, "101"]) assert.deepEqual(h.moments.held.recent(chat), [], `nothing is held for ${chat}`);
+      assert.deepEqual(h.pushed, []);
+    }
+  });
+
+  test("a Save tap on a WhatsApp chat is refused, and posts nothing", async () => {
+    const h = harness();
+    const answer = await h.moments.onSaveTap({ chatId: WA_GROUP, token: "0123456789abcdef", fromId: WA_SENDER, fromName: null, language: "en" });
+    assert.deepEqual(answer, { text: photoText("tapUnavailable", "en") }, "unavailable, not 'expired': refused before the token is looked up");
+    assert.deepEqual(h.pushed, []);
+  });
+
+  test("the refusal is not a blanket one: the same turn as Telegram is still saved", async () => {
+    const h = harness();
+    await h.gate(photoTurn("t1", { at: T0 - 1000 }));
+    await h.settle();
+    assert.equal(h.site.saved.length, 1);
   });
 });
