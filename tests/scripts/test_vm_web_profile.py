@@ -215,6 +215,13 @@ class ComposeProfile(unittest.TestCase):
         self.assertEqual(self.without["services"]["relay"]["environment"]["RUNTIME_EXCHANGE_KEY"], "")
         self.assertEqual(self.with_env["services"]["relay"]["environment"]["RUNTIME_EXCHANGE_KEY"], WEB_ENV["RUNTIME_EXCHANGE_KEY"])
 
+    def test_the_gateway_routes_trip_hosts_only_when_a_suffix_is_set(self):
+        # Host mode (docs/runtime-session-exchange.md, "Host mode") is off unless TRIP_HOST_SUFFIX reaches the
+        # gateway: unset, it is passed through empty and the gateway routes no trip host.
+        self.assertEqual(self.with_env["services"]["runtime-gateway"]["environment"]["TRIP_HOST_SUFFIX"], "")
+        with_suffix = compose_json({**BASE_ENV, **WEB_ENV, "TRIP_HOST_SUFFIX": "trips.example.org"})
+        self.assertEqual(with_suffix["services"]["runtime-gateway"]["environment"]["TRIP_HOST_SUFFIX"], "trips.example.org")
+
     def test_the_gateway_is_configured_from_env_alone(self):
         env = self.with_env["services"]["runtime-gateway"]["environment"]
         self.assertEqual(env["PORTAL_ORIGIN"], WEB_ENV["PORTAL_ORIGIN"])
