@@ -220,3 +220,33 @@ class ApprovalAnswersThisDocument(unittest.TestCase):
                 last, ast.Name,
                 "pass the sequence captured before the document, not a literal",
             )
+
+
+class VerificationEvidenceTests(unittest.TestCase):
+    """The six checks every build records, plus site_to_bridge when the trip is built on the
+    shared trip-mcp bridge (TRIP_MCP_BRIDGE=shared). Found on the VM e2e of 2026-11-26: a
+    correct shared-bridge build failed here because it recorded seven rows."""
+
+    BASE = {"backup_checkpoint": "skipped", "mcp_isolation": "skipped", "messaging_binding": "skipped",
+            "release_compatibility": "passed", "rendered_data": "passed", "runtime_health": "passed"}
+
+    def setUp(self) -> None:
+        self.mod = load()
+
+    def test_the_six_base_checks_pass(self) -> None:
+        self.assertEqual(self.mod.evidence_problems(dict(self.BASE)), [])
+
+    def test_a_passed_site_to_bridge_is_accepted(self) -> None:
+        self.assertEqual(self.mod.evidence_problems({**self.BASE, "site_to_bridge": "passed"}), [])
+
+    def test_a_failed_site_to_bridge_is_a_problem(self) -> None:
+        problems = self.mod.evidence_problems({**self.BASE, "site_to_bridge": "failed"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("site_to_bridge", problems[0])
+
+    def test_a_missing_base_check_is_a_problem(self) -> None:
+        evidence = dict(self.BASE); del evidence["mcp_isolation"]
+        self.assertTrue(any("mcp_isolation" in p for p in self.mod.evidence_problems(evidence)))
+
+    def test_an_unknown_check_is_a_problem(self) -> None:
+        self.assertTrue(any("surprise" in p for p in self.mod.evidence_problems({**self.BASE, "surprise": "passed"})))

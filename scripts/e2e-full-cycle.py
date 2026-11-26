@@ -643,11 +643,30 @@ def stage_confirm_and_build(ctx: dict, wait_minutes: int, build: bool = True) ->
         f"WHERE trip_id='{trip}' ORDER BY check_name"
     ).splitlines()
     evidence = dict(r.split("=", 1) for r in rows if "=" in r)
-    check(len(evidence) == 6, f"{len(evidence)} verification check(s) recorded",
-          f"expected 6 verification_evidence rows, found {len(evidence)}: {evidence}")
+    problems = evidence_problems(evidence)
+    check(not problems, f"{len(evidence)} verification check(s) recorded",
+          f"verification_evidence is not what a build records: {'; '.join(problems)} — {evidence}")
     for hard_gated in ("release_compatibility", "runtime_health", "rendered_data"):
         check(evidence.get(hard_gated) == "passed", f"{hard_gated}: passed",
               f"{hard_gated}: {evidence.get(hard_gated, 'MISSING')} (this blocks ready_private — how did provisioning succeed?)")
+
+
+#: Recorded for every build.
+BASE_EVIDENCE = ("backup_checkpoint", "mcp_isolation", "messaging_binding",
+                 "release_compatibility", "rendered_data", "runtime_health")
+#: Recorded only for a trip built on the shared trip-mcp bridge (TRIP_MCP_BRIDGE=shared), and then it
+#: must have passed: the site could not reach the bridge it was given otherwise.
+SHARED_BRIDGE_EVIDENCE = "site_to_bridge"
+
+
+def evidence_problems(evidence: dict) -> "list[str]":
+    """What is wrong with one trip's verification_evidence rows; empty when nothing is."""
+    problems = [f"{name} missing" for name in BASE_EVIDENCE if name not in evidence]
+    problems += [f"{name} is not a check a build records" for name in evidence
+                 if name not in BASE_EVIDENCE and name != SHARED_BRIDGE_EVIDENCE]
+    if SHARED_BRIDGE_EVIDENCE in evidence and evidence[SHARED_BRIDGE_EVIDENCE] != "passed":
+        problems.append(f"{SHARED_BRIDGE_EVIDENCE}: {evidence[SHARED_BRIDGE_EVIDENCE]}")
+    return problems
 
 
 def stage_site(ctx: dict) -> None:
