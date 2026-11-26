@@ -204,6 +204,11 @@ services:
       # value the worker is handed below; it never reaches a trip site, the api or a log.
       RUNTIME_TRIP_KEY_MASTER: ${RUNTIME_TRIP_KEY_MASTER:-}
       RUNTIME_LEGACY_TRIP_KEY: ${RUNTIME_LEGACY_TRIP_KEY:-}
+      # Host mode (docs/runtime-session-exchange.md, "Host mode"): <label>.<suffix> is routed to the upstream
+      # the trip's runtime_routes row names. Empty (the default) routes no trip host, today's behaviour. A trip
+      # is moved behind it one at a time with scripts/trip-route.py, after the api's
+      # web.runtime_upstream_allowed_hosts names that trip's site address.
+      TRIP_HOST_SUFFIX: ${TRIP_HOST_SUFFIX:-}
     ports:
       - "${WEB_BIND_IP:-127.0.0.1}:${RUNTIME_GATEWAY_PORT:-4320}:4320"
     healthcheck:
