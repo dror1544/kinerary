@@ -771,6 +771,16 @@ traveller reaches it. The invitation email is a new `PortalMail` kind in
   uncommitted teardown; it is not made worse.
 - Teardown and clear expire codes first, the order `REVOKE_GROUP_TOKENS` documents
   (issue #175).
+- Issuing: the issuer's advisory lock (`pg_advisory_xact_lock`, which only issuers take, so it
+  orders issuers among themselves and adds no edge against teardown or clear), then the
+  trip's live codes `ORDER BY created_at, id FOR UPDATE`, then the expiry of the surplus,
+  then the insert (which takes `FOR KEY SHARE` on `trips` through its foreign key, after
+  every code lock). Redemption locks one code row; issuance, teardown and clear lock
+  several, so **every statement that locks more than one `chat_binding_codes` row takes them
+  in `created_at, id` order**: teardown's expiry (a sorted sub-select), `executeClear`'s
+  code CTE (`ORDER BY`) and the restore of a clear's archive (one ordered `SELECT ... FOR UPDATE`
+  before its per-row updates). A multi-row lock with no `ORDER BY` visits rows in plan
+  order, and two statements that disagree meet in a `40P01` (issue #661, hit repeatedly in CI). A new writer of this table that locks several rows follows the same order.
 
 ### Files expected to change
 

@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import type pg from "pg";
 import {
@@ -15,6 +16,7 @@ import {
 } from "../src/chat-binding-codes.js";
 import { redeemGroupBindingToken, issueGroupBindingToken } from "../src/group-binding.js";
 import { removeMember } from "../src/member-removal.js";
+import { executeClear, previewClear } from "../src/trip-clear.js";
 import { FakeNotificationAdapter } from "../src/adapters/notification.js";
 import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { testDatabaseUrl } from "./support/test-database.js";
@@ -24,6 +26,19 @@ import {
 } from "./support/whatsapp-fixture.js";
 
 const SKIP = !testDatabaseUrl();
+
+/**
+ * A 40P01 is Postgres killing one side of a lock cycle. Print WHICH promise it was and the cycle Postgres reports (its
+ * `detail` names each process, the lock it waits for and the statement it was running), so one red CI run is enough to
+ * read the mechanism. Never loosen this to a retry: a deadlock here is a real lock-order defect (issues #175, #387, #661).
+ */
+function assertNoDeadlock(settled: PromiseSettledResult<unknown>[], names: string[]): void {
+  settled.forEach((r, i) => {
+    if (r.status !== "rejected") return;
+    const e = r.reason as { code?: string; message?: string; detail?: string; where?: string };
+    assert.notEqual(e.code, "40P01", `deadlock detected: ${names[i] ?? `promise ${i}`} was the victim. message: ${e.message} | detail: ${e.detail} | where: ${e.where}`);
+  });
+}
 
 describe("AC-12: what counts as a code attempt (no database)", () => {
   test("AC-12: only a token of exactly the code shape, anywhere in the text, is an attempt", () => {
@@ -65,6 +80,16 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
   before(async () => { pool = await freshDatabase(); });
   after(async () => { await pool.end(); });
 
+  /** Waits until `n` backends of this database are waiting on a lock (a deterministic point, not a sleep). */
+  const waitForLockWaiters = async (n: number) => {
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      const r = await pool.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'");
+      if (r.rows[0].n >= n) return;
+      if (Date.now() > deadline) throw new Error(`only ${r.rows[0].n} backends waiting on a lock`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
   const bindingsOf = async (chatId: string) =>
     (await pool.query("SELECT * FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 ORDER BY created_at", [chatId])).rows;
   const linksOf = async (tripId: string) =>
@@ -857,16 +882,6 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
   });
 
   describe("AC-14 / lock order: a membership removed while a redemption is in flight", () => {
-    /** Waits until `n` backends of this database are waiting on a lock (a deterministic point, not a sleep). */
-    const waitForLockWaiters = async (n: number) => {
-      const deadline = Date.now() + 15_000;
-      for (;;) {
-        const r = await pool.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'");
-        if (r.rows[0].n >= n) return;
-        if (Date.now() > deadline) throw new Error(`only ${r.rows[0].n} backends waiting on a lock`);
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-    };
     const noOpenBindingForRevoked = async (tripId: string, userId: string) => {
       const rows = (await pool.query(
         `SELECT 1 FROM control_plane.trip_person_links l
@@ -932,12 +947,27 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
   });
 
   describe("Lock order (spec 'Lock order')", () => {
+    /**
+     * The statement `teardown-trip.py`'s retire_in_db runs FIRST: its own text, read out of the script, so this test cannot drift
+     * from it (a mirror written by hand here is what kept this suite green while the script's unordered UPDATE was the defect,
+     * issue #661). It fails loudly if the constant moves.
+     */
+    const expireCodesSql = (tripId: string): string => {
+      const source = readFileSync(new URL("../../../scripts/teardown-trip.py", import.meta.url), "utf8");
+      const match = /^EXPIRE_CHAT_BINDING_CODES = """(.*?)"""/ms.exec(source);
+      assert.ok(match, "scripts/teardown-trip.py no longer defines EXPIRE_CHAT_BINDING_CODES as a triple-quoted string");
+      assert.match(match[1]!, /\{id\}/);
+      return match[1]!.replaceAll("{id}", tripId);
+    };
     /** The statements `teardown-trip.py`'s retire_in_db runs, in its order: codes first, then bindings, then the trip. */
-    const teardown = async (tripId: string, pauseMs = 0) => {
+    const teardown = async (tripId: string, pauseMs = 0, options: { heapOrder?: boolean } = {}) => {
       const c = await pool.connect();
       try {
         await c.query("BEGIN");
-        await c.query("UPDATE control_plane.chat_binding_codes SET state = 'expired' WHERE trip_id = $1 AND state = 'issued'", [tripId]);
+        // The plan an UNORDERED multi-row lock is worst served by: rows in heap order, not created_at order. The statement under test
+        // sorts anyway, so this changes nothing for it - and would make the pre-#661 statement take the rows in the wrong order.
+        if (options.heapOrder) await c.query("SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off");
+        await c.query(expireCodesSql(tripId));
         if (pauseMs) await new Promise((r) => setTimeout(r, pauseMs));
         await c.query("UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed', transport_address = NULL, phone_last4 = NULL WHERE trip_id = $1 AND closed_at IS NULL", [tripId]);
         await c.query("UPDATE control_plane.trips SET slug = 'retired-' || slug, updated_at = now() WHERE id = $1", [tripId]);
@@ -956,9 +986,7 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
           redeem(codes[2]!, s2.chatId, s2.senderId, { transportAddress: FIXTURE_ADDRESS }),
           teardown(tripId, round % 3),
         ]);
-        for (const r of settled) {
-          if (r.status === "rejected") assert.notEqual((r.reason as { code?: string }).code, "40P01", "deadlock detected");
-        }
+        assertNoDeadlock(settled, ["redeem 0", "redeem 1", "redeem 2", "teardown"]);
         assert.equal(settled[3]!.status, "fulfilled");
         assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.chat_binding_codes WHERE trip_id=$1 AND state='issued'", [tripId])).rows[0].n, 0);
       }
@@ -973,11 +1001,139 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
           issueChatBindingCode(pool, { tripId, userId: ownerId, kind: "me" }),
           teardown(tripId, round % 3),
         ]);
-        for (const r of settled) {
-          if (r.status === "rejected") assert.notEqual((r.reason as { code?: string }).code, "40P01", "deadlock detected");
-        }
+        assertNoDeadlock(settled, ["issuer A", "issuer B", "teardown"]);
         assert.equal(settled[2]!.status, "fulfilled");
       }
+    });
+
+    // ── Deterministic: one side's lock held open on a second connection, the other side fired (the shape of trip-clear.test.ts's
+    // ── R4-2 / #387 tests). The race test above samples a cycle; these two sides CANNOT cycle, or they do on every run (issue #661).
+
+    /** Nine live codes whose HEAP order is not their `created_at` order (the newest is rewritten into the past, so its new tuple
+     *  sits last in the heap but first by created_at). Returns the ids in the order `issueChatBindingCode` locks them. */
+    const seedSkewedCodes = async (tripId: string, ownerId: string): Promise<string[]> => {
+      for (let i = 0; i < 9; i += 1) await issue(tripId, ownerId, "me");
+      const newest = (await pool.query<{ id: string }>("SELECT id FROM control_plane.chat_binding_codes WHERE trip_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1", [tripId])).rows[0]!.id;
+      await pool.query("UPDATE control_plane.chat_binding_codes SET created_at = created_at - interval '1 hour' WHERE id = $1", [newest]);
+      const ordered = (await pool.query<{ id: string }>("SELECT id FROM control_plane.chat_binding_codes WHERE trip_id = $1 AND state = 'issued' ORDER BY created_at, id", [tripId])).rows.map((r) => r.id);
+      assert.equal(ordered[0], newest, "the fixture: the first code to lock is the one the heap holds last");
+      const heap = (await pool.query<{ id: string }>("SELECT id FROM control_plane.chat_binding_codes WHERE trip_id = $1 AND state = 'issued' ORDER BY ctid", [tripId])).rows.map((r) => r.id);
+      assert.equal(heap[heap.length - 1], newest, "the fixture: heap order differs from created_at order, or the test loses its teeth");
+      return ordered;
+    };
+    /** An issuer caught between its first and second row lock: the first (oldest) live code locked, nothing else. */
+    const issuerHoldingFirstCode = async (firstId: string) => {
+      const holder = await pool.connect();
+      await holder.query("BEGIN");
+      await holder.query("SELECT id FROM control_plane.chat_binding_codes WHERE id = $1 FOR UPDATE", [firstId]);
+      return holder;
+    };
+    /** ...and its next step, exactly `issueChatBindingCode`'s: lock the trip's live codes in `created_at, id` order. */
+    const lockLiveCodesLikeAnIssuer = (holder: pg.PoolClient, tripId: string) =>
+      holder.query("SELECT id FROM control_plane.chat_binding_codes WHERE trip_id = $1 AND state = 'issued' AND expires_at > now() ORDER BY created_at, id FOR UPDATE", [tripId]);
+    const issuedCount = async (tripId: string) =>
+      (await pool.query("SELECT count(*)::int AS n FROM control_plane.chat_binding_codes WHERE trip_id=$1 AND state='issued'", [tripId])).rows[0].n as number;
+
+    test("#661 / lock order: an issuer holding the first code, then teardown fired: teardown waits holding nothing, the issuer takes the rest, no 40P01", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool);
+      const ordered = await seedSkewedCodes(tripId, ownerId);
+      const holder = await issuerHoldingFirstCode(ordered[0]!);
+      try {
+        let settled = false;
+        const torn = teardown(tripId, 0, { heapOrder: true }).then(() => { settled = true; });
+        await waitForLockWaiters(1);
+        // An unordered teardown would by now hold codes 2..9 and wait on the first; this is the issuer's next step, so it would
+        // be the other half of the cycle. Ordered, teardown holds none of them.
+        const locked = await lockLiveCodesLikeAnIssuer(holder, tripId);
+        assert.equal(locked.rows.length, 9);
+        assert.equal(settled, false, "teardown must wait on the issuer's first code, not deadlock and not overtake it");
+        await holder.query("COMMIT");
+        await torn;
+        assert.equal(await issuedCount(tripId), 0, "no code survives the teardown");
+      } finally { await holder.query("ROLLBACK").catch(() => undefined); holder.release(); }
+    });
+
+    test("#661 / lock order: teardown holding the codes, then an issuer fired: the issuer waits, then succeeds against the expired codes", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool);
+      await seedSkewedCodes(tripId, ownerId);
+      const holder = await pool.connect();
+      try {
+        await holder.query("BEGIN");
+        await holder.query("SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off");
+        await holder.query(expireCodesSql(tripId));
+        let settled = false;
+        const issued = issueChatBindingCode(pool, { tripId, userId: ownerId, kind: "me" }).then((r) => { settled = true; return r; });
+        await waitForLockWaiters(1);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        assert.equal(settled, false, "the issuer must wait on the code teardown holds, not deadlock");
+        await holder.query("COMMIT");
+        const result = await issued;
+        assert.ok(result.ok, JSON.stringify(result));
+        assert.equal(await issuedCount(tripId), 1, "only the code the issuer minted after the teardown's expiry is live");
+      } finally { await holder.query("ROLLBACK").catch(() => undefined); holder.release(); }
+    });
+
+    test("#661 / lock order: an issuer holding the first code, then executeClear fired: clear waits holding nothing, the issuer takes the rest, no 40P01, no retry", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool, { lifecycle: "intake_confirmed" });
+      const ordered = await seedSkewedCodes(tripId, ownerId);
+      const slug = (await pool.query("SELECT slug FROM control_plane.trips WHERE id=$1", [tripId])).rows[0].slug as string;
+      assert.ok((await previewClear(pool, tripId)).ok);
+      const holder = await issuerHoldingFirstCode(ordered[0]!);
+      const realConnect = pool.connect.bind(pool);
+      let clearConnects = 0;
+      try {
+        // executeClear absorbs ONE 40P01 by retrying on a fresh client (F-R9-1), which would hide exactly this defect, so count the
+        // transactions it opens (the promise form only: Pool.query itself calls connect(callback)).
+        // The same heap-order plan as the teardown test: the one an unordered CTE is worst served by. The sorted CTE ignores it.
+        (pool as unknown as { connect: (...a: unknown[]) => unknown }).connect = (...a: unknown[]) => {
+          if (a.length > 0) return (realConnect as (...b: unknown[]) => unknown)(...a);
+          clearConnects++;
+          return realConnect().then(async (c) => {
+            await c.query("SET enable_indexscan = off; SET enable_bitmapscan = off");
+            // Session settings must not outlive the test in a pooled connection: destroy it on release instead of resetting it.
+            const release = c.release.bind(c);
+            c.release = () => release(true);
+            return c;
+          });
+        };
+        let settled = false;
+        const cleared = executeClear(pool, tripId, slug, "test:operator").then((r) => { settled = true; return r; });
+        await waitForLockWaiters(1);
+        const locked = await lockLiveCodesLikeAnIssuer(holder, tripId);
+        assert.equal(locked.rows.length, 9);
+        assert.equal(settled, false, "clear must wait on the issuer's first code, not deadlock and not overtake it");
+        await holder.query("COMMIT");
+        const result = await cleared;
+        assert.ok(result.ok, JSON.stringify(result));
+        assert.equal(clearConnects, 1, "executeClear opened its transaction once: no 40P01 was absorbed by its retry");
+        assert.equal(await issuedCount(tripId), 0);
+      } finally {
+        (pool as unknown as { connect: typeof realConnect }).connect = realConnect;
+        await holder.query("ROLLBACK").catch(() => undefined); holder.release();
+      }
+    });
+
+    test("#661 / lock order: clear holding the codes, then an issuer fired: the issuer waits, then succeeds without a 40P01", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool, { lifecycle: "intake_confirmed" });
+      await seedSkewedCodes(tripId, ownerId);
+      const holder = await pool.connect();
+      try {
+        await holder.query("BEGIN");
+        // executeClear's own statement shape: a CTE that locks every code of the trip in `created_at, id` order, then the UPDATE.
+        await holder.query(
+          `WITH old AS (SELECT * FROM control_plane.chat_binding_codes WHERE trip_id = $1 ORDER BY created_at, id FOR UPDATE)
+           UPDATE control_plane.chat_binding_codes c SET state = CASE WHEN old.state = 'issued' THEN 'expired' ELSE old.state END
+             FROM old WHERE c.id = old.id RETURNING old.id`, [tripId]);
+        let settled = false;
+        const issued = issueChatBindingCode(pool, { tripId, userId: ownerId, kind: "me" }).then((r) => { settled = true; return r; });
+        await waitForLockWaiters(1);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        assert.equal(settled, false, "the issuer must wait on the code clear holds, not deadlock");
+        await holder.query("COMMIT");
+        const result = await issued;
+        assert.ok(result.ok, JSON.stringify(result));
+        assert.equal(await issuedCount(tripId), 1);
+      } finally { await holder.query("ROLLBACK").catch(() => undefined); holder.release(); }
     });
   });
 });
