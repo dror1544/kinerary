@@ -28,7 +28,11 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VM_ENV=/opt/kinerary-deploy/vm.env
-C=(sudo docker compose -f "$DIR/compose.vm.yml" --env-file /opt/kinerary-deploy/provisioning.env --env-file "$VM_ENV")
+# The compose file set follows vm.env (WhatsApp's overlay, when it is on), so a service started
+# here never changes what the relay's own recreate would have created.
+. "$DIR/vm-compose-files.sh"
+vm_compose_files_init "$DIR" /opt/kinerary-deploy/provisioning.env "$VM_ENV" || { echo "vm-manual-test: cannot work out the compose file set" >&2; exit 1; }
+C=(sudo docker compose "${VM_COMPOSE_FILES[@]}" --env-file /opt/kinerary-deploy/provisioning.env --env-file "$VM_ENV")
 PSQL=(sudo docker exec kinerary-cp-postgres-1 psql -U kinerary_control_plane -d kinerary_control_plane -At -c)
 
 SCENARIO=own

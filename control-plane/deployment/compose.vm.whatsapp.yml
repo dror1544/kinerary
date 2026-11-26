@@ -1,0 +1,86 @@
+# compose.vm.whatsapp.yml — WhatsApp through the relay, on the control-plane VM.
+# An OVERLAY on compose.vm.yml, never run alone:
+#
+#   docker compose -f compose.vm.yml -f compose.vm.whatsapp.yml --env-file ... up -d
+#
+# It adds the `whatsapp-bridge` service and hands the relay the two secrets its
+# `relay.whatsapp` profile block names. It exists as a second file, and not as a
+# compose profile, because a secret cannot be attached to the relay conditionally:
+# the relay is always created, and a `file:` secret whose file is missing stops
+# `up` for the relay — Telegram with it. With the overlay left out, compose.vm.yml
+# is byte for byte what it was and no WhatsApp file, secret or variable is read.
+#
+# THE OVERLAY IS ON ONLY WHEN vm.env SAYS SO: `WHATSAPP_BRIDGE_ENABLED=1`
+# (docs/control-plane-vm-deployment.md, "WhatsApp"). Every command that brings the
+# relay up must use the same file set, or the relay is recreated without its
+# secrets and logs `relay.whatsapp_disabled` while Telegram looks fine: the release
+# tool (vm-release.py) and the scripts that call compose by hand all take it from
+# vm-compose-files.sh, and tests/scripts/test_vm_whatsapp.py fails for one that does
+# not.
+#
+# The bridge is a credential holder. Its session directory (WHATSAPP_SESSION_DIR in
+# vm.env, a host path outside every git checkout, mode 0700, owned by the uid it
+# runs as) is the logged-in WhatsApp account: it is bind-mounted read-write at
+# /session, never baked into the image, and part of every VM snapshot.
+name: kinerary-cp
+
+services:
+  whatsapp-bridge:
+    image: kinerary-cp/whatsapp-bridge:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    build:
+      context: ../whatsapp-bridge
+      dockerfile: Dockerfile
+    # Host networking, like the relay: the bridge binds 127.0.0.1 only (the host is not
+    # a parameter), and the relay reaches it at the profile's
+    # `bridge_url: http://127.0.0.1:<port>`, the same loopback.
+    network_mode: host
+    # The image's own uid (node, 1000) - also the uid the relay runs as, which reads the same
+    # secret file. The secret file and the session directory on the host belong to it: the bridge
+    # refuses a secret file readable by group or others, so there is no group-read way around it.
+    user: "1000:1000"
+    # Arguments to the image's entrypoint (node src/bridge.js). The secret is a file;
+    # never an argument and never an environment variable.
+    command:
+      - --session
+      - /session
+      - --port
+      - "${WHATSAPP_BRIDGE_PORT:-4340}"
+      - --secret-file
+      - /run/secrets/whatsapp_bridge_secret
+    volumes:
+      # Long syntax with create_host_path off: a mistyped path is an error, not a new
+      # root-owned directory that then looks like an unpaired session.
+      - type: bind
+        source: ${WHATSAPP_SESSION_DIR:?set WHATSAPP_SESSION_DIR in vm.env to the host directory that holds the WhatsApp session}
+        target: /session
+        bind:
+          create_host_path: false
+    secrets:
+      - whatsapp_bridge_secret
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # unless-stopped, so the bridge comes back after a VM reboot or a Docker daemon restart (it
+    # exits 0 on SIGTERM, which on-failure would never restart). Nothing can loop against WhatsApp:
+    # an unpaired session exits 3 before the library is even loaded, so its restarts stay local and
+    # Docker backs them off; a logged-out or replaced session does not exit at all (the process stays
+    # up and says so on /health, and never retries). `docker compose stop whatsapp-bridge` (and
+    # vm-whatsapp-pair.sh, which stops it before pairing) keeps it down until it is started again.
+    restart: unless-stopped
+
+  relay:
+    # Merged into the relay's own list: its bridge client's bearer secret, and the key
+    # its opaque sender ids are derived from. Neither is given to any other service
+    # (the api reads only `relay.whatsapp.number` for the dashboard).
+    secrets:
+      - whatsapp_bridge_secret
+      - whatsapp_sender_id_key
+
+secrets:
+  whatsapp_bridge_secret:
+    file: ./.local-secrets/whatsapp_bridge_secret
+  whatsapp_sender_id_key:
+    file: ./.local-secrets/whatsapp_sender_id_key

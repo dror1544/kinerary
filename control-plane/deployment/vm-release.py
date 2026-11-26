@@ -339,8 +339,124 @@ def compose_defines_web(compose_text: str) -> bool:
     return all(re.search(rf"^  {re.escape(name)}:\s*$", compose_text, re.M) for name in WEB_SERVICES)
 
 
+# --------------------------------------------------------------------------- #
+# WhatsApp through the relay: an OPTIONAL overlay (compose.vm.whatsapp.yml) that adds the
+# bridge sidecar and gives the relay its two secrets. Off unless vm.env says
+# WHATSAPP_BRIDGE_ENABLED=1; off, nothing below changes a single command, image or line
+# of output. It is an overlay and not a profile because a secret cannot be attached to
+# the relay conditionally (docs/control-plane-vm-deployment.md, "WhatsApp").
+#
+# Every compose call this tool makes carries the overlay or none of them do: the relay is
+# recreated by vm-relay-restart.sh, and a relay recreated from compose.vm.yml alone has no
+# WhatsApp secrets (it logs relay.whatsapp_disabled, Telegram looks fine), while a bridge
+# left out of a `up --remove-orphans` is removed as an orphan.
+# --------------------------------------------------------------------------- #
+WHATSAPP_FLAG = "WHATSAPP_BRIDGE_ENABLED"
+WHATSAPP_OVERLAY = "compose.vm.whatsapp.yml"
+WHATSAPP_SERVICE = "whatsapp-bridge"
+WHATSAPP_SECRET_NAMES = ("whatsapp_bridge_secret", "whatsapp_sender_id_key")
+WHATSAPP_DEFAULT_PORT = "4340"
+WHATSAPP_BRIDGE_UID = 1000   # the image's `node` user; the overlay pins it, and the relay (also node) reads the same secret file
+#: What the bridge's /health may say about itself; anything else is reported as unrecognised, never echoed.
+WHATSAPP_STATES = ("starting", "connecting", "connected", "disconnected", "logged_out", "replaced", "unpaired")
+WHATSAPP_STATE_POLLS, WHATSAPP_STATE_STEP_SECONDS = 10, 3   # a bridge that is still connecting gets 30 s
+
+
+def truthy(value: str) -> bool:
+    # A trailing ` # comment` is dropped (vm.env.example once carried one on this line): reading `1   # on`
+    # as "not on" would silently leave the overlay out.
+    value = re.sub(r"\s+#.*$", "", value.strip())
+    return value.strip().strip("\"'").strip().lower() in ("1", "true", "yes", "on")
+
+
+def whatsapp_flag(*env_texts: str) -> bool:
+    """WHATSAPP_BRIDGE_ENABLED as vm-compose-files.sh reads it: the last env file to set it wins."""
+    value = ""
+    for text in env_texts:
+        value = read_env_text(text).get(WHATSAPP_FLAG, value)
+    return truthy(value)
+
+
+def compose_defines_whatsapp(overlay_text: str) -> bool:
+    """Whether a compose.vm.whatsapp.yml defines the bridge. Looked up in the TARGET revision's
+    file, like the portal: a rollback to a version from before the overlay has none."""
+    return bool(re.search(rf"^  {re.escape(WHATSAPP_SERVICE)}:\s*$", overlay_text, re.M))
+
+
+def whatsapp_profile_problems(env: Dict[str, str], profile: Optional[Dict]) -> List[str]:
+    """Why the architecture profile would leave the relay without a working WhatsApp even though the
+    bridge runs. Names only, never a value. These disable WhatsApp, not the relay, so they are warnings."""
+    port = env.get("WHATSAPP_BRIDGE_PORT") or WHATSAPP_DEFAULT_PORT
+    if profile is None:
+        return ["the architecture profile named by KINERARY_ARCHITECTURE_PROFILE could not be read, so relay.whatsapp was not checked"]
+    block = (profile.get("relay") or {}).get("whatsapp")
+    if not isinstance(block, dict):
+        return ["the architecture profile has no relay.whatsapp block: the bridge would run and the relay would not use it"]
+    problems = []
+    if block.get("bridge_url") != f"http://127.0.0.1:{port}":
+        problems.append(f"relay.whatsapp.bridge_url is not http://127.0.0.1:{port} (WHATSAPP_BRIDGE_PORT)")
+    for key, secret in (("bridge_secret_ref", WHATSAPP_SECRET_NAMES[0]), ("sender_id_secret_ref", WHATSAPP_SECRET_NAMES[1])):
+        if block.get(key) != f"file:///run/secrets/{secret}":
+            problems.append(f"relay.whatsapp.{key} is not file:///run/secrets/{secret}, the file the overlay mounts in the relay")
+    if not re.fullmatch(r"[0-9]{6,15}", str(block.get("number", ""))):
+        problems.append("relay.whatsapp.number is not digits only, country code first")
+    return problems
+
+
+def whatsapp_secret_problems(directory: Path) -> List[str]:
+    """What is wrong with the two secret files, by name; a value is never read into a message."""
+    problems = []
+    values: Dict[str, str] = {}
+    for name in WHATSAPP_SECRET_NAMES:
+        path = directory / name
+        try:
+            mode = path.stat().st_mode & 0o777
+            values[name] = path.read_text().strip()
+        except OSError:
+            problems.append(f"{path} is missing or unreadable")
+            continue
+        if mode & 0o077:
+            problems.append(f"{name} is readable by group or others (mode {mode:04o}); the bridge refuses such a secret file: chmod 0600")
+    secret, key = values.get(WHATSAPP_SECRET_NAMES[0]), values.get(WHATSAPP_SECRET_NAMES[1])
+    if secret is not None and (len(secret) < 32 or re.search(r"\s", secret)):
+        problems.append(f"{WHATSAPP_SECRET_NAMES[0]} must be at least 32 characters with no whitespace")
+    if key is not None and len(key.encode()) < 32:
+        problems.append(f"{WHATSAPP_SECRET_NAMES[1]} must be at least 32 bytes")
+    if secret and key and secret == key:
+        problems.append("the two WhatsApp secrets hold the same value; they must differ")
+    return problems
+
+
+def whatsapp_session_problems(session_dir: str, uid: int) -> Tuple[List[str], bool]:
+    """(problems, paired) for the host session directory. The bridge's own refusal to run inside a git
+    work tree cannot see past the mount point inside its container, so it is enforced here."""
+    if not session_dir:
+        return ["WHATSAPP_SESSION_DIR is not set in vm.env"], False
+    path = Path(session_dir)
+    if not path.is_absolute():
+        return ["WHATSAPP_SESSION_DIR must be an absolute path (it is a host path)"], False
+    if not path.is_dir():
+        return ["WHATSAPP_SESSION_DIR does not exist or is not a directory: create it (mode 0700, owned by the bridge's uid), then pair"], False
+    problems = []
+    real = path.resolve()
+    for candidate in (path, real):
+        for parent in (candidate, *candidate.parents):
+            if (parent / ".git").exists():
+                problems.append("WHATSAPP_SESSION_DIR is inside a git work tree: the session is a credential and must live outside every checkout")
+                break
+        else:
+            continue
+        break
+    stat = real.stat()
+    if stat.st_mode & 0o077:
+        problems.append(f"WHATSAPP_SESSION_DIR is readable by group or others (mode {stat.st_mode & 0o777:04o}): chmod 0700")
+    if stat.st_uid != uid:
+        problems.append(f"WHATSAPP_SESSION_DIR is owned by uid {stat.st_uid}, not {uid} (the uid the bridge runs as): it could not write its session")
+    return problems, (real / "creds.json").is_file()
+
+
 # The env:// targets compose.vm.yml gives the api for the `web` block's secret references.
-WEB_API_ENV = ("RUNTIME_EXCHANGE_KEY", "PORTAL_EMAIL_API_KEY")
+WEB_API_ENV =("RUNTIME_EXCHANGE_KEY", "PORTAL_EMAIL_API_KEY")
 WEB_REQUIRED_ENV = ("RUNTIME_EXCHANGE_KEY", "RUNTIME_COOKIE_SECRET", "PORTAL_ORIGIN", "RUNTIME_ORIGIN",
                     "KINERARY_ARCHITECTURE_PROFILE")
 
@@ -805,14 +921,14 @@ def backups_to_prune(backups: Sequence[Tuple[str, int]], *, keep: int, max_total
 
 
 def images_to_prune(tags: Iterable[str], keep_revs: Iterable[str]) -> List[str]:
-    """kinerary-cp/{api,worker,agent-runtime,portal,runtime-gateway}:<rev> images not in keep_revs.
+    """kinerary-cp/{api,worker,agent-runtime,portal,runtime-gateway,whatsapp-bridge}:<rev> images not in keep_revs.
 
     Hermes images are never pruned here: building one is a manual step.
     """
     keep = {r for r in keep_revs if r}
     doomed = []
     for tag in tags:
-        match = re.match(r"^kinerary-cp/(api|worker|agent-runtime|portal|runtime-gateway):([0-9a-f]{7,40})$", tag)
+        match = re.match(r"^kinerary-cp/(api|worker|agent-runtime|portal|runtime-gateway|whatsapp-bridge):([0-9a-f]{7,40})$", tag)
         if match and match.group(2) not in keep:
             doomed.append(tag)
     return sorted(doomed)
@@ -1201,8 +1317,43 @@ class ControlPlane:
         # every command this tool builds then agrees with web_enabled(), whatever
         # an older compose does with the variable in an --env-file.
         profile = ["--profile", WEB_PROFILE] if self.web_enabled() else []
-        return ["docker", "compose", "-f", str(DEPLOYMENT_DIR / "compose.vm.yml"),
+        # The WhatsApp overlay is in EVERY compose call or in none (see the comment above
+        # WHATSAPP_FLAG). Off, this is the argv it always was.
+        overlay = ["-f", str(DEPLOYMENT_DIR / WHATSAPP_OVERLAY)] if self.whatsapp_active() else []
+        return ["docker", "compose", "-f", str(DEPLOYMENT_DIR / "compose.vm.yml"), *overlay,
                 "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *profile, *args]
+
+    # ---------------------------------------------------------- whatsapp --
+    def merged_env(self) -> Dict[str, str]:
+        """provisioning.env then vm.env, the order compose reads them: vm.env wins."""
+        read = lambda path: path.read_text() if path.exists() else ""  # noqa: E731
+        return {**read_env_text(read(PROVISIONING_ENV)), **read_env_text(read(VM_ENV))}
+
+    def whatsapp_enabled(self) -> bool:
+        """Is WhatsApp switched on in this VM's env files? Read from the files alone, like web_enabled()."""
+        read = lambda path: path.read_text() if path.exists() else ""  # noqa: E731
+        return whatsapp_flag(read(PROVISIONING_ENV), read(VM_ENV))
+
+    def whatsapp_in_compose(self, full: str) -> bool:
+        proc = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/{WHATSAPP_OVERLAY}"), timeout=60)
+        return proc.returncode == 0 and compose_defines_whatsapp(proc.stdout.decode(errors="replace"))
+
+    def whatsapp_active(self) -> bool:
+        """Is the overlay part of this checkout's compose file set right now? On in vm.env AND
+        the checked-out version carries it (a rollback to a version from before the overlay
+        has none, and `-f <missing file>` would fail every compose call, Telegram included).
+        A dry run never checks the target out, so it asks git about the target instead."""
+        if not self.whatsapp_enabled():
+            return False
+        if self.dry_run and self.target_full:
+            return self.whatsapp_in_compose(self.target_full)
+        overlay = DEPLOYMENT_DIR / WHATSAPP_OVERLAY
+        return overlay.exists() and compose_defines_whatsapp(overlay.read_text())
+
+    def whatsapp_wanted(self, full: Optional[str]) -> bool:
+        """The bridge image belongs to a release only when WhatsApp is on AND that revision carries
+        the overlay: a stack that never enabled it builds, checks and prunes what it always did."""
+        return bool(full) and self.whatsapp_enabled() and self.whatsapp_in_compose(full)
 
     def web_in_compose(self, full: str) -> bool:
         proc = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/compose.vm.yml"), timeout=60)
@@ -1648,10 +1799,26 @@ class ControlPlane:
         images = [f"kinerary-cp/api:{rev}", f"kinerary-cp/worker:{rev}", f"kinerary-cp/agent-runtime:{rev}"]
         if self.web_images_wanted(full):
             images += [f"kinerary-cp/{name}:{rev}" for name in WEB_SERVICES]
+        if self.whatsapp_wanted(full):
+            images.append(f"kinerary-cp/{WHATSAPP_SERVICE}:{rev}")
         return images
 
-    def build_images(self, full: str, short: str) -> None:
-        missing = [t for t in self.kinerary_images(short, full) if not self.image_exists(t)]
+    def rollback_image_plan(self, short: str, full: str) -> Tuple[List[str], List[str]]:
+        """(images that must already exist, images to build) for a rollback target. The optional bridge
+        image is the one that may be built: the target revision may never have been built while WhatsApp
+        was on, and its absence must not stop Telegram's rollback. Everything else missing refuses it."""
+        bridge = f"kinerary-cp/{WHATSAPP_SERVICE}:{short}"
+        required: List[str] = []
+        build: List[str] = []
+        for tag in self.kinerary_images(short, full):
+            (build if tag == bridge and not self.image_exists(tag) else required).append(tag)
+        return required, build
+
+    def build_images(self, full: str, short: str, only: Optional[Sequence[str]] = None) -> None:
+        """Build what is missing for this revision. `only` narrows it to those tags (a rollback that
+        finds just the optional bridge image absent builds that and nothing else)."""
+        wanted = [t for t in self.kinerary_images(short, full) if only is None or t in only]
+        missing = [t for t in wanted if not self.image_exists(t)]
         if not missing:
             self.r.ok(f"images for {short} already built")
             return
@@ -1669,6 +1836,11 @@ class ControlPlane:
                 ["docker", "build", "-f", "control-plane/runtime-gateway/Dockerfile",
                  "-t", f"kinerary-cp/runtime-gateway:{short}", "control-plane/runtime-gateway"],
             ]
+        if self.whatsapp_wanted(full):
+            builds.append(["docker", "build", "-f", "control-plane/whatsapp-bridge/Dockerfile",
+                           "-t", f"kinerary-cp/{WHATSAPP_SERVICE}:{short}", "control-plane/whatsapp-bridge"])
+        if only is not None:
+            builds = [argv for argv in builds if argv[argv.index("-t") + 1] in only]
         if self.dry_run:
             self.r.step(f"would build {len(builds)} images for {short} in a worktree at {worktree} (~1.6 GB, before the snapshot so builds do not grow it)")
             return
@@ -1684,19 +1856,31 @@ class ControlPlane:
                     raise Refused("image build failed:\n      " + "\n      ".join(tail))
         finally:
             self.sh.read(self.git_argv("worktree", "remove", "--force", str(worktree)))
-        self.r.ok(f"built {', '.join(self.kinerary_images(short, full))}")
+        self.r.ok(f"built {', '.join(wanted)}")
 
     def validate_compose(self, full: str) -> None:
         text = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/compose.vm.yml"), check=True).stdout
         with tempfile.NamedTemporaryFile(prefix="kinerary-compose.", suffix=".yml", delete=False) as handle:
             handle.write(text)
             temp = handle.name
+        overlay_temp: Optional[str] = None
         try:
             profile = ["--profile", WEB_PROFILE] if self.web_enabled() else []
-            proc = self.sh.read(["docker", "compose", "--project-directory", str(DEPLOYMENT_DIR), "-f", temp,
+            overlay: List[str] = []
+            if self.whatsapp_wanted(full):
+                # The target's own overlay, checked with its own compose.vm.yml: the same file set
+                # compose() will use once the target is checked out.
+                text = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/{WHATSAPP_OVERLAY}"), check=True).stdout
+                with tempfile.NamedTemporaryFile(prefix="kinerary-compose-whatsapp.", suffix=".yml", delete=False) as handle:
+                    handle.write(text)
+                    overlay_temp = handle.name
+                overlay = ["-f", overlay_temp]
+            proc = self.sh.read(["docker", "compose", "--project-directory", str(DEPLOYMENT_DIR), "-f", temp, *overlay,
                                  "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *profile, "config", "-q"], timeout=60)
         finally:
             os.unlink(temp)
+            if overlay_temp:
+                os.unlink(overlay_temp)
         if proc.returncode != 0:
             self.r.fail(f"the target's compose.vm.yml does not validate against this VM's env files and secrets: "
                         f"{proc.stderr.decode(errors='replace').strip()[-300:]}")
@@ -1724,6 +1908,45 @@ class ControlPlane:
             self.r.fail(f"{WEB_PROFILE} profile: {problem}")
         if not problems:
             self.r.ok(f"{WEB_PROFILE} profile: the portal and gateway are configured (names checked, no values shown)")
+
+    def guard_whatsapp(self, full: str, *, rollback: bool = False) -> None:
+        """With WhatsApp on and the target carrying the overlay, its files must be whole BEFORE the
+        switch: the relay is recreated with the overlay's two secrets, and `up` fails for the relay
+        (Telegram with it) when one is missing. Nothing is checked, and nothing printed, when it is
+        off. Names only; no value is shown. A profile that leaves the bridge unused disables WhatsApp
+        and nothing else, so that is a warning, not a refused plan. A ROLLBACK refuses only for the two secret files (the relay is recreated
+        with them, and cannot be without): a session directory problem there is a warning, because the
+        bridge alone is affected and Telegram's way back must not wait on it."""
+        if not self.whatsapp_wanted(full):
+            return
+        env = self.merged_env()
+        problems = whatsapp_secret_problems(SECRETS_DIR)
+        session, paired = whatsapp_session_problems(env.get("WHATSAPP_SESSION_DIR", ""), WHATSAPP_BRIDGE_UID)
+        if rollback:
+            for problem in session:
+                self.r.note(f"whatsapp: {problem} — the bridge may not start; Telegram's rollback goes on")
+        else:
+            problems += session
+        for problem in problems:
+            self.r.fail(f"whatsapp: {problem}")
+        if not problems:
+            self.r.ok("whatsapp: the two secrets and the session directory are in place (names checked, no values shown)")
+            if not paired:
+                self.r.note("whatsapp: the session is not paired yet — the bridge will not serve until vm-whatsapp-pair.sh has linked the phone "
+                            "(WhatsApp stays down, Telegram is unaffected)")
+        profile: Optional[Dict] = None
+        if env.get("KINERARY_ARCHITECTURE_PROFILE"):
+            try:
+                profile = json.loads((DEPLOYMENT_DIR / env["KINERARY_ARCHITECTURE_PROFILE"]).read_text())
+            except (OSError, ValueError):
+                profile = None
+        else:
+            try:
+                profile = json.loads((DEPLOYMENT_DIR / "../config/architecture.local.example.json").read_text())
+            except (OSError, ValueError):
+                profile = None
+        for problem in whatsapp_profile_problems(env, profile):
+            self.r.note(f"whatsapp: {problem} — WhatsApp stays off on the relay (Telegram is unaffected)")
 
     # ---------------------------------------------------------- switch --
     def switch_to(self, full: str, short: str, hermes_rev: Optional[str], previous: Dict[str, str],
@@ -1902,6 +2125,18 @@ class ControlPlane:
             self.r.note(f"{profile} did not log a new registration for {', '.join(servers)} within "
                         f"{GATEWAY_WAIT_POLLS * GATEWAY_WAIT_STEP_SECONDS}s — verify will say what is missing")
 
+    def start_whatsapp(self) -> None:
+        """Bring the bridge up on this revision's image, when WhatsApp is on. Its restart pauses
+        WhatsApp only. A bridge that cannot start is a warning here and in verify: WhatsApp being
+        down never fails a release, because the rollback that follows would take Telegram with it."""
+        if not self.whatsapp_active():
+            return
+        proc = self.sh.act(self.compose("up", "-d", "--no-deps", WHATSAPP_SERVICE), check=False, timeout=300,
+                           describe=f"compose up -d --no-deps {WHATSAPP_SERVICE}  (downtime: WhatsApp pauses while it restarts; Telegram is untouched)")
+        if proc.returncode != 0:
+            self.r.note(f"WARNING: the WhatsApp bridge did not start ({proc.stderr.decode(errors='replace').strip()[-200:]}) — "
+                        "the release goes on; WhatsApp stays down and verify will say so")
+
     def start_switched(self, hermes_rev: Optional[str], *, restart_hermes: bool) -> None:
         """The point of no return: the target's containers start. From here a failure
         rolls forward (verify, then rollback), because putting an older database back
@@ -1913,6 +2148,10 @@ class ControlPlane:
         self.sh.act(self.compose("up", "-d", "--wait", "--remove-orphans", *services),
                     describe=f"compose up -d --wait {' '.join(services)}  (downtime: none for trips)", timeout=900,
                     stream_output=True)
+        # WhatsApp's bridge comes up on the new image BEFORE the relay restarts, so the relay meets
+        # a bridge that is already connecting. Not in the `--wait` list above: an unpaired or
+        # logged-out bridge is not a failed release, and `--wait` would make it one.
+        self.start_whatsapp()
         relay_restart = lambda: self.sh.act(  # noqa: E731
             [str(DEPLOYMENT_DIR / "vm-relay-restart.sh"), "--force-live"],
             describe="vm-relay-restart.sh --force-live  (downtime: the Telegram bot pauses; messages wait at Telegram)",
@@ -2028,6 +2267,95 @@ class ControlPlane:
         f.check("web:gateway-health", ok, "NO_ANSWER",
                 "runtime gateway: /health answers" if ok else f"runtime gateway: /health did not answer: {body or 'no output'}")
 
+    def bridge_health(self, env: Dict[str, str]) -> Tuple[Optional[str], str]:
+        """(state, problem) from the bridge's /health, read in this process: the bearer secret goes
+        from its file to one request header and nowhere else. Only `state`, and only one of the
+        words the bridge uses, is taken from the answer: the rest of it (`own` is the bot's full
+        number) is dropped here and never printed, logged or kept."""
+        try:
+            secret = (SECRETS_DIR / WHATSAPP_SECRET_NAMES[0]).read_text().strip()
+        except OSError:
+            return None, "its secret file cannot be read"
+        port = env.get("WHATSAPP_BRIDGE_PORT") or WHATSAPP_DEFAULT_PORT
+        if not re.fullmatch(r"[0-9]{1,5}", port):
+            return None, "WHATSAPP_BRIDGE_PORT is not a port number"
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/health", headers={"Authorization": f"Bearer {secret}"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read(65536)
+        except urllib.error.HTTPError as error:
+            # The bridge answers some states with a non-200 and a JSON body; a refusal (401/403) is a wrong secret.
+            if error.code in (401, 403):
+                return None, f"/health refused the bearer secret (HTTP {error.code}): the relay's secret and the bridge's differ"
+            body = error.read(65536)
+        except (OSError, ValueError) as error:
+            return None, f"/health did not answer ({type(error).__name__})"
+        try:
+            state = json.loads(body.decode(errors="replace")).get("state")
+        except (ValueError, AttributeError):
+            return None, "/health did not return JSON"
+        return (state if state in WHATSAPP_STATES else "unrecognised"), ""
+
+    def verify_whatsapp(self, f: Findings, running: Dict[str, str], rev: str, events: List[Dict]) -> None:
+        """The optional WhatsApp bridge. Off means not looked at, and not mentioned. On, EVERYTHING here is
+        a note: an unpaired, logged-out or missing bridge is a loud WARNING, never a failed check, because
+        a failed verify rolls the release back and WhatsApp being down must not take Telegram with it."""
+        if not self.whatsapp_enabled():
+            return
+        overlay = DEPLOYMENT_DIR / WHATSAPP_OVERLAY
+        if not (overlay.exists() and compose_defines_whatsapp(overlay.read_text())):
+            f.note("WARNING: WhatsApp is on in vm.env but this version has no WhatsApp bridge — not checked")
+            return
+        container = f"{COMPOSE_PROJECT}-{WHATSAPP_SERVICE}-1"
+        image = running.get(container, "")
+        if not image:
+            f.note(f"WARNING: the WhatsApp bridge is NOT RUNNING ({container}) — WhatsApp is down, Telegram is not. "
+                   f"If it is unpaired run vm-whatsapp-pair.sh; otherwise start it: docker compose up -d --no-deps {WHATSAPP_SERVICE} "
+                   "(with the same -f files as the release tool)")
+            return
+        if not image.endswith(f":{rev}"):
+            f.note(f"WARNING: the WhatsApp bridge runs {image}, not revision {rev}")
+        env = self.merged_env()
+        state, problem = self.bridge_health(env)
+        for _ in range(WHATSAPP_STATE_POLLS):
+            if state not in ("starting", "connecting"):
+                break
+            time.sleep(WHATSAPP_STATE_STEP_SECONDS)
+            state, problem = self.bridge_health(env)
+        if state is None:
+            f.note(f"WARNING: the WhatsApp bridge is up but {problem} — WhatsApp is down, Telegram is not")
+        elif state == "connected":
+            f.note(f"whatsapp: bridge {image} is connected")
+        elif state == "unpaired":
+            f.note("WARNING: the WhatsApp bridge is unpaired — link the phone with vm-whatsapp-pair.sh. WhatsApp is down, Telegram is not")
+        elif state == "logged_out":
+            f.note("WARNING: the WhatsApp bridge is LOGGED OUT (the phone unlinked this device, or the account was restricted) — "
+                   "unlink and pair again with vm-whatsapp-pair.sh. WhatsApp is down, Telegram is not")
+        else:
+            f.note(f"WARNING: the WhatsApp bridge's state is {state}, not connected — WhatsApp is down, Telegram is not")
+        configured = [e for e in events if e.get("event") == "relay.whatsapp"]
+        disabled = [e for e in events if e.get("event") == "relay.whatsapp_disabled"]
+        if configured and configured[-1].get("configured") is True:
+            f.note("whatsapp: the relay is configured for it (relay.whatsapp configured:true)")
+        else:
+            why = ""
+            if disabled:
+                field = str(disabled[-1].get("field", ""))
+                reason = str(disabled[-1].get("reason", ""))
+                if re.fullmatch(r"[a-z_.]{1,80}", field):
+                    why = f" ({field} {reason[:100]})"
+            f.note("WARNING: the relay did not log relay.whatsapp configured:true" + why +
+                   " — it runs without WhatsApp; check relay.whatsapp in the architecture profile and the two secrets, then restart the relay")
+            return
+        seen = [e for e in events if e.get("event") == "whatsapp.bridge_state"]
+        last = str(seen[-1].get("state", "")) if seen else ""
+        if last == "connected":
+            f.note("whatsapp: the relay logged whatsapp.bridge_state connected")
+        elif seen:
+            f.note(f"WARNING: the relay's last whatsapp.bridge_state is {last if re.fullmatch(r'[a-z_]{1,30}', last) else 'unrecognised'}, not connected")
+        else:
+            f.note("WARNING: the relay has not logged whatsapp.bridge_state yet — it has not reached the bridge (check bridge_url's port against WHATSAPP_BRIDGE_PORT)")
+
     def versions_in_env(self) -> Tuple[str, str]:
         try:
             env = self.vm_env()
@@ -2066,6 +2394,7 @@ class ControlPlane:
         f.check(f"image:{HERMES_CONTAINER}", image.endswith(f":{hermes_rev}"), "NOT_RUNNING" if not image else "WRONG_REV",
                 f"{HERMES_CONTAINER}: {image or 'NOT RUNNING'}")
         self.verify_web(f, running, rev)
+        self.verify_whatsapp(f, running, rev, events)
 
         identity = [e for e in events if e.get("event") == "relay.bot_identity"]
         bot = identity[-1].get("username") if identity else None
@@ -2448,6 +2777,7 @@ def cmd_plan(cp: ControlPlane, rev: str) -> int:
     for tag in cp.kinerary_images(short, full):
         (r.ok if cp.image_exists(tag) else r.note)(f"{tag} {'present' if cp.image_exists(tag) else 'will be built'}")
     cp.guard_web(full)
+    cp.guard_whatsapp(full)
     return 1 if r.failures else 0
 
 
@@ -2479,6 +2809,7 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
         (r.ok if cp.image_exists(tag) else r.fail)(f"{tag} {'present' if cp.image_exists(tag) else 'missing — build it first (runbook: Hermes)'}")
     cp.validate_compose(full)
     cp.guard_web(full)
+    cp.guard_whatsapp(full)
     cp.guard_storage(extra_bytes=cp.db_size_bytes() + (2 * 1024 ** 3))
     cp.refuse_if_failed("nothing was changed")
     cp.build_images(full, short)
@@ -2545,7 +2876,9 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
         r.step("would verify: readyz, migrations, image tags, relay bot + polling + no 409, every running gateway's tools "
                "(against its own config.yaml, from lines newer than its restart), Hermes credentials, every live trip's "
                "companion and trip-mcp bridge (/health)"
-               + (", the portal's /v1 proxy and the runtime gateway" if cp.web_enabled() else ""))
+               + (", the portal's /v1 proxy and the runtime gateway" if cp.web_enabled() else "")
+               + (", the WhatsApp bridge's /health (state only; its answer's number is never shown) and the relay's WhatsApp lines — "
+                  "problems there are warnings, never a failed release" if cp.whatsapp_enabled() else ""))
         r.line()
         r.line(f"Dry run complete: {r.failures} problem(s). Nothing was changed.")
         return 1 if r.failures else 0
@@ -2594,7 +2927,10 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     hermes_changes = hermes_target != versions["HERMES_REV"]
     r.ok(f"{versions['KINERARY_REV']} → {short} \"{cp.subject(full)}\"" + (f", Hermes {versions['HERMES_REV']} → {hermes_target}" if hermes_changes else ""))
     r.fact("target", f"{versions['KINERARY_REV']} -> {short} \"{cp.subject(full)}\"")
-    for tag in cp.kinerary_images(short, full):
+    required, build_bridge = cp.rollback_image_plan(short, full)
+    for tag in build_bridge:
+        r.note(f"{tag} not built — it will be built from {short} before the switch (WhatsApp is on in vm.env)")
+    for tag in required:
         (r.ok if cp.image_exists(tag) else r.fail)(f"{tag} {'present' if cp.image_exists(tag) else 'MISSING — pruned? rebuild it or pick another target'}")
     if hermes_changes:
         (r.ok if cp.image_exists(f"kinerary-cp/hermes:{hermes_target}") else r.fail)(f"kinerary-cp/hermes:{hermes_target}")
@@ -2645,9 +2981,17 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     r.head("3/5 Guards")
     cp.guard_jobs()
     cp.guard_interview(force_live)
+    cp.guard_whatsapp(full, rollback=True)
     baseline_path = cp.take_baseline("rollback")
     cp.guard_storage(extra_bytes=cp.db_size_bytes())
     cp.refuse_if_failed("nothing was changed")
+    if build_bridge:
+        try:
+            cp.build_images(full, short, only=build_bridge)
+        except Refused as error:
+            # A bridge that cannot be built must not hold Telegram's rollback hostage: it is left out of this
+            # switch and verify says so.
+            r.note(f"WARNING: the WhatsApp bridge image for {short} could not be built, WhatsApp stays down: {error}")
 
     r.head("4/5 Switch")
     pre_label = f"{versions['KINERARY_REV']}-before-rollback-to-{short}"
@@ -2680,7 +3024,8 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     r.head("5/5 Verify")
     if cp.dry_run:
         r.step("would verify: readyz, migrations, image tags, relay, every running gateway's tools, Hermes credentials, live trips and their bridges"
-               + (", the portal's /v1 proxy and the runtime gateway" if cp.web_enabled() else ""))
+               + (", the portal's /v1 proxy and the runtime gateway" if cp.web_enabled() else "")
+               + (", the WhatsApp bridge's /health (state only) and the relay's WhatsApp lines — warnings only" if cp.whatsapp_enabled() else ""))
         r.line(); r.line(f"Dry run complete: {r.failures} problem(s). Nothing was changed.")
         return 1 if r.failures else 0
     result = cp.verify(cp.baseline)

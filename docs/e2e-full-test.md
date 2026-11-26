@@ -43,7 +43,10 @@ again on every exit:
 
 ```bash
 cd /opt/kinerary
-C="sudo docker compose -f control-plane/deployment/compose.vm.yml --env-file /opt/kinerary-deploy/provisioning.env --env-file /opt/kinerary-deploy/vm.env"
+# The file set comes from the helper, so the WhatsApp overlay is included while it is on.
+. control-plane/deployment/vm-compose-files.sh
+vm_compose_files_init "$PWD/control-plane/deployment" /opt/kinerary-deploy/provisioning.env /opt/kinerary-deploy/vm.env
+C="sudo docker compose ${VM_COMPOSE_FILES[*]} --env-file /opt/kinerary-deploy/provisioning.env --env-file /opt/kinerary-deploy/vm.env"
 flags() {  # flags 1 1  -> on;  flags "" 0 -> off
   sudo sed -i -e "s/^PROVISIONER_COMPUTE_ENABLED=.*/PROVISIONER_COMPUTE_ENABLED=$1/" \
     -e "s/^PROVISIONER_COMPANION_PROFILE_ENABLED=.*/PROVISIONER_COMPANION_PROFILE_ENABLED=$2/" \
