@@ -82,10 +82,10 @@ it("lists connected groups by title and people by name with the last four digits
   // no number is shown but the deployment's own: every run of seven or more digits on the page is that one
   const longRuns = [...(document.querySelector("#whatsapp")?.textContent ?? "").matchAll(/\d{7,}/g)].map((m) => m[0]);
   expect(longRuns.every((run) => run === NUMBER)).toBe(true);
-  fireEvent.click(screen.getByRole("button", { name: /Remove WhatsApp · linked Nov 21, 2026/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Unlink WhatsApp · linked Nov 21, 2026/ }));
   expect(calls.some((c) => c.call.startsWith("DELETE"))).toBe(false);
-  expect(screen.getByRole("group", { name: "Confirm remove" })).toHaveTextContent("Nothing is sent to it");
-  fireEvent.click(screen.getByRole("button", { name: "Confirm remove" }));
+  expect(screen.getByRole("group", { name: "Confirm unlink" })).toHaveTextContent("Nothing is sent to it");
+  fireEvent.click(screen.getByRole("button", { name: "Confirm unlink" }));
   await vi.waitFor(() => expect(screen.queryByText("Noa")).toBeNull());
   expect(calls.map((c) => c.call)).toContain("DELETE /v1/trips/trip_abcdefgh/whatsapp-connections/tcb_bbbbbbbbbbbbbbbb");
   expect(screen.getByText("Family <b>chat</b>")).toBeInTheDocument();

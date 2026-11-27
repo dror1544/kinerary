@@ -51,7 +51,7 @@ function LinkWhatsApp({ trip, active, menu }: { trip: TripSummary; active: boole
   );
 }
 
-/** Connected chats, for the trip's owner, each with Remove (asks first; sends nothing to the chat, spec 625 AC-15). */
+/** Connected chats, for the trip's owner, each with Unlink (asks first; the owner chose the word Telegram uses, 2026-11-27; sends nothing to the chat, spec 625 AC-15). */
 function WhatsAppEntries({ trip, onDone, menu }: { trip: TripSummary; onDone: () => void; menu?: boolean }) {
   const queryClient = useQueryClient();
   const { connections, owner, scoped } = useWhatsAppAccess(trip);
@@ -69,15 +69,15 @@ function WhatsAppEntries({ trip, onDone, menu }: { trip: TripSummary; onDone: ()
       {list.map((entry) => {
         const what = entry.kind === "group" ? "Group" : "Person";
         return confirming === entry.bindingId
-          ? <div key={entry.bindingId} className="telegram-confirm" role="group" aria-label="Confirm remove">
-            <small>Remove this WhatsApp {entry.kind === "group" ? "group" : "chat"} (connected {formatDay(entry.connectedAt)})? Nothing is sent to it, and anyone still in the group can connect again by messaging the number.</small>
+          ? <div key={entry.bindingId} className="telegram-confirm" role="group" aria-label="Confirm unlink">
+            <small>Unlink this WhatsApp {entry.kind === "group" ? "group" : "chat"} (connected {formatDay(entry.connectedAt)})? Nothing is sent to it, and anyone still in the group can connect again by messaging the number.</small>
             <span>
-              <button type="button" className="text-button" onClick={() => remove.mutate(entry.bindingId)} disabled={remove.isPending}>Confirm remove</button>
+              <button type="button" className="text-button" onClick={() => remove.mutate(entry.bindingId)} disabled={remove.isPending}>Confirm unlink</button>
               <button type="button" className="text-button" onClick={() => setConfirming(null)}>Keep</button>
             </span>
           </div>
           : <button key={entry.bindingId} type="button" role={itemRole} className="text-button whatsapp-unlink" onClick={() => { remove.reset(); setConfirming(entry.bindingId); }}>
-            Remove WhatsApp · linked {formatDay(entry.connectedAt)}
+            Unlink WhatsApp · linked {formatDay(entry.connectedAt)}
             <small>
               {what}: {entry.name ? <bdi>{entry.name}</bdi> : "unnamed"} · {HOW[entry.via]}{entry.lastFour ? ` · number ending ${entry.lastFour}` : ""}
             </small>
@@ -193,7 +193,7 @@ export function TripWhatsApp({ trip }: { trip: TripSummary }) {
             <WhatsAppEntries trip={trip} onDone={() => undefined} />
           </div>
           {connections.isSuccess && count === 0 && <p className="subtle">Nothing is connected yet.</p>}
-          <p className="subtle">Removing a chat tells it nothing. Anyone still in the group can connect again by messaging the number.</p>
+          <p className="subtle">Unlinking a chat tells it nothing. Anyone still in the group can connect again by messaging the number.</p>
         </>
       )}
     </aside>
