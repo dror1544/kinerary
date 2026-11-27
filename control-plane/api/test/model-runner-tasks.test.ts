@@ -179,9 +179,9 @@ describe("the quota-only fallback (decision 48)", () => {
       INTERPRET_RUNNER: "claude",
       INTERPRET_MODEL: "m",
       // Misconfigured on purpose: interpret has no `*_FALLBACK_*` variable in
-      // the scheme at all (only EXTRACT_FALLBACK_*, EXTRACT_INTAKE_FALLBACK_*
-      // and EXTRACT_ITINERARY_FALLBACK_* are ever read), so this is inert
-      // rather than merely unused.
+      // the scheme at all (only EXTRACT_FALLBACK_*, EXTRACT_INTAKE_FALLBACK_*,
+      // EXTRACT_ITINERARY_FALLBACK_* and, since 2026-11-27, the group judge's
+      // JUDGE_FALLBACK_* are ever read), so this is inert rather than merely unused.
       INTERPRET_FALLBACK_RUNNER: "claude",
       INTERPRET_FALLBACK_MODEL: "m",
     });

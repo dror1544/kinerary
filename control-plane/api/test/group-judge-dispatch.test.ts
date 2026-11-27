@@ -175,6 +175,24 @@ describe("the group judge in the gate", { skip: SKIP }, () => {
     });
   });
 
+  test("YES from the quota FALLBACK: the log line says used_fallback and the analytics descriptor records the fallback's model", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000013";
+      await bindNamed(fix, chat);
+      const onFallback: JudgeOutcome = { kind: "yes", confidence: 0.9, ms: 2400, model: "claude-haiku-5-5", usedFallback: true };
+      const lines: string[] = [];
+      const decision = await dispatch(fix, from(chat, "what time is check-in at the hotel?"), { groupJudge: scripted(onFallback), assistantEvents: true }, lines);
+      assert.equal(decision.kind, "to_gateway");
+      assert.equal(facts(decision)?.judge?.model, "claude-haiku-5-5", "by_model in the daily report splits on this");
+      const judged = lines.find((l) => l.includes("trip_bot.group_judged"));
+      assert.ok(judged?.includes('"used_fallback":true') && judged.includes("claude-haiku-5-5"), judged);
+      // And an ordinary outcome carries no such field.
+      const plain = await dispatch(fix, from(chat, "any other news?", NOA), { groupJudge: scripted(YES) }, lines);
+      assert.equal(plain.kind, "to_gateway");
+      assert.ok(!lines.filter((l) => l.includes("trip_bot.group_judged")).slice(-1)[0]!.includes("used_fallback"));
+    });
+  });
+
   test("NO: NOT_ADDRESSED with the overheard context kept, and the descriptor says judge_no", async () => {
     await withFixture(async (fix) => {
       const chat = "-1004000004";

@@ -711,6 +711,8 @@ async function prepareGroupJudge(
       model: judged.model,
       ...(judged.kind === "fallback" ? { reason: judged.reason } : { confidence: judged.confidence }),
       ...(judged.kind === "no" && judged.belowThreshold ? { below_threshold: true } : {}),
+      // The primary was out of quota and `model` is the fallback's (JUDGE_FALLBACK_*).
+      ...(judged.usedFallback ? { used_fallback: true } : {}),
     }));
     return judged;
   };

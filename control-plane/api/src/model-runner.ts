@@ -181,6 +181,19 @@ export interface StructuredModelRunner {
    * the task, and the choice of provider stays configuration.
    */
   describe?(task: string): { provider: string; model: string } | null;
+  /**
+   * The quota fallback a task has wired behind its primary (`quotaFallbackRunner`),
+   * or null/absent when it has none: the fallback's provider and model, and the
+   * timeout it is called with when the wrapper imposes one (the group judge's
+   * does; the document tasks' fallbacks keep whatever the request carried).
+   *
+   * Like `describe`, for RECORDING and for the one start-up line that says a
+   * fallback is wired: a caller never branches on it to decide anything. The
+   * wrappers that route by task (`composeRunners`, `switchableRunner`) pass it
+   * through, and a `/model` override reports none, because an override replaces
+   * the whole binding, fallback included.
+   */
+  describeFallback?(task: string): { provider: string; model: string; timeoutMs?: number } | null;
 }
 
 /**
@@ -1191,6 +1204,10 @@ export function composeRunners(byTask: Record<string, StructuredModelRunner>): S
       const runner = byTask[task];
       return runner?.describe ? runner.describe(task) : null;
     },
+    describeFallback(task) {
+      const runner = byTask[task];
+      return runner?.describeFallback ? runner.describeFallback(task) : null;
+    },
     async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
       const runner = byTask[req.task];
       if (!runner) return { ok: false, reason: "NOT_CONFIGURED", attempts: 0, ms: 0 };
@@ -1211,6 +1228,10 @@ export function composeRunners(byTask: Record<string, StructuredModelRunner>): S
  * `quotaFallbackRunner` and `modelRunnerFromEnv`. A `*_FALLBACK_*` variable
  * named for any other task is never read at all, so misconfiguring one for
  * `interpret` is structurally inert, not merely unused by convention.
+ *
+ * `group_judge` is deliberately NOT a member (the owner extended the fallback to
+ * it on 2026-11-27, with its own variables and branch; see `judgeFallbackBinding`):
+ * this set is "the document-reading tasks" and stays true to that name.
  */
 export const DOCUMENT_READ_TASKS: ReadonlySet<string> = new Set(["extract", "extract_intake", "extract_itinerary"]);
 
@@ -1244,21 +1265,58 @@ export const DOCUMENT_READ_TASKS: ReadonlySet<string> = new Set(["extract", "ext
  * decision 48 asks for one escalation, not a chain.
  *
  * Never used generically. `modelRunnerFromEnv` is the only caller, and only
- * for tasks in `DOCUMENT_READ_TASKS` — `composeRunners`'s own contract is
- * untouched, so nothing outside that one call site can wrap a runner this
- * way.
+ * for tasks in `DOCUMENT_READ_TASKS` and, since 2026-11-27, for `group_judge`
+ * (below) — `composeRunners`'s own contract is untouched, so nothing outside
+ * that one call site can wrap a runner this way.
+ *
+ * **The group judge (owner, 2026-11-27: "we need a fallback to Claude Haiku if
+ * credits are over on OpenRouter").** Same rule, same single hop, one difference
+ * that matters: the judge stamps every request with the PRIMARY's timeout (an
+ * HTTP call's 3 s), and a CLI fallback that is handed that 3 s can never answer
+ * (a claude start plus login measures 5-7 s). So the judge's wiring passes
+ * `fallbackTimeoutMs`: the fallback leg then gets its own, and each leg is
+ * bounded by its own budget — a primary that hangs is cut at its own timeout
+ * and is NOT a quota limit, so it never hops. Without the option (the document
+ * tasks) the request goes to the fallback exactly as it came.
  */
 export function quotaFallbackRunner(
   primary: StructuredModelRunner,
   fallback: StructuredModelRunner,
   task: string,
+  options: { fallbackTimeoutMs?: number } = {},
 ): StructuredModelRunner {
+  const ownTimeout = options.fallbackTimeoutMs;
+  // One leg's wall: its own timeout plus a short grace, past which a runner that
+  // never answers is a TIMED_OUT, not a wait. Only imposed when the caller asked
+  // for per-leg budgets (the judge); the document tasks keep their runners' own clocks.
+  const bounded = async <T>(leg: StructuredModelRunner, req: StructuredModelRequest<T>): Promise<RunnerResult<T>> => {
+    if (ownTimeout === undefined || req.timeoutMs === undefined) return leg.run(req);
+    const budget = req.timeoutMs;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const wall = new Promise<RunnerResult<T>>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ ok: false, reason: "TIMED_OUT", detail: `no answer within ${budget} ms`, attempts: 1, ms: budget }),
+        budget + 50,
+      );
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([leg.run(req), wall]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
   return {
     describe(t) {
       return primary.describe ? primary.describe(t) : null;
     },
+    describeFallback(t) {
+      if (t !== task) return null;
+      const pin = fallback.describe ? fallback.describe(t) : null;
+      return pin ? { ...pin, ...(ownTimeout !== undefined ? { timeoutMs: ownTimeout } : {}) } : null;
+    },
     async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
-      const primaryResult = await primary.run(req);
+      const primaryResult = await bounded(primary, req);
       if (primaryResult.ok || primaryResult.reason !== "RATE_LIMITED") return primaryResult;
       // Task and reason only — never content, never the prompt, never the
       // answer. The fallback's own provider/model is configuration, not
@@ -1271,7 +1329,8 @@ export function quotaFallbackRunner(
         fallbackProvider: fallbackPin?.provider,
         fallbackModel: fallbackPin?.model,
       }));
-      const fallbackResult = await fallback.run(req);
+      const fallbackReq = ownTimeout !== undefined ? { ...req, timeoutMs: ownTimeout } : req;
+      const fallbackResult = await bounded(fallback, fallbackReq);
       return { ...fallbackResult, usedFallback: true };
     },
   };
@@ -1486,6 +1545,11 @@ export const JUDGE_CLI_MAX_TIMEOUT_MS = 10_000;
  *   5.1-7.4 s on 2026-10-17; the owner accepted missing the 1.5 s target on this
  *   path. The turn does NOT wait on it any more (the poller runs the judge off its
  *   loop, per chat), so the ceiling bounds how long ONE chat's follow-ups queue.
+ *   With a quota fallback wired (JUDGE_FALLBACK_*) that bound is one call's two
+ *   legs, up to 3 s + 8 s for an openrouter primary and a claude fallback, and a
+ *   call waiting for a slot may wait as long (the slot wait covers both legs);
+ *   in practice only while the primary is out of credits, since a healthy
+ *   primary answers in about a second.
  *
  * A missing, zero, negative or non-numeric value is the default; `clamped` says
  * which, for one start-up warning.
@@ -1514,6 +1578,37 @@ export function judgeTimeoutMs(
  */
 export function judgeEffort(env: NodeJS.ProcessEnv = process.env): ClaudeEffort {
   return claudeEffort("JUDGE_EFFORT", env) ?? "low";
+}
+
+/**
+ * The judge's quota fallback as the environment names it, or null when
+ * `JUDGE_FALLBACK_RUNNER` / `JUDGE_FALLBACK_MODEL` name nothing (unset is no
+ * fallback at all, not a default one).
+ *
+ *   JUDGE_FALLBACK_RUNNER=openrouter|claude|codex    JUDGE_FALLBACK_MODEL=<id>
+ *   JUDGE_FALLBACK_EFFORT=low|...                    (claude and codex)
+ *   JUDGE_FALLBACK_TIMEOUT_MS                        (clamped per runner, as JUDGE_TIMEOUT_MS is)
+ *
+ * `env` is the environment the fallback binding is BUILT under: the same one,
+ * with the judge's own timeout and effort replaced by the fallback's. The judge's
+ * binding reads those two by name (`runnerForBinding`), so this is how a fallback
+ * gets a CLI's 8 s while the primary is held to an HTTP call's 3 s, and the
+ * effort it was configured with instead of the primary's. Unset they are the
+ * fallback runner's defaults, never the primary's values.
+ *
+ * `model` is empty when none is usable: no `JUDGE_FALLBACK_MODEL` (only codex
+ * has a default), so the caller leaves the task unwrapped and the start-up line says why.
+ */
+export function judgeFallbackBinding(
+  env: NodeJS.ProcessEnv = process.env,
+): { kind: string; model: string; timeoutMs: number; env: NodeJS.ProcessEnv } | null {
+  const kind = (env.JUDGE_FALLBACK_RUNNER ?? "").trim().toLowerCase();
+  if (!kind) return null;
+  // A typo throws here, naming the variable it is in, as JUDGE_EFFORT's does.
+  if (kind === "claude" || kind === "codex") claudeEffort("JUDGE_FALLBACK_EFFORT", env);
+  const fbEnv: NodeJS.ProcessEnv = { ...env, JUDGE_TIMEOUT_MS: env.JUDGE_FALLBACK_TIMEOUT_MS, JUDGE_EFFORT: env.JUDGE_FALLBACK_EFFORT };
+  const model = (env.JUDGE_FALLBACK_MODEL ?? "").trim() || (kind === "codex" ? CODEX_LUNA_MODEL : "");
+  return { kind, model, timeoutMs: judgeTimeoutMs(fbEnv, kind).ms, env: fbEnv };
 }
 
 /** A task's timeout: its own `<PREFIX>_TIMEOUT_MS`, else what it inherits, else its default. */
@@ -1657,6 +1752,18 @@ export function runnerForBinding(
  * as they do to any binding, and a fallback that resolves to no runner (a
  * forbidden model, an unresolvable binding) simply leaves the task unwrapped
  * — the primary's own result surfaces, same as if no fallback were named.
+ *
+ * **The group judge's quota fallback (the owner extended decision 48 to
+ * `group_judge` on 2026-11-27).** `group_judge` is NOT in `DOCUMENT_READ_TASKS`;
+ * it has its own explicit branch and its own variables, read for no other task:
+ *
+ *   JUDGE_FALLBACK_RUNNER=openrouter|claude|codex   JUDGE_FALLBACK_MODEL=<id>
+ *   JUDGE_FALLBACK_EFFORT                           JUDGE_FALLBACK_TIMEOUT_MS
+ *
+ * No inheritance: the fallback's effort and timeout are its own (see
+ * `judgeFallbackBinding`), because the point of the fallback is a different
+ * runner kind (a claude CLI behind an OpenRouter judge) with a different clock.
+ * A `/model group_judge` override replaces the binding and so has no fallback.
  */
 export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): StructuredModelRunner | undefined {
   const byTask: Record<string, StructuredModelRunner> = {};
@@ -1698,6 +1805,18 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
           const fbRunner = build(fbKind, fbModel, fbTimeoutMs, task);
           if (fbRunner) wired = quotaFallbackRunner(runner, fbRunner, task);
         }
+      }
+    }
+    // The group judge's own quota fallback (owner, 2026-11-27) - not a member of
+    // DOCUMENT_READ_TASKS, which says what it says. Its own axis: no inheritance,
+    // and neither the primary's timeout nor its effort carries over.
+    if (task === "group_judge") {
+      const fb = judgeFallbackBinding(env);
+      if (fb) {
+        const fbRunner = fb.model ? runnerForBinding(fb.kind, fb.model, fb.timeoutMs, task, fb.env) : undefined;
+        if (fbRunner) wired = quotaFallbackRunner(runner, fbRunner, task, { fallbackTimeoutMs: fb.timeoutMs });
+        // else: left unwrapped, and groupJudgeFromEnv says so at start-up (it can
+        // see the whole picture, including a primary that is itself unusable).
       }
     }
     byTask[task] = wired;
