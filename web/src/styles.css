@@ -602,6 +602,19 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
 .invite-list { list-style: none; padding: 0; margin: 24px 0 0; }
 .invite-list li { display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #e8e3dc; padding: 14px 0; }
 .invite-list small { display: block; color: #73838c; margin-top: 4px; }
+.photo-library-card { display: grid; gap: 12px; max-width: 760px; }
+.photo-library-card > * { margin: 0; }
+.photo-connections { list-style: none; padding: 0; margin: 0; }
+.photo-connection { display: grid; gap: 6px; justify-items: start; border-top: 1px solid #e8e3dc; padding-block: 14px; }
+.photo-connection-head { display: flex; gap: 10px; align-items: center; }
+.photo-connection small { color: #73838c; }
+.photo-address { overflow-wrap: anywhere; color: #53666f; }
+.photo-state { margin: 0; font-weight: 700; color: #167b74; }
+.photo-state-reconnect { color: #b64225; }
+.photo-library-form { margin: 0; }
+.photo-library-form h3 { margin: 0; font-size: 16px; }
+.photo-library-form small { margin-top: -8px; color: #73838c; }
+.photo-soon { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .notice { padding: 14px 16px; background: #fff0e9; border-left: 4px solid var(--coral); border-radius: 8px; color: #7d351d; margin: 15px 0; }
 .runtime-launch { min-height: 100dvh; display: grid; place-content: center; justify-items: center; gap: 14px; padding: 24px; text-align: center; }
 .runtime-launch .route-loading { min-height: 0; }
