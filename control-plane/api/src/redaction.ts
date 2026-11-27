@@ -13,6 +13,9 @@ export function redact(value: unknown): unknown {
     return value
       .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
       .replace(/PVEAPIToken=\S+/gi, "PVEAPIToken=[REDACTED]")
+      // A photo-library key quoted as a header inside a text value (#699): `x-api-key: <key>`, `"x-api-key":"<key>"`.
+      // Field NAMES holding one (`apiKey`, `credential_ct`, `x-api-key`) are already caught by `sensitiveKey`.
+      .replace(/(x-api-key["']?\s*[:=]\s*["']?)[^\s"',;}]+/gi, "$1[REDACTED]")
       // Driver errors quote the connection string they failed on, userinfo included.
       .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s:@/]+:[^\s@/]+@/gi, "$1[REDACTED]@");
   }

@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { z } from "zod";
 import { GATEWAY_KEY_MODES } from "./relay/protocol.js";
 
@@ -141,6 +142,16 @@ function setAsideInvalidWhatsapp(raw: unknown): unknown {
   relay.whatsapp_invalid = { field, reason };
   return relay;
 }
+
+/**
+ * One entry of `photo_library.allowed_private_hosts`: a hostname, an IPv4 address or an IPv6 address (no brackets),
+ * compared exactly with the host of the address a user typed. No CIDR blocks and no wildcards: the list opens a
+ * private network to user-typed addresses, so it names hosts one by one.
+ */
+const photoLibraryAllowedHost = z.string().trim().min(1).max(253).transform((value) => value.toLowerCase()).refine(
+  (value) => isIP(value) !== 0 || /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/.test(value),
+  "must be a hostname or an IP address, with no scheme, port, path or wildcard",
+);
 
 export const architectureProfileSchema = z.object({
   version: z.literal(1),
@@ -296,6 +307,20 @@ export const architectureProfileSchema = z.object({
     message: "email_provider \"resend\" needs both email_api_key_secret_ref and email_from",
     path: ["email_provider"],
   }).optional(),
+  /**
+   * A photo library per user (#699, docs/specs/sprint-9/699-user-photo-library.md). The whole block is OPTIONAL, and so
+   * is each field: without `credential_key_secret_ref` every `/v1/photo-connections` route answers 503
+   * `photo_library_not_configured` and stores nothing (there is no key to seal a credential with, and no fallback).
+   *
+   * `credential_key_secret_ref` names 32 random bytes, written base64 (photo-credentials.ts); it is resolved on each use.
+   * `allowed_private_hosts` names the hosts, exactly as a user types them in a library address, that may resolve to a
+   * private or loopback address (a deployment whose Immich is on its own network). Absent or empty, only public
+   * addresses are reachable. The metadata address is never reachable, listed or not (photo-library-guard.ts).
+   */
+  photo_library: z.object({
+    credential_key_secret_ref: secretReference.optional(),
+    allowed_private_hosts: z.array(photoLibraryAllowedHost).max(64).optional(),
+  }).strict().optional(),
   /**
    * The Trip Bot relay connector — the WebSocket server Hermes's gateway dials
    * OUT to, plus the shared bot token the connector polls.
@@ -494,4 +519,15 @@ export function validateBeforeProvider<T>(raw: unknown, providerFactory: () => T
 export function whatsappPortalSettings(profile: ArchitectureProfile): { number: string; codeTtlSeconds: number } | undefined {
   const block = profile.relay?.whatsapp;
   return block ? { number: block.number, codeTtlSeconds: block.code_ttl_seconds } : undefined;
+}
+
+/**
+ * What the portal needs of the profile's `photo_library` block (#699). ABSENT when the block or its key reference is
+ * missing: every photo-connection route then answers 503 `photo_library_not_configured`. server.ts passes this as
+ * `PortalDependencies.photoLibrary`.
+ */
+export function photoLibraryPortalSettings(profile: ArchitectureProfile): { credentialKeySecretRef: string; allowedPrivateHosts: readonly string[] } | undefined {
+  const block = profile.photo_library;
+  if (!block?.credential_key_secret_ref) return undefined;
+  return { credentialKeySecretRef: block.credential_key_secret_ref, allowedPrivateHosts: block.allowed_private_hosts ?? [] };
 }
