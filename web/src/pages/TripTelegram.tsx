@@ -1,7 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useQuery } from "@tanstack/react-query";
-import { getMe, issueTelegramLink, restoreTelegramLink, unlinkTelegramLink, type TelegramLinkVia, type TripSummary } from "../api";
+import {
+  getMe, getTelegramGroups, issueTelegramGroupLink, issueTelegramLink, removeTelegramGroup, restoreTelegramLink, unlinkTelegramLink,
+  type TelegramLinkVia, type TripSummary,
+} from "../api";
 import { ServiceMark, ServiceStatusIcon, type MenuControl } from "./chat-service";
 import { formatDay } from "./dates";
 import { OneClickLink, useOneClickLink, worksOnce } from "./one-click-link";
@@ -129,6 +132,73 @@ function TelegramEntries({ trip, canLink, onDone, menu }: { trip: TripSummary; c
   );
 }
 
+/**
+ * Telegram groups (#690, docs/specs/sprint-9/690-dashboard-chat-parity.md): the twin of the WhatsApp group steps. They are the trip
+ * OWNER's, on a full session: `trip.telegram.groups.owner` says so (the server sends it to an organizer on a full session only),
+ * and a co-organizer is given no list and so no "none yet". The group link can only work for a Telegram account that is linked to
+ * this trip (the redemption checks the sender), so without one the page says "Link Telegram first" and asks for no link.
+ */
+function useTelegramGroups(trip: TripSummary, canLink: boolean, active = true) {
+  const owner = canLink && Boolean(trip.telegram?.groups?.owner);
+  const linked = (trip.telegram?.links.length ?? 0) > 0;
+  // `active` is "the list is on screen": a closed menu on the dashboard reads no list, however many trips the page has.
+  const groups = useQuery({ queryKey: ["telegram-groups", trip.id], queryFn: () => getTelegramGroups(trip.id), retry: false, enabled: owner && active });
+  return { owner, linked, groups, canAdd: owner && linked };
+}
+
+/**
+ * Add the companion to a Telegram group: ONE link, already holding its one-time code. Telegram asks which group, adds the bot as
+ * an admin and posts the code there from the person who added it; the binding is made only when that person is this trip's linked
+ * main organizer. Asked for when the action is on screen (`active`), kept until it expires, never shown as text.
+ */
+function AddTelegramGroup({ trip, active, menu }: { trip: TripSummary; active: boolean; menu?: boolean }) {
+  const offer = useOneClickLink({
+    limiter: "telegram-group", service: "telegram-group", id: [trip.id], enabled: active,
+    mint: () => issueTelegramGroupLink(trip.id),
+  });
+  return (
+    <OneClickLink
+      offer={offer} label="Add to a Telegram group" mark={<ServiceMark service="telegram" />} role={menu ? "menuitem" : undefined}
+      className={menu ? "text-button chat-link chat-service-telegram" : "button button-small chat-link chat-service-telegram"}
+      opened="Telegram opened. Pick the group there and approve the companion's admin rights."
+      note={(expiresAt) => `${worksOnce(expiresAt)} Open it in the Telegram account linked to this trip: from any other account the group is not connected.`}
+    />
+  );
+}
+
+/** The linked groups, each with Unlink: it asks first, closes the link, and sends nothing to the group (spec 690). Names are what people typed: text, never markup. */
+function TelegramGroupEntries({ trip, canLink, onDone, menu }: { trip: TripSummary; canLink: boolean; onDone: () => void; menu?: boolean }) {
+  const queryClient = useQueryClient();
+  const { owner, groups } = useTelegramGroups(trip, canLink);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const remove = useMutation({
+    mutationFn: (bindingId: string) => removeTelegramGroup(trip.id, bindingId),
+    onSuccess: async () => { setConfirming(null); onDone(); await queryClient.invalidateQueries({ queryKey: ["telegram-groups", trip.id] }); },
+  });
+  if (!owner) return null;
+  const itemRole = menu ? "menuitem" : undefined;
+  return (
+    <>
+      {groups.isError && <div className="notice" role="alert">Could not load the linked groups.</div>}
+      {(groups.data ?? []).map((entry) => (
+        confirming === entry.bindingId
+          ? <div key={entry.bindingId} className="telegram-confirm" role="group" aria-label="Confirm unlink">
+            <small>Unlink this Telegram group (linked {formatDay(entry.connectedAt)})? The companion leaves the group quietly and posts nothing there. You can add it again from this page.</small>
+            <span>
+              <button type="button" className="text-button" onClick={() => remove.mutate(entry.bindingId)} disabled={remove.isPending}>Confirm unlink</button>
+              <button type="button" className="text-button" onClick={() => setConfirming(null)}>Keep</button>
+            </span>
+          </div>
+          : <button key={entry.bindingId} type="button" role={itemRole} className="text-button telegram-unlink telegram-group-unlink" onClick={() => { remove.reset(); setConfirming(entry.bindingId); }}>
+            Unlink Telegram group · linked {formatDay(entry.connectedAt)}
+            <small>Group: {entry.name ? <bdi>{entry.name}</bdi> : "unnamed group"}</small>
+          </button>
+      ))}
+      {remove.isError && <div className="notice" role="alert">{remove.error.message}</div>}
+    </>
+  );
+}
+
 const linkedSentence = (count: number) => count > 0
   ? `${count === 1 ? "A Telegram account is" : `${count} Telegram accounts are`} linked to this trip.`
   : "No Telegram account is linked to this trip.";
@@ -149,6 +219,7 @@ const MAIN_ACCOUNT_NOTE = "Link Telegram sets your main Telegram account for all
 export function TripTelegram({ trip, menu }: { trip: TripSummary; menu?: MenuControl }) {
   const links = trip.telegram?.links ?? [];
   const { organizerSide, scoped, canLink } = useTelegramAccess(trip);
+  const groupAccess = useTelegramGroups(trip, canLink, false);
   const [ownOpen, setOwnOpen] = useState(false);
   const open = menu?.open ?? ownOpen;
   const setOpen = menu?.setOpen ?? setOwnOpen;
@@ -169,7 +240,10 @@ export function TripTelegram({ trip, menu }: { trip: TripSummary; menu?: MenuCon
           {organizerSide && scoped && <small>Signed in with Telegram: to link another Telegram account, sign in with your password.</small>}
           {canLink && <small className="subtle">{MAIN_ACCOUNT_NOTE}</small>}
           {canLink && <LinkTelegram trip={trip} active={open} menu />}
+          {groupAccess.canAdd && <AddTelegramGroup trip={trip} active={open} menu />}
+          {groupAccess.owner && !groupAccess.linked && <small className="subtle">Link Telegram first, then add the companion to a group from your own Telegram.</small>}
           <TelegramEntries key={confirmKey} trip={trip} canLink={canLink} onDone={close} menu />
+          <TelegramGroupEntries key={`groups-${confirmKey}`} trip={trip} canLink={canLink} onDone={close} menu />
         </div>
       )}
     </div>
@@ -184,7 +258,9 @@ export function TripTelegram({ trip, menu }: { trip: TripSummary; menu?: MenuCon
 export function TripTelegramCard({ trip }: { trip: TripSummary }) {
   const links = trip.telegram?.links ?? [];
   const { organizerSide, scoped, canLink } = useTelegramAccess(trip);
+  const groupAccess = useTelegramGroups(trip, canLink);
   if (!organizerSide && links.length === 0) return null;
+  const groupCount = groupAccess.groups.data?.length ?? 0;
   return (
     <aside className="workflow-card chat-card chat-service-telegram-card" id="telegram">
       <h2><ServiceMark service="telegram" size={22} /> Telegram</h2>
@@ -196,6 +272,23 @@ export function TripTelegramCard({ trip }: { trip: TripSummary }) {
       <div className="chat-entries">
         <TelegramEntries trip={trip} canLink={canLink} onDone={() => undefined} />
       </div>
+
+      {groupAccess.owner && (
+        <>
+          <h3>Add the companion to a group</h3>
+          {groupAccess.linked
+            ? <>
+              <p>Add the companion to your family's Telegram group in one step: Telegram asks which group and adds it as an admin, so it can pin the trip button.</p>
+              <AddTelegramGroup trip={trip} active />
+            </>
+            : <p>Link Telegram first, then add the companion to a group from your own Telegram.</p>}
+          <div className="chat-entries">
+            <TelegramGroupEntries trip={trip} canLink={canLink} onDone={() => undefined} />
+          </div>
+          {groupAccess.groups.isSuccess && groupCount === 0 && <p className="subtle">No group is linked yet.</p>}
+          <p className="subtle">Unlinking a group makes the companion leave it quietly: nothing is posted there.</p>
+        </>
+      )}
     </aside>
   );
 }

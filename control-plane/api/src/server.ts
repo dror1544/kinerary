@@ -339,6 +339,11 @@ if (outboxNotification && outboxBotToken) {
   // is the bot in the trip's bound group. It needs the real Telegram adapter (the fake one has no group to change) and the
   // gateway road back to the trip's site; without both it is off, and says so once.
   const groupPhotoApi = notification instanceof TelegramNotificationAdapter ? notification : null;
+  // Unlinking a Telegram group from the dashboard makes this same bot leave it (#690, spec 690 D6). The portal reads
+  // `telegramGroups` on each request, so setting it here, after the app is built, is seen. No adapter, no leave: Unlink then
+  // closes the binding and logs `telegram_groups.leave_unavailable`.
+  if (groupPhotoApi && portal) portal.telegramGroups = groupPhotoApi;
+  else process.stderr.write(`${structuredLog("warn", "telegram_groups.leave_disabled", { reason: "no portal, or the outbox does not send through the Telegram adapter" })}\n`);
   const groupPhoto = groupPhotoApi && portal?.runtimeExchangeKey
     ? {
       api: groupPhotoApi,
