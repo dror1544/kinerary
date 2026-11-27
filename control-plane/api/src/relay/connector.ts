@@ -658,6 +658,9 @@ export class RelayConnector {
         const verdict = silenceVerdict(action.content);
         if (verdict.kind === "silent") {
           this.log(structuredLog("info", "trip_bot.companion_stayed_silent", { silent: true }));
+          // WhatsApp keeps "typing..." up until it is switched off or expires (~25 s), unlike
+          // Telegram's 5 s: the companion's own typing would hang over a reply that never comes.
+          if (whatsapp) await this.whatsapp!.typing(action.chat_id, tripId, "paused").catch(() => undefined);
           // Silence on a message that NAMED the assistant is a defect, not a
           // judgement call: nothing can be sent (no answer to invent), but it is
           // logged and recorded so the daily report counts it. Booleans only.
@@ -676,6 +679,7 @@ export class RelayConnector {
         const guarded = this.options.outboundGuard?.(action.chat_id, action.reply_to, this.explicitTurns.latestMessageId(action.chat_id), content);
         if (guarded?.kind === "suppress") {
           this.log(structuredLog("warn", "relay.moment_reply_held_back", { reason: guarded.reason }));
+          if (whatsapp) await this.whatsapp!.typing(action.chat_id, tripId, "paused").catch(() => undefined);
           this.options.assistantEvents?.replySent(action.chat_id, "suppressed", content.length, action.reply_to);
           return { success: true };
         }

@@ -55,6 +55,32 @@ SQLite on the document store (`DATA_DIR=<nfs>/server-data`), and sealed release 
 - **Boot order:** the entrypoint refuses to start unless the per-trip marker `TRIP.txt` and `.env` are present in the
   mounted directory. A host that boots before the document store mounts, or mounts it late, serves no empty site, and
   `restart: unless-stopped` retries until the mount is there.
+- **The daemon is never given a path on the document store** (found in review, 2026-11-27, by the lead on the VM's
+  own daemon): `docker inspect` reports a bind source as given, and the daemon re-resolves it on every start, restart
+  policy and reboot included. A path the worker can rename or re-point would redirect a restart to anywhere. So the
+  host script walks to the trip's directory without following a link (every component `O_NOFOLLOW`, `TRIP.txt`
+  naming the request's trip id and slug), and bind-mounts **that open descriptor**
+  (`mount --no-canonicalize --bind /proc/self/fd/N`) onto an empty root-owned directory
+  `<TRIP_CONTAINER_MOUNT_ROOT>/<trip_id>`; `docker run` is given that path. A bind binds the directory itself, so a
+  later rename or swap of the store entry does not move it. `ensure`, `deploy`, `start` and `check` redo the walk and
+  refuse, without remounting, when the mount point is already bound to a different directory. The container's mounts
+  are read back after every run and every start. `remove` removes the container, unmounts the bind and removes the
+  empty mount point; the store directory stays.
+- **Boot:** binds do not survive a reboot, and docker's restart policy may start a container before they exist. The
+  mount point is then empty, the image's entrypoint refuses (AC-6) and the policy retries.
+  `trip-container-host.sh --boot`, run by a root systemd unit ordered after the document store mounts (documented in
+  the script's header; the deployment installs it), re-establishes the bind of every trip whose container carries
+  our labels, reports the ones that fail and exits non-zero if any did. `--boot` is the one argument the script
+  takes: ssh cannot pass it and sudo is refused for it.
+- **Host configuration is a root-owned file, not the environment:** `/etc/kinerary/trip-container-host.conf` (owner
+  root, not group/other writable, in a directory the same is true of; `KEY=value` lines). The script runs as root
+  through `sudo -n` from a forced command, with `env_reset`; it runs docker, mount and umount by absolute path with a
+  scrubbed environment and checks that those binaries are root-owned and not writable by others. The container uid is
+  never the ssh user's. One mutating request runs at a time (a host-wide flock; `check` counts, because it may
+  re-establish the bind) and every request has a deadline; a deadline that fires half-way removes what was just made
+  and restores the previous container.
+- **The script never builds an image.** `trip-site:<64 hex>` is built by the release tooling (`vm-release`); a
+  request naming an image the host lacks is refused.
 - **Writes to the document store:** the worker writes `trip/` through `PROVISIONER_TRIP_NFS_LOCAL_BASE`, as it already
   writes `documents/`. `deploy` sends a release reference, never files.
 
@@ -71,6 +97,14 @@ SQLite on the document store (`DATA_DIR=<nfs>/server-data`), and sealed release 
   trip id that fails validation, or a container whose `kinerary.trip_id` label differs from the request, then it
   refuses, changes nothing and exits non-zero. `docker run` is always issued with no `--privileged`, `--cap-drop ALL`,
   `no-new-privileges`, a memory limit, the fixed uid, `--restart unless-stopped`, the trip network and its `--ip`.
+- AC-4b Given any request, when the daemon is asked to run or start a trip container, then its only mount is a
+  read-write bind of the trip's root-owned mount point at `/trip-store`, which is bound to the directory the host
+  script walked to without following a link; a store entry renamed or replaced afterwards does not change what the
+  container sees, and a later `ensure`, `deploy`, `start` or `check` refuses instead of remounting. (Asserted by
+  `tests/scripts/test_trip_container_host_root.py`, which runs as root against a real kernel `mount --bind`; the CI
+  job `trip-container-host-root` is written to run it. Observed 2026-11-27 by hand, once, in a throwaway privileged
+  Alpine container with util-linux 2.42.3 on Docker Desktop's kernel and a fake docker: 12 of 12 passed. Not yet
+  observed on the VM's own kernel and util-linux, with NFS as the store, or with the real daemon.)
 - AC-5 Given `ensure` for a new trip, then `.env` is created 0600, owned by the container uid, with secrets generated
   on the host or read from stdin, never from argv; given an existing `.env`, it is never rewritten.
 - AC-6 Given the trip directory has no `TRIP.txt` or no `.env`, when the container starts, then the entrypoint exits
@@ -96,8 +130,14 @@ SQLite on the document store (`DATA_DIR=<nfs>/server-data`), and sealed release 
   (`_ips_already_claimed`, `_trip_nfs_dirname`) keep working.
 - Worker env: `TRIP_PLACEMENT`, `TRIP_CONTAINER_SSH_HOST`, `TRIP_CONTAINER_SSH_KEY`,
   `TRIP_CONTAINER_SSH_KNOWN_HOSTS`, `TRIP_CONTAINER_IP_POOL` (addresses inside `TRIP_CONTAINER_SUBNET`).
-- Host env (forced command): `TRIP_CONTAINER_NETWORK`, `TRIP_CONTAINER_SUBNET`, `TRIP_CONTAINER_UID`,
-  `TRIP_CONTAINER_MEMORY`, `KINERARY_NFS_ROOT`, the release-tree root.
+- Host configuration (the forced command reads it from its root-owned file, never the environment):
+  `TRIP_CONTAINER_NETWORK`, `TRIP_CONTAINER_SUBNET`, `TRIP_CONTAINER_UID` (default 10001), `TRIP_CONTAINER_MEMORY`,
+  `KINERARY_NFS_ROOT`, `TRIP_CONTAINER_MOUNT_ROOT` (root-owned, 0755 or tighter, refused when its filesystem is NFS; other network
+  filesystems are not detected; one empty mount point per trip), and optionally `TRIP_CONTAINER_DOCKER` (one of two fixed paths), `TRIP_CONTAINER_LOCK_FILE`
+  (default under `/run`), `TRIP_CONTAINER_TIMEOUT` (default 120 s), and `TRIP_CONTAINER_BRIDGE_URL` (the one shared-bridge
+  origin; a request's `hermes_url` and `bridge_url` must equal it, because a site sends its host-generated bridge key
+  to whatever its `.env` names). There is no release-tree setting: the script
+  never builds.
 - Host script request: `{"record_type":"trip_container_request","verb":…,"trip_id":…,"slug":…,…}`; answer:
   one JSON line, `{"ok":true|false,…}`.
 - Files expected to change: `provisioning/models.py`, `provisioning/engine.py`, `provisioning/adapters.py` (nginx
@@ -112,7 +152,8 @@ SQLite on the document store (`DATA_DIR=<nfs>/server-data`), and sealed release 
 1. **PR1, model, inert:** placement parsing and writing, `TRIP_PLACEMENT` and the combination refusals;
    `vm-container` is refused as "not available yet". AC-1, AC-2.
 2. **PR2, image:** `trip-site.Dockerfile`, entrypoint, shared nginx config, build/prune in `vm-release.py`. AC-6.
-3. **PR3, host script** and its forced-command install. AC-4, AC-5. Boundary review with live evidence.
+3. **PR3, host script** and its forced-command install. AC-4, AC-4b, AC-5. Boundary review with live evidence. The
+   boot unit that runs `--boot` is deployment's, not this PR's.
 4. **PR4, worker adapters** plus the e2e harness's placement awareness; lifts the PR1 refusal. AC-3, AC-7, AC-10.
 5. **PR5, lifecycle dispatch:** teardown, rollout, autostart, route, companion install. AC-8, AC-9, AC-11, AC-12.
 6. Then `scripts/trip-migrate-placement.py` (plan/execute, `--live`), its own spec.
@@ -127,6 +168,9 @@ how LXC trips work; migrating an existing trip (step 6).
 - The host user behind the forced command can start containers, which is root-equivalent on the host. Its key is
   used for nothing else, the script accepts only the seven verbs with validated fields, and every `docker` argument is
   built by the script, never taken from the request.
+- The document store is untrusted: the worker writes all of it and the export does not squash root. Nothing the
+  daemon is given is a path the worker can change (the bind-mount design above); the deployment must also keep the
+  store root's top level from being replaceable by the worker (PR4 narrows the worker's mount).
 - Secrets never travel on argv or in logs; `read` returns only the fields it names.
 - `sanitizeConfig()` and the site's auth are unchanged: the site is the same code in a different box.
 

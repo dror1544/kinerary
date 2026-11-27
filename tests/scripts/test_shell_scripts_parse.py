@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -37,6 +38,24 @@ class ParsesUnderSystemBash(unittest.TestCase):
             with self.subTest(script=str(script.relative_to(REPO))):
                 result = subprocess.run([bash, "-n", str(script)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr.strip())
+
+    @unittest.skipUnless(Path(SYSTEM_BASH).exists() or shutil.which("bash"), "no bash")
+    def test_trip_container_host_is_covered_and_its_python_compiles(self) -> None:
+        # The forced command that can start containers (docs/specs/sprint-9/x-trip-vm-container-placement.md):
+        # named here so a moved glob cannot drop it unnoticed, and its python half is compiled too, because
+        # the wrapper only finds a syntax error in the python when a request arrives.
+        bash = SYSTEM_BASH if Path(SYSTEM_BASH).exists() else shutil.which("bash")
+        wrapper = REPO / "scripts/trip-container-host.sh"
+        impl = REPO / "scripts/trip-container-host.py"
+        self.assertTrue(wrapper.is_file() and impl.is_file())
+        listed = sorted(p for p in (REPO / "scripts").rglob("*.sh") if p.is_file())
+        self.assertIn(wrapper, listed)
+        result = subprocess.run([bash, "-n", str(wrapper)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        compiled = subprocess.run(
+            [sys.executable, "-I", "-c", "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')", str(impl)],
+            capture_output=True, text=True)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr.strip())
 
 
 if __name__ == "__main__":

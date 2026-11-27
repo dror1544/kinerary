@@ -287,6 +287,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m unittest -v tests.scripts.test_regression_assessment_workflow tests.scripts.test_regression_assessment_scope
+      # The trip-container forced command is a boundary that can run containers on the host (vm-container spec,
+      # AC-4/AC-5). As an ordinary user, with a fake docker and a fake mount behind a test-owned configuration;
+      # no service, no real docker call. Its production branch (root) runs in the next job.
+      - run: python -m unittest -v tests.scripts.test_trip_container_host
       # The commit/deploy hooks (rules 1 and 2) and their codex adapter: bash,
       # git, jq and ps only, no services. Their tests make throwaway repos and
       # commit in them, so git needs an identity on the runner.
@@ -294,3 +298,31 @@ jobs:
           git config --global user.email ci@invalid.example
           git config --global user.name "kinerary ci"
           python -m unittest -v tests.scripts.test_claude_hooks_bash tests.scripts.test_codex_hook_adapter
+
+  # The forced command that runs trip sites as containers (vm-container spec, PR3) is a root program. Its production
+  # branch (the fixed configuration path, the fixed docker path, the chown to the container uid, the lock under /run,
+  # and a real `mount --bind` of an open directory) cannot run as an ordinary user, so it runs here, as root, in a
+  # throwaway privileged container (the shape it was first run in by hand on 2026-11-27: Alpine, util-linux, a local
+  # filesystem, a fake docker). The module refuses to run unless TRIP_CONTAINER_ROOT_TESTS=1 and refuses to
+  # overwrite a /etc/kinerary or /usr/local/bin/docker that is already there. The mount, the kernel's mount table,
+  # root's file checks and fchown are real; the daemon is a fake. The second command runs the ordinary-user suite on
+  # Linux as an unprivileged user, in the same image, because it is otherwise only ever run on a Mac.
+  trip-container-host-root:
+    name: Trip container host (as root, real bind mount)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: |
+          docker run --rm --privileged -e TRIP_CONTAINER_ROOT_TESTS=1 -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD:/w:ro" -w /w python:3.12-alpine sh -c '
+              set -e
+              apk add --no-cache bash util-linux su-exec >/dev/null
+              ln -sf /bin/mount /usr/bin/mount; ln -sf /bin/umount /usr/bin/umount
+              ln -sf /usr/local/bin/python3 /usr/bin/python3
+              mkdir -p /srv
+              python -m unittest -v tests.scripts.test_trip_container_host_root
+              su-exec 1000:1000 env TRIP_CONTAINER_ROOT_TESTS= python -m unittest -v tests.scripts.test_trip_container_host
+            '
