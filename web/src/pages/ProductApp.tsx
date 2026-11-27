@@ -10,10 +10,10 @@ import { NamePrompt } from "../components/NamePrompt";
 import { GoogleSignInButton } from "../components/GoogleSignInButton";
 import { tripUsernameInputProps, tripUsernameRegisterOptions } from "../mini-app/username";
 import { isEmbedded } from "../mini-app/sdk";
-import { TripTelegram } from "./TripTelegram";
+import { TripTelegram, TripTelegramCard } from "./TripTelegram";
 import { MembersPanel } from "./MembersPanel";
 import { SecondaryOrganizersPanel } from "./SecondaryOrganizersPanel";
-import { TripWhatsApp } from "./TripWhatsApp";
+import { TripWhatsApp, TripWhatsAppMenu } from "./TripWhatsApp";
 import { DateInput, nextDay } from "../components/DateInput";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
@@ -122,6 +122,9 @@ function Trips() {
 function TripCard({ trip }: { trip: TripSummary }) {
   const inMiniApp = useLocation().pathname.startsWith("/mini-app");
   const navigate = useNavigate();
+  // Which chat menu is open on this card: one at a time, since both hang from the same spot.
+  const [chatMenu, setChatMenu] = useState<"telegram" | "whatsapp" | null>(null);
+  const menuOf = (service: "telegram" | "whatsapp") => ({ open: chatMenu === service, setOpen: (next: boolean) => setChatMenu((current) => next ? service : current === service ? null : current) });
   const open = trip.runtimeReady ? (inMiniApp ? `/mini-app/trips/${trip.id}` : `/trips/${trip.id}/app`) : `/trips/${trip.id}/setup`;
   // The trip's own page (progress, Telegram status, members). A member (runtime access, no dashboard) has no
   // setup page to go to, so their card is not a link: an unready trip is just not ready.
@@ -134,10 +137,10 @@ function TripCard({ trip }: { trip: TripSummary }) {
   // card behave the same for a pointer. Controls inside the card keep their own meaning.
   const onCardClick = (event: MouseEvent<HTMLElement>) => {
     if (!tripPage || event.defaultPrevented) return;
-    if ((event.target as HTMLElement).closest("a, button, input, select, textarea, label, .telegram-status")) return;
+    if ((event.target as HTMLElement).closest("a, button, input, select, textarea, label, .chat-status")) return;
     navigate(tripPage);
   };
-  return <article className={`trip-card${tripPage ? " trip-card-openable" : ""}`} onClick={onCardClick}><div className="trip-card-head"><div className="status-chip">{humanize(trip.nextAction)}</div><TripTelegram trip={trip} /></div><h3>{tripPage ? <Link className="trip-card-link" to={tripPage}>{trip.title}</Link> : trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small>{action}</article>;
+  return <article className={`trip-card${tripPage ? " trip-card-openable" : ""}`} onClick={onCardClick}><div className="trip-card-head"><div className="status-chip">{humanize(trip.nextAction)}</div><div className="chat-statuses"><TripTelegram trip={trip} menu={menuOf("telegram")} /><TripWhatsAppMenu trip={trip} menu={menuOf("whatsapp")} /></div></div><h3>{tripPage ? <Link className="trip-card-link" to={tripPage}>{trip.title}</Link> : trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small>{action}</article>;
 }
 
 const tripSchema = z.object({ destination: z.string().trim().min(2, "Add a destination").max(160), startDate: z.string().optional(), endDate: z.string().optional(), tripType: z.enum(["family", "group", "couple", "other"]) }).refine((value) => !value.startDate || !value.endDate || value.endDate > value.startDate, { message: "End date must follow the start date", path: ["endDate"] });
@@ -201,7 +204,7 @@ function TripSetup() {
   return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p><p>{trip.startDate || "Start date to confirm"} → {trip.endDate || "End date to confirm"} · {humanize(trip.tripType)} trip</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview) && !paused} title="Start your private planning interview" detail={paused ? "Interview paused — your answers are saved" : trip.interview ? `Interview ${humanize(trip.interview.state)}` :"Continue in the shared Kinerary Telegram bot."}>{interviewAction}</WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Create the provisioning plan" detail="Kinerary pins an exact release and the resources your trip needs, for you to review before anything is built.">{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Create plan</button>}</WorkflowStep><WorkflowStep done={Boolean(trip.provisioning) && trip.provisioning!.planStatus !== "pending_approval"} title="Review and approve the plan" detail={trip.provisioning ? humanize(trip.provisioning.jobState || trip.provisioning.planStatus) : "Available once the plan exists. You approve it yourself — nobody else has to sign off."}><PlanReview trip={trip} tripId={tripId} /></WorkflowStep>{trip.nextAction === "retry_provisioning"
       // The raw error code is an operator's diagnostic; the organizer is told what happened and what they can do.
       ? <Notice>We couldn't finish building your trip site. This is usually temporary.{trip.permissions.role === "owner" && <> <button className="button button-small" onClick={() => retry.mutate()} disabled={retry.isPending}>{retry.isPending ? "Trying again…" : "Try again"}</button></>}{retry.isError && <> We couldn't start it again just now — please wait a moment and try once more.</>}</Notice>
-      : trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || replaceLink.isError || linkState.isError || provision.isError) && <Notice>{(replaceLink.error || linkState.error || interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /><MembersPanel trip={trip} /><SecondaryOrganizersPanel trip={trip} /><TripWhatsApp trip={trip} /></div></main>;
+      : trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || replaceLink.isError || linkState.isError || provision.isError) && <Notice>{(replaceLink.error || linkState.error || interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /><MembersPanel trip={trip} /><SecondaryOrganizersPanel trip={trip} /><div className="chat-cards"><TripTelegramCard trip={trip} /><TripWhatsApp trip={trip} /></div></div></main>;
 }
 
 function PlanReview({ trip, tripId }: { trip: TripSummary; tripId: string }) {

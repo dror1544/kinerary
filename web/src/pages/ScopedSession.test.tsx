@@ -85,7 +85,9 @@ it("a scoped session is not offered Link on a trip card (the server would refuse
 });
 
 it("a full session still gets Link", async () => {
-  mount("/trips", { id: "user_1", displayName: "Olive", scope: "full" });
+  mount("/trips", { id: "user_1", displayName: "Olive", scope: "full" }, (path, init) =>
+    init?.method === "POST" && path.endsWith("/telegram-link")
+      ? json({ deepLink: "https://t.me/kinerary_bot?start=lk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", expiresAt: new Date(Date.now() + 900_000).toISOString() }, 201) : undefined);
   fireEvent.click(await screen.findByRole("button", { name: "Telegram options for Rome 2027" }));
   expect(await screen.findByRole("menuitem", { name: "Link Telegram" })).toBeInTheDocument();
 });

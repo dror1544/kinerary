@@ -283,7 +283,7 @@ written down).
   (`membership_ended`) and the link is deleted: inside `removeMember`'s transaction
   (`member-removal.ts`), and as a check before each private turn for every other way a
   membership can end.
-- AC-15 Given Remove in the dashboard, then the binding closes (`dashboard_removed`), its
+- AC-15 (the dashboard labels this action **Unlink**, the word Telegram uses: owner decision 2026-11-27, #690) Given Remove in the dashboard, then the binding closes (`dashboard_removed`), its
   `transport_address` is cleared, the person link (for a private chat) is deleted, and
   nothing is sent to the chat. A later message from that chat is handled as from any
   unbound chat, so a person who is still in the trip's group can connect again (AC-29).

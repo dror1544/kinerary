@@ -1,8 +1,10 @@
 import "@testing-library/jest-dom/vitest";
-import { afterEach, vi } from "vitest";
+import { afterEach, beforeEach, vi } from "vitest";
 import { cleanup, configure } from "@testing-library/react";
 
 afterEach(() => cleanup());
+// The one-click links keep a count of recent mints in sessionStorage (pages/one-click-link.tsx); each test starts without one.
+beforeEach(() => window.sessionStorage.clear());
 
 // Every route is lazy-loaded (App.tsx), so the first findBy* after a render
 // can be waiting on a chunk import, not just a DOM update. The default 1000ms
