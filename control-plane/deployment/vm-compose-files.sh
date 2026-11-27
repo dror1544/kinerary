@@ -38,7 +38,10 @@ vm_compose_env_value() {
   local key="$1" file hit text value=""
   shift
   for file in "$@"; do
-    [ -e "$file" ] || continue
+    # Existence is asked with the same privilege the file is read with: the env files sit in a root-only
+    # directory, where `[ -e ]` as the caller is false and every flag would silently read as off.
+    if [ -n "${VM_COMPOSE_READ:-}" ]; then [ -e "$file" ] || continue
+    else [ -e "$file" ] || sudo test -e "$file" || continue; fi
     if ! text="$(${VM_COMPOSE_READ:-sudo cat} "$file")"; then
       printf 'vm-compose-files: cannot read %s\n' "$file" >&2
       return 1
