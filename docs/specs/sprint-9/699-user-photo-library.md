@@ -1,6 +1,6 @@
 # A photo library per user: connect Immich or Google Photos once, every trip uses it
 
-Status: draft (2026-11-27) · Issue: #699 · Track: video look · Size: L, built as four PRs (S1–S4) · Tier: High
+Status: approved (2026-11-27, by Dror: L1–L5 and open questions 1–5 as the lead's leans; question 6 amended, see "Photos keep their experience") → build starts with S1 · Issue: #699 · Track: video look · Size: L, built as four PRs (S1–S4) · Tier: High
 Security path: yes (the control plane stores a third party's credential; it fetches an address the user typed; an OAuth
 sign-in) · Migration: yes (new tables only, `-- rollback: compatible`) · Live-trip behaviour: yes, once the switch is on
 
@@ -13,7 +13,7 @@ trip. Nothing lets a person choose a library themselves, and the key sits on eve
 - **A reused Immich key is a user key.** It reads and deletes the owner's whole library, not one trip's photos. Copied
   onto every trip site, one compromised site exposes the library.
 - **The site's use of Immich is write-only.** It uploads an asset and adds it to a phase album (`pushPhotoToImmich`,
-  `POST /api/upload`), deletes the asset it uploaded (`DELETE /api/photos/:id`), and creates a shared link for an album
+  `POST /api/upload`), deletes the asset it uploaded (`DELETE /api/photos/:id`; the new road drops this, P1), and creates a shared link for an album
   (`getOrCreateShareLink`, `GET /api/album-share/:phase`). The photo itself is served from the site's own storage, and the
   web app draws the album button only when `/api/health` says `immich: true` (`trip-web/src/immich.tsx:49`). So the key
   can leave the site without a photo going missing from it.
@@ -49,20 +49,43 @@ trip. Nothing lets a person choose a library themselves, and the key sits on eve
   library". LM5 in the product spec asks for consent before sharing; the group is told, and an organizer can turn the
   sync off.
 
+**Agreed by Dror, 2026-11-27:** L1 to L5; the Google Photos album per trip; backfill of new photos only, with a "copy the
+existing photos" button; the Google Cloud project and consent screen are the owner's to create; the share-link spike at the
+start of S3. Delete behaviour changed: see the next section.
+
+## Photos keep their experience (Dror, 2026-11-27, on delete behaviour)
+
+"The trip captures the experience related to the photo, so make sure this is captured and an album can be
+produced. An AI runs on all the photos and selects which are the best; make sure this is not lost."
+
+Read as three rules, none of which was in the first draft:
+
+- **P1. Nothing is lost when a photo leaves the trip.** Deleting a photo on the site does **not** delete the copy in the
+  user's library. Kinerary marks the library asset "removed from the trip" in its own records and never deletes anything
+  in a user's library (this replaces the first draft's AC-13). Removing it from the library is the user's own act.
+- **P2. The experience travels with the photo.** The photo's caption, the moment it belongs to (its caption and body),
+  who took it, the place (phase) and the date are written onto the library copy as its description, and updated when
+  they change. The same data stays on the site, so an album with its story can be produced from either side.
+- **P3. The selection of best photos is kept.** Every photo goes to the library at full quality, as uploaded (the site
+  stores the original untouched), so whatever picks the best ones sees all of them. A photo's "best" mark, set by the
+  AI or by a person, is stored on the photo and mirrored in the library as an album "Best of <trip>" (Immich also
+  marks it a favourite). **No AI photo selection exists in the code today**: this spec reserves the mark and the
+  mirroring and does not build the selector (open question 1).
+
 ## Behaviour
 
 **On the dashboard (account level).** A "Photo library" section under the account. The user can connect **Immich**
 (server address, API key) or **Google Photos** (a Google sign-in), see each connection's state (`active`,
 `needs_reconnect`), test it, disconnect it, and choose the **default** when two are connected. The page says in
-plain words what Kinerary does with a connection: it adds trip photos to an album, deletes only what it added, and
-can create a share link for an album.
+plain words what Kinerary does with a connection: it adds trip photos to an album and writes each photo's story on it, never deletes anything in
+the library, and can create a share link for an album.
 
 **On a trip (dashboard, organizer).** One switch, "Copy this trip's photos to my photo library", on by default when the
 owner has a connection, and off if an organizer turns it off. It shows which library the trip uses.
 
 **On the trip site.** A member uploads or the bot saves a photo, as today. If the trip syncs, the photo also lands in
 the owner's library, in the trip's album, within about two minutes. The album button shows when a share link
-exists for the phase. A deleted photo is deleted from the library if Kinerary put it there.
+exists for the phase. A photo deleted from the trip stays in the library (P1). A caption or moment change reaches the library copy's description (P2).
 
 **Immich.** An album per phase (as today). A phase's share link is created once, with the rules of #508 (no per-photo
 metadata, no download), and kept.
@@ -116,12 +139,26 @@ album from there.
   missing), and reports `done` with the library's asset id and, for Immich, the album's share link, or `failed` with a
   reason. A claim lost mid-way is claimed again and never uploads twice (the job's own identity is the library's
   device asset id).
-- AC-13 Given a photo is deleted on the site and Kinerary uploaded it, then a `delete` job removes that asset from the
-  library. Kinerary never deletes an asset it did not upload (it knows them only by the ids it stored).
+- AC-13 Given a photo is deleted on the site, then its library copy is left in place and the site's job row records
+  `removed_from_trip`. Kinerary never deletes an asset in a user's library, whoever put it there (P1).
 - AC-14 Given the library is unreachable, then the job is retried a bounded number of times with backoff and then
   reads `failed`; the photo stays on the site either way.
 - AC-15 Given a share link is stored for a phase, then `GET /api/album-share/:phase` returns it without a call to any
   library. Given none, it answers that no album link exists.
+
+**Experience and selection (P2, P3)**
+
+- AC-21 Given a photo with a caption, or a moment that carries it, when it is uploaded, then the library copy's description
+  holds the caption, the moment's caption and body, the author's name, the phase's place name and the date. Given the
+  caption or the moment changes, then an `update` job rewrites the description within two minutes. A description never
+  holds a trip key, a booking detail or text from a moment still a `draft`.
+- AC-22 Given a photo as uploaded by a member, then the library receives exactly those bytes: the site's stored file, not
+  a resized or re-encoded copy.
+- AC-23 Given a photo is marked best (by a person today; by the selector when there is one), then it is added to the album
+  "Best of <trip>" in the library (and, on Immich, marked a favourite). Given the mark is removed, it leaves that album.
+  Given the library or the mark is missing, nothing else about the photo changes.
+- AC-24 Given a trip's photos and moments on the site, then an ordered album (by date, then phase, with each photo's
+  caption and moment) can be produced from the site's own data alone, with no library connected.
 
 **Google Photos**
 
@@ -150,9 +187,10 @@ album from there.
   created_at; unique (user_id, provider); at most one default per user, by a partial unique index).
 - `control_plane.trip_photo_library` (trip_id, sync_enabled default true, updated_by, updated_at).
 
-**Trip SQLite (site):** `photo_library_jobs` (id, photo_id, op, phase_id, status, attempt, claim_token, library_ref,
-detail, created_at, finished_at) and `photo_library_albums` (phase_id, album_ref, share_url, updated_at). Both are
-created in the site's own migration list (`ALTER`/`CREATE IF NOT EXISTS` at boot, as the site does today).
+**Trip SQLite (site):** `photo_library_jobs` (id, photo_id, op `upload|update|best`, phase_id, status, attempt, claim_token, library_ref,
+detail, created_at, finished_at) and `photo_library_albums` (phase_id, album_ref, share_url, updated_at). `photos` gains `best` (0 or 1, who,
+when), the reserved mark of P3. All are created in the site's own migration list (`ALTER`/`CREATE IF NOT EXISTS` at boot,
+as the site does today).
 
 **Routes**
 
@@ -164,7 +202,7 @@ created in the site's own migration list (`ALTER`/`CREATE IF NOT EXISTS` at boot
   `.../result`, shaped like `group-photo/claim` and `group-photo/result`; the gateway's `tripPhotoRoute` grows the
   matching two paths.
 - Control plane, `control-plane/api/src/photo-library-poller.ts` and `photo-library.ts` (one adapter per service behind
-  one interface: `ensureAlbum`, `upload`, `delete`, `shareLink`, `check`).
+  one interface: `ensureAlbum`, `upload`, `describe`, `addToBest`, `shareLink`, `check`; no delete, P1).
 
 **Config:** `photo_library.credential_key_secret_ref` (the encryption key), `photo_library.allowed_private_hosts`,
 and for Google `web.google_photos_client_id` plus `google_photos_client_secret_ref`. All are references or ids; none
@@ -186,7 +224,9 @@ routes in `portal.ts`, `config.ts`, `web/` (the dashboard section and the trip t
 - Several libraries for one trip, or a library per co-organizer (L1).
 - A second Immich server per user (L3).
 - Faces, tagging, or any use of the library's own recognition (LM5).
-- Moving photos already on the site into the library (open question 3).
+- Moving photos already on the site into the library, except by the owner's "copy the existing photos" button.
+- Building the AI that selects the best photos. P3 keeps the mark and its mirroring; where the selector runs is open
+  question 1.
 
 ## Security and boundary notes
 
@@ -215,7 +255,8 @@ Tests are written from the criteria first.
   private range, a redirect, a name that resolves to a private address, and the allow-list.
 - `control-plane/api/test/photo-library-poller.test.ts`, against a stand-in Immich and a stand-in gateway: AC-7 to 9,
   12 to 15, with a lost claim and a failing library.
-- `tests/photo-library-site.test.js`: AC-8, 11, 13, 15, 20 on the site; the legacy path is unchanged with the switch
+- `tests/photo-library-site.test.js`: AC-8, 11, 13, 15, 20, 21 (the description, and that a draft moment never appears in it),
+  22 (byte-for-byte), 23 and 24 on the site; the legacy path is unchanged with the switch
   off.
 - `control-plane/api/test/photo-library-google.test.ts`: AC-16 to 18 against a stand-in Google, including a wrong
   `state` and a revoked token.
@@ -236,15 +277,8 @@ Tests are written from the criteria first.
 
 ## Open questions
 
-1. **L2**, one Google Photos album per trip rather than one "Kinerary trips" album: confirm, or choose the single album.
-2. **L1**, a trip uses its owner's library only: confirm, or ask for a co-organizer's own.
-3. **Backfill.** When a trip's library turns on (or the owner connects after photos exist), should the photos already on
-   the site be copied, or only new ones? Lead's lean: only new ones, with a one-time "copy the existing photos" button on
-   the trip's dashboard page.
-4. **Google verification.** A Google Photos sign-in needs a Google Cloud project and a consent screen. While the app
-   is in testing, only named test users can connect; a public launch needs Google's review. The owner creates the
-   project and sets the profile values; this spec does not.
-5. **Does Google Photos still let an app create shared links?** S3 starts with a spike that checks it. AC-18 is written
-   for the reported answer (no) and flips if it is yes.
-6. **Delete behaviour (AC-13).** Deleting a photo on the site deletes the asset in the owner's own library, as the site
-   does today. Confirm that is wanted for a personal library, or make it "leave it in the library".
+1. **Where does the AI that selects the best photos run?** I found no such selection in the code, the specs or the
+   product spec beyond the §5 line "album self-assembles into private staging (photo metadata × trip stage,
+   quality-filtered)". If it is a Kinerary feature, it needs its own spec and writes the `best` mark (P3); if it is the
+   library's own (Immich's or Google's), P1 and P3's mirroring keep it working. Which one is it?
+2. **Backfill button.** Agreed in principle; its wording and where it sits on the trip's dashboard page are for S2.
