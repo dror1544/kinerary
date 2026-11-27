@@ -983,6 +983,19 @@ class Pieces(unittest.TestCase):
         self.assertEqual("trip-t", topo["proxmox"]["lxc"]["name"])
         self.assertEqual("8080", topo["npm"]["forward_port"])
 
+    def test_site_port_reads_lxc_forward_port_for_a_wildcard_trip_with_no_npm_section(self):
+        wildcard = rt.parse_topology("version: 1\nname: t\nrouting: wildcard\nproxmox:\n  node: n\n  vmid: '123'\n  lxc:\n"
+                                     "    name: trip-t\n    ipv4: 127.0.0.1/24\n    forward_port: 8080\n")
+        self.assertEqual("8080", rt.site_port_of(wildcard))
+
+    def test_site_port_prefers_lxc_forward_port_and_falls_back_to_npm(self):
+        both = rt.parse_topology("version: 1\nname: t\nproxmox:\n  vmid: '1'\n  lxc:\n    name: trip-t\n    forward_port: 8081\n"
+                                 "npm:\n  forward_port: 8080\n")
+        self.assertEqual("8081", rt.site_port_of(both))
+        npm_only = rt.parse_topology("version: 1\nname: t\nproxmox:\n  vmid: '1'\n  lxc:\n    name: trip-t\nnpm:\n  forward_port: 8080\n")
+        self.assertEqual("8080", rt.site_port_of(npm_only))
+        self.assertEqual("", rt.site_port_of(rt.parse_topology("version: 1\nname: t\n")))
+
     def test_scrub_removes_control_characters_and_secret_assignments_and_keeps_only_the_tail(self):
         text = "\n".join(f"line {i}" for i in range(40)) + "\nPASSWORD=hunter2 and token: abc\x1b[31m red\n"
         shown = rt.scrub(text)
