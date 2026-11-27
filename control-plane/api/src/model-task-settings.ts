@@ -160,6 +160,12 @@ export function switchableRunner(
       if (chosen) return chosen.describe?.(task) ?? null;
       return base.describe ? base.describe(task) : null;
     },
+    // An override replaces the whole binding, fallback included: an operator who
+    // pinned a model with `/model` asked for that model, not for a hop behind it.
+    describeFallback(task) {
+      if (override(task)) return null;
+      return base.describeFallback ? base.describeFallback(task) : null;
+    },
     run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
       return (override(req.task) ?? base).run(req);
     },

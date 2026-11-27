@@ -396,6 +396,14 @@ services:
       JUDGE_MIN_CONFIDENCE: ${JUDGE_MIN_CONFIDENCE:-}
       JUDGE_CONCURRENCY: ${JUDGE_CONCURRENCY:-}
       JUDGE_DATA_COLLECTION: ${JUDGE_DATA_COLLECTION:-}
+      # The judge's quota-only fallback (owner, 2026-11-27): used once, only when the primary answers
+      # RATE_LIMITED (OpenRouter 402 = credits out, or 429). Unset = no fallback. Its own effort and
+      # timeout; it inherits neither the primary's. A fallback asked for and not wired logs
+      # `model_runner.judge_fallback_unusable` at start.
+      JUDGE_FALLBACK_RUNNER: ${JUDGE_FALLBACK_RUNNER:-}
+      JUDGE_FALLBACK_MODEL: ${JUDGE_FALLBACK_MODEL:-}
+      JUDGE_FALLBACK_EFFORT: ${JUDGE_FALLBACK_EFFORT:-}
+      JUDGE_FALLBACK_TIMEOUT_MS: ${JUDGE_FALLBACK_TIMEOUT_MS:-}
       # Uploaded originals, on the trips' NFS export (see
       # docs/document-intake-operations.md). REQUIRED: the relay refuses to start
       # unless this is a mounted, writable volume carrying the store's marker,

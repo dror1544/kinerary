@@ -201,10 +201,17 @@ export class JudgeRateLimiter {
   }
 }
 
+/**
+ * What the judge decided. `model` is the model that gave (or failed to give) the
+ * answer: when the primary ran out of quota and the call went to the fallback
+ * (JUDGE_FALLBACK_*), `usedFallback` is true and `model` is the FALLBACK's, so
+ * the analytics rollup (`judge.by_model`, which the daily report prints) shows
+ * the judge on its fallback with no new column. Absent otherwise.
+ */
 export type JudgeOutcome =
-  | { kind: "yes"; confidence: number; ms: number; model: string }
-  | { kind: "no"; confidence: number; ms: number; model: string; belowThreshold: boolean }
-  | { kind: "fallback"; reason: JudgeFallbackReason; ms: number; model: string };
+  | { kind: "yes"; confidence: number; ms: number; model: string; usedFallback?: true }
+  | { kind: "no"; confidence: number; ms: number; model: string; belowThreshold: boolean; usedFallback?: true }
+  | { kind: "fallback"; reason: JudgeFallbackReason; ms: number; model: string; usedFallback?: true };
 
 export interface GroupJudge {
   /**
@@ -338,6 +345,14 @@ export function createGroupJudge(options: GroupJudgeOptions): GroupJudge {
   // (timeout, error, or the provider's own rate limit - NOT a bad answer, which
   // means the model is reachable) no call is made for `cooldownMs`; then ONE probe
   // goes through, and its result closes the circuit or re-arms the cool-down.
+  //
+  // It judges the FINAL result of a call, after the quota fallback (if one is
+  // wired) has had its single hop. A primary out of credits whose fallback
+  // answers is a judge that works: the call counts as a success, the breaker
+  // stays closed, and the next message tries the primary again (so credits coming
+  // back are noticed at once) and the fallback again if not. Opening on the
+  // primary's 402s alone would cut the judge off from the very fallback that
+  // exists for them. A 402 whose fallback also fails is one failure, like any.
   // While open every message is a judge_fallback with reason circuit_open, so the
   // report shows the outage instead of a silent gap. In memory: a restart closes it.
   const threshold = Math.max(1, options.breakerThreshold ?? DEFAULT_BREAKER_THRESHOLD);
@@ -378,12 +393,23 @@ export function createGroupJudge(options: GroupJudgeOptions): GroupJudge {
     }
   };
 
+  // Whether the judge is, as of its last call to reach a verdict, being served by
+  // the quota fallback. Logged on the way in and on the way out - not per message:
+  // the per-message facts are `usedFallback` on the outcome and the model recorded
+  // with it. In memory: a restart forgets it and says "engaged" again at the first 402.
+  let onFallback = false;
+
   return {
     model: modelNow,
     async judge(input) {
       // Read once per call, so the decision, its record and the call agree.
       const model = modelNow() ?? "unknown";
       const timeoutMs = timeoutFor(options.runner.describe?.(JUDGE_TASK)?.provider);
+      // The quota fallback wired behind the primary right now, if any. Its own
+      // timeout is not the primary's: the call may use both, in turn, and every
+      // clock below that is "one call" has to be able to hold both.
+      const fallbackPin = options.runner.describeFallback?.(JUDGE_TASK) ?? null;
+      const fallbackMs = fallbackPin ? fallbackPin.timeoutMs ?? timeoutMs : 0;
       let started = now();
       const elapsed = () => Math.max(0, now() - started);
       const gate = breakerGate();
@@ -397,7 +423,11 @@ export function createGroupJudge(options: GroupJudgeOptions): GroupJudge {
       // A slot: at most `concurrency` calls at once, a bounded line behind them. The
       // poller runs each chat's judgement off its loop, so this line is what keeps a
       // burst of busy chats from starting a process per message.
-      const release = await slots.acquire(timeoutMs);
+      // The wait for a slot is as long as ONE call may take: with a fallback that
+      // is both legs. A call behind a fallback call (several seconds) would
+      // otherwise give up after the primary's 3 s and a credits-out episode would
+      // read as queue_full in every busy chat.
+      const release = await slots.acquire(timeoutMs + fallbackMs);
       if (!release) {
         if (gate === "probe") breaker.probing = false;
         return { kind: "fallback", reason: "queue_full", ms: 0, model };
@@ -408,8 +438,11 @@ export function createGroupJudge(options: GroupJudgeOptions): GroupJudge {
       try {
         // A hard wall of our own beside the adapter's: a CLI runner, a hung
         // socket or a fake that never answers must not hold the poll loop.
+        // With a fallback the wall holds both legs; each leg is bounded by its own
+        // timeout inside the runner (quotaFallbackRunner), so a primary that hangs
+        // is cut at its own budget, not held for the fallback's too.
         const hardStop = new Promise<"timeout">((resolve) => {
-          timer = setTimeout(() => resolve("timeout"), timeoutMs + 100);
+          timer = setTimeout(() => resolve("timeout"), timeoutMs + 100 + (fallbackPin ? fallbackMs + 100 : 0));
         });
         const run = options.runner.run<JudgeVerdict>({
           task: JUDGE_TASK,
@@ -423,15 +456,32 @@ export function createGroupJudge(options: GroupJudgeOptions): GroupJudge {
           breakerRecord(true);
           return { kind: "fallback", reason: "timeout", ms: elapsed(), model };
         }
+        // The answer is the fallback's when the primary ran out of quota: the
+        // outcome then names the fallback's model, not the primary's.
+        const usedFallback = result.usedFallback === true;
+        const answeredBy = usedFallback ? fallbackPin?.model ?? model : model;
+        const marker = usedFallback ? { usedFallback: true as const } : {};
+        if (usedFallback && !onFallback) {
+          onFallback = true;
+          log(structuredLog("warn", "relay.group_judge_fallback_engaged", {
+            task: JUDGE_TASK,
+            primary_model: model,
+            fallback_model: answeredBy,
+            consequence: "the primary judge model is out of quota (OpenRouter 402 = credits out, or 429); unaddressed group messages are judged by the fallback until it answers again",
+          }));
+        } else if (!usedFallback && onFallback && result.ok) {
+          onFallback = false;
+          log(structuredLog("info", "relay.group_judge_fallback_ended", { task: JUDGE_TASK, primary_model: model }));
+        }
         if (!result.ok) {
           const reason = reasonOf(result.reason);
           breakerRecord(reason !== "unparseable");
-          return { kind: "fallback", reason, ms: elapsed(), model };
+          return { kind: "fallback", reason, ms: elapsed(), model: answeredBy, ...marker };
         }
         breakerRecord(false);
         const { forAssistant, confidence } = result.value;
-        if (forAssistant && confidence >= minConfidence) return { kind: "yes", confidence, ms: elapsed(), model };
-        return { kind: "no", confidence, ms: elapsed(), model, belowThreshold: forAssistant };
+        if (forAssistant && confidence >= minConfidence) return { kind: "yes", confidence, ms: elapsed(), model: answeredBy, ...marker };
+        return { kind: "no", confidence, ms: elapsed(), model: answeredBy, belowThreshold: forAssistant, ...marker };
       } catch {
         breakerRecord(true);
         return { kind: "fallback", reason: "error", ms: elapsed(), model };
@@ -497,6 +547,29 @@ export function groupJudgeFromEnv(
     log,
   }) : undefined;
   const model = judge?.model() ?? null;
+  // The quota fallback (JUDGE_FALLBACK_*): said once, whichever way it went. A
+  // fallback that was asked for and is not wired is a downgrade nothing else in
+  // the conversation would show - credits run out and the groups go quiet - so it
+  // is a warning here, not a silent unwrap.
+  const fallbackPin = runner?.describeFallback?.(JUDGE_TASK) ?? null;
+  const fallbackAsked = Boolean((env.JUDGE_FALLBACK_RUNNER ?? "").trim() || (env.JUDGE_FALLBACK_MODEL ?? "").trim());
+  if (judge && model && fallbackAsked && !fallbackPin) {
+    log(structuredLog("warn", "model_runner.judge_fallback_unusable", {
+      task: JUDGE_TASK,
+      variable: "JUDGE_FALLBACK_RUNNER / JUDGE_FALLBACK_MODEL",
+      consequence: "no quota fallback is wired (it needs a runner of openrouter, claude or codex, and a model, a key where one is needed, and a model that does not pick models): when the primary is out of credits the judge falls back to ignoring unaddressed group messages",
+    }));
+  }
+  if (judge && model && fallbackPin) {
+    const fbTimeout = judgeTimeoutMs({ ...env, JUDGE_TIMEOUT_MS: env.JUDGE_FALLBACK_TIMEOUT_MS }, fallbackPin.provider);
+    if (fbTimeout.clamped) {
+      log(structuredLog("warn", "model_runner.judge_timeout_clamped", {
+        variable: "JUDGE_FALLBACK_TIMEOUT_MS",
+        reason: fbTimeout.clamped === "above" ? `above the ${fbTimeout.ceiling} ms ceiling` : "not a positive number",
+        effective_ms: fbTimeout.ms,
+      }));
+    }
+  }
   if (judge && model) {
     log(structuredLog("info", "relay.group_judge", {
       enabled: true,
@@ -509,6 +582,10 @@ export function groupJudgeFromEnv(
       ...(provider === "claude" || provider === "codex" ? { effort: judgeEffortSafe(env) } : {}),
       // The effective OpenRouter provider policy for the judge, stated once.
       ...(provider !== "claude" && provider !== "codex" ? { data_collection: dataCollection.policy } : {}),
+      // The quota-only fallback, when one is wired: used only when the primary answers 402/429.
+      ...(fallbackPin
+        ? { fallback_runner: fallbackPin.provider, fallback_model: fallbackPin.model, fallback_timeout_ms: fallbackPin.timeoutMs }
+        : {}),
     }));
     return judge;
   }

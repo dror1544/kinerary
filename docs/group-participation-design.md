@@ -132,6 +132,16 @@ but does nothing until a judge runner and model are configured.
 - Model: a free small model via OpenRouter with data collection denied, chosen
   in configuration (`JUDGE_RUNNER` / `JUDGE_MODEL`).
 - A typed-decision model such as TypeSafe Jev will be benchmarked later.
+- **Quota fallback (owner, 2026-11-27).** When the primary is OpenRouter and its
+  credits run out (402, or a 429), the judge may fall back once to a second
+  configured runner, for example the claude CLI on Haiku
+  (`JUDGE_FALLBACK_RUNNER` / `_MODEL` / `_EFFORT` / `_TIMEOUT_MS`; unset means
+  none). It is quota-only, as decision 48 is for documents (`docs/sprint6-tracks.md`
+  #48): a timeout, an error or a bad answer from the primary does not reach it.
+  The fallback has its own timeout, and a decision it made is recorded under the
+  fallback's model id, so the daily report's "by model" line shows the judge on
+  its fallback. Entering and leaving it log `relay.group_judge_fallback_engaged`
+  / `_ended` once each.
 
 ## 4. Proactive level: a preference, not a privacy switch (built)
 
