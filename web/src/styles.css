@@ -546,8 +546,31 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
 .product-shell .trip-card-link:hover { text-decoration: underline; }
 .product-shell .trip-card-head { display: flex; justify-content: space-between; align-items: center; width: 100%; }
 .telegram-status { position: relative; display: flex; align-items: center; gap: 2px; }
-.telegram-icon { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; color: #8a979d; background: #f1f3f2; }
-.telegram-icon.linked { color: #167b74; background: #e9f7f5; }
+/* Telegram and WhatsApp are treated alike everywhere a chat is linked (#690): the same shapes, each in its own brand colour. */
+.chat-service-telegram, .chat-service-telegram-card { --brand: #229ed9; --brand-ink: #04283a; --brand-text: #1b7fb0; --brand-tint: #e3f3fb; }
+.chat-service-whatsapp, .chat-service-whatsapp-card { --brand: #25d366; --brand-ink: #073b1c; --brand-text: #128c4a; --brand-tint: #e2f8ea; }
+.chat-statuses { position: relative; display: flex; align-items: center; gap: 6px; }
+/* both menus hang from the pair, right-aligned, so neither runs off the card to the left */
+.chat-statuses .chat-status { position: static; }
+.chat-icon { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; color: #8a979d; background: #f1f3f2; }
+.chat-icon.linked { color: var(--brand-text); background: var(--brand-tint); }
+.chat-icon.unknown { color: var(--brand-text); background: #f6f7f6; }
+.chat-mark-telegram { color: #229ed9; }
+.chat-mark-whatsapp { color: #25d366; }
+.chat-link .chat-mark { color: inherit; flex: none; }
+.button.chat-link { display: inline-flex; align-items: center; gap: 8px; background: var(--brand); border-color: var(--brand); color: var(--brand-ink); }
+.telegram-menu .text-button.chat-link, .text-button.chat-link { display: inline-flex; align-items: center; gap: 8px; color: var(--brand-text); font-weight: 800; }
+.chat-connect-ready, .chat-connect-failed { display: grid; gap: 6px; justify-items: start; }
+.chat-connect-ready small, .chat-connect-failed small { color: #60727f; }
+.chat-cards { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; }
+.chat-card { display: grid; gap: 10px; justify-items: start; }
+.chat-card > * { margin: 0; }
+.chat-card h2 { display: flex; align-items: center; gap: 8px; }
+.chat-card h3 { margin: 8px 0 0; font-size: 16px; }
+.chat-service-telegram-card, .chat-service-whatsapp-card { border-top: 4px solid var(--brand); }
+.chat-entries { display: grid; gap: 6px; width: 100%; }
+.chat-entries .text-button { text-align: left; display: grid; gap: 2px; }
+.chat-entries small { color: #60727f; }
 .telegram-kebab { font-size: 20px; line-height: 1; min-width: 28px; min-height: 28px; }
 .telegram-menu { position: absolute; z-index: 5; top: calc(100% + 6px); right: 0; width: 290px; display: grid; gap: 6px; text-align: left; background: white; border: 1px solid #e5e0d8; border-radius: 14px; padding: 12px; box-shadow: 0 18px 40px rgba(16,38,58,.16); }
 .telegram-menu .subtle, .telegram-menu small { margin: 0; color: #60727f; }
@@ -597,6 +620,7 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
 
 @media (max-width: 900px) {
   .setup-layout { grid-template-columns: 1fr; }
+  .chat-cards { grid-template-columns: 1fr; }
   .trip-grid { grid-template-columns: 1fr 1fr; }
   .dashboard-nav span { display: none; }
 }

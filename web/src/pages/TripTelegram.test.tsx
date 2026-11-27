@@ -20,6 +20,8 @@ function mount(state: State, extra: (path: string, init?: RequestInit) => Respon
     const path = String(input); calls.push(`${init?.method || "GET"} ${path}`);
     const custom = extra(path, init);
     if (custom) return custom;
+    // Opening an organizer's menu makes the one-time link (one click to Telegram), so the default answers it.
+    if (init?.method === "POST" && path.endsWith("/telegram-link")) return json({ deepLink: "https://t.me/kinerary_bot?start=lk_DEFAULTDEFAULTDEFAULTDEFAULT00", expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() }, 201);
     if (path === "/v1/me") return json({ id: "user_existing", displayName: "Organizer" });
     if (path === "/v1/trips") {
       return json({ trips: trips?.() ?? [
@@ -43,7 +45,7 @@ it("each organizer trip card shows whether Telegram is linked for THAT trip", as
   expect(screen.queryByText(/Telegram accounts that can sign in as you/)).toBeNull();
 });
 
-it("Link produces a one-time t.me link for that trip, and says how long it works", async () => {
+it("opening the menu makes ONE link for that trip, ready to press: one click opens Telegram, and nothing was asked for before", async () => {
   const calls: string[] = [];
   const expiresAt = new Date(Date.now() + 15 * 60_000).toISOString();
   mount({ rome: [], oslo: [] }, (path, init) => {
@@ -52,24 +54,36 @@ it("Link produces a one-time t.me link for that trip, and says how long it works
     return undefined;
   });
   const oslo = within(await card("Oslo 2027"));
+  await card("Rome 2027");
+  // Two cards on the page, no menu open: not one link was asked for.
+  expect(calls.some((c) => c.includes("telegram-link"))).toBe(false);
   fireEvent.click(oslo.getByRole("button", { name: "Telegram options for Oslo 2027" }));
   expect(oslo.getByText("No Telegram account is linked to this trip.")).toBeInTheDocument();
-  expect(calls.some((c) => c.includes("telegram-link"))).toBe(false);
-  fireEvent.click(oslo.getByRole("menuitem", { name: "Link Telegram" }));
-  const open = await oslo.findByRole("link", { name: "Open in Telegram" });
+  // The link IS the action: a plain anchor that already holds the deep link, so the browser opens it from the click itself.
+  const open = await oslo.findByRole("menuitem", { name: "Link Telegram" });
+  expect(open.tagName).toBe("A");
   expect(open).toHaveAttribute("href", "https://t.me/kinerary_bot?start=lk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+  expect(open).toHaveAttribute("target", "_blank");
   expect(open).toHaveAttribute("rel", "noopener noreferrer");
+  // What the link will do is said before the click, with when it stops.
   expect(oslo.getByText(/Works once, until/)).toBeInTheDocument();
+  expect(oslo.getAllByText(/replaces the main Telegram account you had/).length).toBeGreaterThan(0);
   expect(calls.filter((c) => c.includes("telegram-link"))).toEqual(["POST /v1/trips/trip_oslooslo/telegram-link"]);
 });
 
-it("a refused link request says so instead of showing a stale link", async () => {
-  mount({ rome: [], oslo: [] }, (path, init) => path.endsWith("/telegram-link") && init?.method === "POST" ? json({ error: "RATE_LIMITED" }, 429) : undefined);
+it("a refused link request says so, offers a button instead of a link, and the person can try again", async () => {
+  let refuse = true;
+  mount({ rome: [], oslo: [] }, (path, init) => {
+    if (path.endsWith("/telegram-link") && init?.method === "POST" && refuse) return json({ error: "RATE_LIMITED" }, 429);
+    return undefined;
+  });
   const oslo = within(await card("Oslo 2027"));
   fireEvent.click(oslo.getByRole("button", { name: "Telegram options for Oslo 2027" }));
-  fireEvent.click(oslo.getByRole("menuitem", { name: "Link Telegram" }));
   expect(await oslo.findByRole("alert")).toHaveTextContent("Too many requests");
-  expect(oslo.queryByRole("link", { name: "Open in Telegram" })).toBeNull();
+  expect(oslo.queryByRole("link", { name: "Link Telegram" })).toBeNull();
+  refuse = false;
+  fireEvent.click(oslo.getByRole("menuitem", { name: "Link Telegram" }));
+  await vi.waitFor(() => expect(oslo.getByRole("menuitem", { name: "Link Telegram" }).tagName).toBe("A"));
 });
 
 it("Unlink asks first, unlinks only that trip, and the card goes to 'not linked' while the other stays linked", async () => {
@@ -104,12 +118,12 @@ it("an Unlinked account is offered Restore; it asks first, then one POST (no Tel
   fireEvent.click(rome.getByRole("button", { name: "Telegram options for Rome 2027" }));
   fireEvent.click(rome.getByRole("menuitem", { name: /Restore Telegram · unlinked Oct 5, 2026/ }));
   // Asked first: nothing has been sent yet, and an account with no label is still named for what it is.
-  expect(calls.some((c) => c.startsWith("POST"))).toBe(false);
+  expect(calls.some((c) => c.startsWith("POST") && !c.endsWith("/telegram-link"))).toBe(false);
   expect(rome.getByRole("group", { name: "Confirm restore" })).toHaveTextContent("Restore Telegram access for this Telegram account? It will open this trip again, and sign in fresh.");
   fireEvent.click(rome.getByRole("button", { name: "Confirm restore" }));
   await vi.waitFor(() => expect(within(screen.getByRole("heading", { name: "Rome 2027" }).closest("article")!).getByRole("img", { name: "Telegram linked" })).toBeInTheDocument());
-  expect(calls.filter((c) => c.startsWith("POST"))).toEqual([`POST /v1/account/telegram-links/${unlinkedEntry.id}/restore`]);
-  expect(calls.some((c) => c.includes("telegram-link") && !c.includes("telegram-links"))).toBe(false);
+  // Restore itself needs no link; the one POST to telegram-link is the menu's own, made when it opened.
+  expect(calls.filter((c) => c.startsWith("POST") && !c.endsWith("/telegram-link"))).toEqual([`POST /v1/account/telegram-links/${unlinkedEntry.id}/restore`]);
   expect(document.body.textContent).not.toMatch(/sha256|otl_|tml_/);
 });
 
@@ -130,7 +144,7 @@ it("the Restore question and the entries show the first name, then the @username
   fireEvent.click(restoreItems[0]!);
   expect(rome.getByRole("group", { name: "Confirm restore" })).toHaveTextContent("Restore Telegram access for Dana @dana_k? It will open this trip again, and sign in fresh.");
   fireEvent.click(rome.getByRole("button", { name: "Keep unlinked" }));
-  expect(calls.some((c) => c.startsWith("POST"))).toBe(false);
+  expect(calls.some((c) => c.startsWith("POST") && !c.endsWith("/telegram-link"))).toBe(false);
   expect(rome.queryByRole("group", { name: "Confirm restore" })).toBeNull();
 });
 
