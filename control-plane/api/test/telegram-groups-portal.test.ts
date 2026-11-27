@@ -126,7 +126,7 @@ describe("telegram groups: dashboard routes", { skip: SKIP }, () => {
     assert.equal(r.headers["cache-control"], "private, no-store");
     const body = r.json();
     assert.deepEqual(Object.keys(body).sort(), ["expiresAt", "link"]);
-    assert.match(body.link, /^https:\/\/t\.me\/kinerary_bot\?startgroup=KWA-[A-HJ-NP-Z2-9]{8}&admin=pin_messages\+invite_users$/);
+    assert.match(body.link, /^https:\/\/t\.me\/kinerary_bot\?startgroup=KWA-[A-HJ-NP-Z2-9]{8}&admin=change_info\+pin_messages\+invite_users$/);
     assert.ok(Math.abs(new Date(body.expiresAt).getTime() - Date.now() - 900_000) < 10_000);
     assert.deepEqual(await codes(f.tripId), [{ platform: "telegram", kind: "group", issued_by_user_id: f.ownerId, state: "issued" }]);
     assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE id = $1 AND issued_to_telegram_user_id = '777'", [kin])).rowCount, 1, "the /group token was not replaced");
