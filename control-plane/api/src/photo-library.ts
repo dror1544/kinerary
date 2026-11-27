@@ -248,7 +248,9 @@ export async function listConnections(db: pg.Pool | pg.PoolClient, userId: strin
   return rows.rows.map(connectionView);
 }
 
-const API_KEY_SHAPE = /^[\x21-\x7e]{1,512}$/;
+// Immich issues base64url keys. Nothing else is accepted, so a key can never hold a character (`,` `;` `}` quotes,
+// spaces, line breaks) that would end a redaction match early or split a header.
+const API_KEY_SHAPE = /^[A-Za-z0-9_-]{1,512}$/;
 
 export async function connectImmich(db: pg.Pool, settings: PhotoLibrarySettings, userId: string, body: unknown): Promise<RouteAnswer> {
   const input = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;

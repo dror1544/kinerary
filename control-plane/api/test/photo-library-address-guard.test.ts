@@ -7,11 +7,14 @@
  * refuses must never reach the stand-in, so each refusal also asserts the stand-in saw nothing.
  */
 import assert from "node:assert/strict";
+import { createSocket } from "node:dgram";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import {
-  PhotoLibraryGuardError, classifyAddress, guardedFetch, parseLibraryAddress, type Resolver,
+  PhotoLibraryGuardError, classifyAddress, guardedFetch, parseLibraryAddress, systemResolver, type Resolver,
 } from "../src/photo-library-guard.js";
 
 let server: Server;
@@ -182,6 +185,50 @@ test("a server that does not answer, or answers a byte at a time, hits the total
   started = Date.now();
   assert.equal(await refusal(guardedFetch(parseLibraryAddress(`http://127.0.0.1:${port}/`), {}, options)), "timeout");
   assert.ok(Date.now() - started < 2000);
+});
+
+test("one deadline covers the name lookup too: a resolver that never answers is a timeout, not a hang", async () => {
+  reset();
+  const never: Resolver = () => new Promise(() => { /* never settles */ });
+  const started = Date.now();
+  assert.equal(await refusal(guardedFetch(parseLibraryAddress(`http://slow-dns.example.test:${port}/`), {}, { resolve: never, timeoutMs: 500 })), "timeout");
+  const took = Date.now() - started;
+  assert.ok(took >= 450 && took < 1500, `answered after ${took} ms, the deadline was 500`);
+  // The time the lookup took counts against the same deadline as the exchange: a slow lookup plus a slow server is one timeout.
+  const slow: Resolver = () => new Promise((resolve) => setTimeout(() => resolve([{ address: "127.0.0.1", family: 4 }]), 300));
+  reset(() => { /* never answers */ });
+  const second = Date.now();
+  assert.equal(await refusal(guardedFetch(parseLibraryAddress(`http://slow.home.test:${port}/`), {}, { resolve: slow, allowedPrivateHosts: ["slow.home.test"], timeoutMs: 500 })), "timeout");
+  assert.ok(Date.now() - second < 900, `the deadline restarted after the lookup (${Date.now() - second} ms)`);
+});
+
+test("the system resolver is c-ares with its own timeout, never the shared thread pool's getaddrinfo", async () => {
+  const source = await readFile(fileURLToPath(new URL("../src/photo-library-guard.ts", import.meta.url)), "utf8");
+  assert.match(source, /new (?:Dns)?Resolver\(\{\s*timeout:/);
+  // getaddrinfo is not imported at all (the file header names it, in prose, as what is avoided).
+  assert.doesNotMatch(source, /import\s*\{[^}]*\blookup\b[^}]*\}\s*from\s*"node:dns/);
+});
+
+test("the c-ares resolver gives up on a name server that never answers, and stops at once when cancelled", async () => {
+  // A name server on loopback that receives every query and answers none.
+  const silent = createSocket("udp4");
+  let queries = 0;
+  silent.on("message", () => { queries += 1; });
+  await new Promise<void>((resolve) => silent.bind(0, "127.0.0.1", () => resolve()));
+  const server = `127.0.0.1:${silent.address().port}`;
+  try {
+    const bounded = systemResolver(400, [server]);
+    let started = Date.now();
+    await assert.rejects(bounded.resolve("photos.example.test"));
+    assert.ok(Date.now() - started < 2000, `c-ares gave up after ${Date.now() - started} ms`);
+    assert.ok(queries > 0, "the stand-in name server was asked");
+    const cancelled = systemResolver(60_000, [server]);
+    started = Date.now();
+    const pending = cancelled.resolve("photos.example.test");
+    setTimeout(() => cancelled.cancel(), 100);
+    await assert.rejects(pending);
+    assert.ok(Date.now() - started < 1000, `cancel took ${Date.now() - started} ms`);
+  } finally { silent.close(); }
 });
 
 test("a closed port reads as unreachable, and a guard error never carries the request's headers", async () => {

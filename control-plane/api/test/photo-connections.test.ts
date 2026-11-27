@@ -253,8 +253,11 @@ test("AC-1: a wrong key, a key without album.read, an address that is not Immich
     assert.deepEqual([notImmichAnswer.statusCode, notImmichAnswer.json().error], [422, "not_immich"]);
     const unreachable = await connect(app, "alice", GOOD, closedUrl);
     assert.deepEqual([unreachable.statusCode, unreachable.json().error], [502, "unreachable"]);
-    const badKey = await connect(app, "alice", "two words\r\nx-injected: 1");
-    assert.deepEqual([badKey.statusCode, badKey.json().error], [400, "invalid_request"]);
+    // An API key is base64url, as Immich issues them: anything else is refused before it is used or could be logged.
+    for (const shape of ["two words\r\nx-injected: 1", "abc,def", "abc;def", "abc}def", "abc'def", 'abc"def', "abc=", "abc+/", "a".repeat(513), ""]) {
+      const badKey = await connect(app, "alice", shape);
+      assert.deepEqual([badKey.statusCode, badKey.json().error], [400, "invalid_request"], JSON.stringify(shape.slice(0, 20)));
+    }
     const badPublic = await connect(app, "alice", GOOD, immichUrl, { publicUrl: "javascript:alert(1)" });
     assert.deepEqual([badPublic.statusCode, badPublic.json().error, badPublic.json().field], [400, "invalid_address", "publicUrl"]);
     assert.deepEqual(await rowsOf(ids.alice), []);
@@ -474,6 +477,18 @@ test("a check that was running when the user reconnected does not overwrite the 
     const [row] = await rowsOf(ids.alice);
     assert.deepEqual([row.status, row.last_error_code], ["active", null], "the new key's connection was not marked needs_reconnect");
   } finally { slowKey = undefined; await app.close(); }
+});
+
+test("AC-4 at the route: a lookup that never answers is a 502 timeout within the deadline, and nothing is stored", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(settings({ allowedPrivateHosts: [], timeoutMs: 500, resolveHost: () => new Promise(() => { /* never */ }) })) });
+  try {
+    const started = Date.now();
+    const response = await connect(app, "alice", GOOD, "https://immich.slow-dns.example.test");
+    const took = Date.now() - started;
+    assert.deepEqual([response.statusCode, response.json().error], [502, "timeout"]);
+    assert.ok(took < 1500, `answered after ${took} ms, the deadline was 500`);
+    assert.deepEqual(await rowsOf(ids.alice), []);
+  } finally { await app.close(); }
 });
 
 // ── AC-19 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
