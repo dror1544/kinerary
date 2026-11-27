@@ -385,6 +385,17 @@ services:
       INTERPRET_EFFORT: ${INTERPRET_EFFORT:-}
       EXTRACT_EFFORT: ${EXTRACT_EFFORT:-}
       VISION_EFFORT: ${VISION_EFFORT:-}
+      # The group judge: whether an unaddressed group message is a
+      # question for the companion, on every platform. Unset = the judge is off and a group is answered only
+      # when the assistant is named, mentioned or replied to (`model_runner.judge_unset`).
+      # Missing here until 2026-11-27, so the VM's groups never had a judge.
+      JUDGE_RUNNER: ${JUDGE_RUNNER:-}
+      JUDGE_MODEL: ${JUDGE_MODEL:-}
+      JUDGE_EFFORT: ${JUDGE_EFFORT:-}
+      JUDGE_TIMEOUT_MS: ${JUDGE_TIMEOUT_MS:-}
+      JUDGE_MIN_CONFIDENCE: ${JUDGE_MIN_CONFIDENCE:-}
+      JUDGE_CONCURRENCY: ${JUDGE_CONCURRENCY:-}
+      JUDGE_DATA_COLLECTION: ${JUDGE_DATA_COLLECTION:-}
       # Uploaded originals, on the trips' NFS export (see
       # docs/document-intake-operations.md). REQUIRED: the relay refuses to start
       # unless this is a mounted, writable volume carrying the store's marker,
