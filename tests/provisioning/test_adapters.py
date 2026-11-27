@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from provisioning.adapters import (
     CloudflareTunnelDnsAdapter,
@@ -989,6 +990,39 @@ SHARED_KEY = "s" * 64
 INSTALLED_SPEC = LxcSpec(
     "trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m", "kinerary",
 )
+
+
+class SharedNginxConfTests(unittest.TestCase):
+    """The site's nginx config is one file (provisioning/trip-site-nginx.conf) used by the LXC bootstrap and
+    by the trip-site image. Moving it out of the bootstrap heredoc must not change what a container gets."""
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+    CONF = Path(__file__).resolve().parents[2] / "provisioning" / "trip-site-nginx.conf"
+
+    def _bootstrap(self) -> str:
+        ssh = FakeProxmoxSsh()
+        adapter = ProxmoxLxcAdapter(
+            ssh, control_plane_exchange_key="exchange-key-fixture",
+            password_factory=lambda: "seed-pass-fixture", hermes_url="http://bridge.example:4300",
+        )
+        adapter._bootstrap_app_environment("203", LXC_SPEC)
+        return ssh.commands[-1]
+
+    def test_lxc_bootstrap_script_is_byte_identical_to_the_one_before_the_move(self) -> None:
+        golden = (self.FIXTURES / "lxc-bootstrap-script.golden.sh").read_text(encoding="utf-8")
+        self.assertEqual(golden, self._bootstrap())
+
+    def test_the_shared_file_is_what_the_bootstrap_writes_to_nginx(self) -> None:
+        body = self.CONF.read_text(encoding="utf-8")
+        self.assertIn("<<'NGINXEOF'\n" + body + "NGINXEOF\n", self._bootstrap())
+
+    def test_the_shared_file_is_literal_at_the_app_dir_both_runtimes_use(self) -> None:
+        # No placeholders: the LXC's app_dir and the image's layout are both /opt/kinerary.
+        body = self.CONF.read_text(encoding="utf-8")
+        self.assertIn("  root /opt/kinerary/site;\n", body)
+        self.assertIn("listen 8080;", body)
+        self.assertNotRegex(body, r"\{[a-z_]+\}")
+        self.assertNotIn("{{", body)
 
 
 class _ReadingSsh(FakeProxmoxSsh):

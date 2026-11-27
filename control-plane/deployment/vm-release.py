@@ -960,16 +960,59 @@ def backups_to_prune(backups: Sequence[Tuple[str, int]], *, keep: int, max_total
     return doomed
 
 
-def images_to_prune(tags: Iterable[str], keep_revs: Iterable[str]) -> List[str]:
-    """kinerary-cp/{api,worker,agent-runtime,portal,runtime-gateway,whatsapp-bridge}:<rev> images not in keep_revs.
+TRIP_SITE_IMAGE = "trip-site"
+TRIP_SITE_DIGEST = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
+TRIP_SITE_TAG = re.compile(r"^trip-site:([0-9a-f]{64})$")
+
+
+def trip_site_tag(digest: str) -> str:
+    """`trip-site:<hex>` for a release's artifact digest (`sha256:<hex>` or the bare hex). A tag cannot hold the
+    colon, and nothing but 64 lowercase hex digits may reach a docker argv from a database or a request."""
+    match = TRIP_SITE_DIGEST.match(digest or "")
+    if not match:
+        raise Refused(f"{digest!r} is not a release digest (sha256:<64 hex>)")
+    return f"{TRIP_SITE_IMAGE}:{match.group(1)}"
+
+
+def trip_site_build_argv(digest: str, tool_root: Path, release_tree: Path) -> List[str]:
+    """The build of one trip's site image: the release tree is the context (server/, site/, shared/), and the
+    deployment's own files (the entrypoint, the shared nginx config) come from a checkout of this repository,
+    named context `tool`. See the header of trip-site.Dockerfile."""
+    return ["docker", "build",
+            "-f", str(tool_root / "control-plane" / "deployment" / "trip-site.Dockerfile"),
+            "--build-context", f"tool={tool_root}",
+            "-t", trip_site_tag(digest),
+            str(release_tree)]
+
+
+def images_to_prune(tags: Iterable[str], keep_revs: Iterable[str],
+                    trip_site_protected: Optional[Iterable[str]] = None) -> List[str]:
+    """kinerary-cp/{api,worker,agent-runtime,portal,runtime-gateway,whatsapp-bridge}:<rev> images not in keep_revs,
+    and trip-site:<digest> images no trip names.
 
     Hermes images are never pruned here: building one is a manual step.
+
+    `trip_site_protected` is the release digests that a trip's current or previous release names (the way back
+    must still run). None means "not known": no trip-site image is pruned at all, so a caller that could not
+    read the set fails safe. An empty set means "known, and no trip names any". A tag that is not
+    `trip-site:<64 hex>` is not ours and is never pruned.
     """
     keep = {r for r in keep_revs if r}
+    protected = None
+    if trip_site_protected is not None:
+        protected = set()
+        for digest in trip_site_protected:
+            match = TRIP_SITE_DIGEST.match(digest or "")
+            if match:
+                protected.add(match.group(1))
     doomed = []
     for tag in tags:
         match = re.match(r"^kinerary-cp/(api|worker|agent-runtime|portal|runtime-gateway|whatsapp-bridge):([0-9a-f]{7,40})$", tag)
         if match and match.group(2) not in keep:
+            doomed.append(tag)
+            continue
+        site = TRIP_SITE_TAG.match(tag)
+        if site and protected is not None and site.group(1) not in protected:
             doomed.append(tag)
     return sorted(doomed)
 
@@ -1828,6 +1871,25 @@ class ControlPlane:
     # ----------------------------------------------------------- images --
     def image_exists(self, tag: str) -> bool:
         return self.sh.read(["docker", "image", "inspect", tag], timeout=30).returncode == 0
+
+    def trip_site_protected_digests(self) -> set:
+        """The release digests a trip's current or previous release names: the images a trip runs, and the way
+        back it keeps. Raises Refused when they cannot be read, so a caller prunes nothing rather than guessing."""
+        out = self.psql(
+            "SELECT DISTINCT r.artifact_digest FROM control_plane.releases r "
+            "JOIN control_plane.trips t ON r.id IN (t.current_release_id, t.previous_release_id)")
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
+    def build_trip_site_image(self, digest: str, release_tree: Path) -> None:
+        """Build `trip-site:<digest>` from a sealed release tree unless it already exists. The tag is the
+        release's identity, so an existing one is the same code and is left alone."""
+        tag = trip_site_tag(digest)
+        if self.image_exists(tag):
+            self.r.ok(f"{tag} already built")
+            return
+        self.sh.act(trip_site_build_argv(digest, REPO, release_tree), describe=f"build {tag} from {release_tree}",
+                    timeout=3600)
+        self.r.ok(f"built {tag}")
 
     def web_images_wanted(self, full: Optional[str]) -> bool:
         """The portal and gateway images belong to a release only when the profile is on
@@ -3409,7 +3471,13 @@ def cmd_prune(cp: ControlPlane) -> int:
     for row in rows[-IMAGE_KEEP_HISTORY_ROWS:]:
         keep |= {row["from_rev"], row["to_rev"]}
     tags = cp.sh.text(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"]).split()
-    doomed_images = images_to_prune(tags, keep)
+    try:
+        trip_site_protected: Optional[set] = cp.trip_site_protected_digests()
+    except Refused as error:
+        # Not knowing which images a trip's current or previous release names is not "none": prune none of them.
+        trip_site_protected = None
+        r.note(f"trip-site images not pruned: {error}")
+    doomed_images = images_to_prune(tags, keep, trip_site_protected)
     r.ok(f"keeping images for {', '.join(sorted(k for k in keep if k))}; removing {len(doomed_images)} image tag(s)")
     for tag in doomed_images:
         cp.sh.act(["docker", "image", "rm", tag], describe=f"docker image rm {tag}", check=False)
