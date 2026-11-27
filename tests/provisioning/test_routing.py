@@ -9,13 +9,14 @@ meant, and a section that IS present is never skipped on the strength of a label
 from __future__ import annotations
 
 import unittest
+from dataclasses import asdict
 from unittest.mock import Mock, patch
 
 import yaml
 
 from provisioning.__main__ import build_provisioner
 from provisioning.engine import Provisioner
-from provisioning.models import ProvisioningError, load_topology
+from provisioning.models import ProvisioningError, Topology, load_topology
 
 # A topology.yaml as control_plane_worker.compute wrote it before routing was a
 # choice (the shape of real files: header comment, npm before cloudflare, the
@@ -75,6 +76,22 @@ proxmox:
     nfs_mount_path: /nfs/trip_9f2c11aa4d
     forward_port: 8080
     public_hostname: tokyo-2026.example.invalid
+"""
+
+
+VM_CONTAINER_TOPOLOGY_YAML = """\
+version: 1
+name: tokyo-2026
+placement: vm-container
+routing: wildcard
+container:
+  name: trip-tokyo-2026
+  ipv4: 198.51.100.10
+  forward_port: 8080
+  public_hostname: tokyo-2026.example.invalid
+  nfs_host_dir: /srv/trips/trip_9f2c11aa4d
+  nfs_mount_path: /trip
+  image: trip-site:sha256-0123456789ab
 """
 
 
@@ -211,6 +228,124 @@ class WildcardTopology(unittest.TestCase):
                 raw["routing"] = value
                 with self.assertRaisesRegex(ProvisioningError, "routing"):
                     load_topology(raw)
+
+
+class VmContainerTopology(unittest.TestCase):
+    """Spec x-trip-vm-container-placement.md, PR1: the model reads and refuses; nothing builds one."""
+
+    def setUp(self) -> None:
+        self.raw = yaml.safe_load(VM_CONTAINER_TOPOLOGY_YAML)
+        self.topology = load_topology(self.raw)
+
+    def test_it_reads_as_a_vm_container_with_no_proxmox_proxy_or_dns(self) -> None:
+        self.assertEqual("vm-container", self.topology.placement)
+        self.assertEqual("wildcard", self.topology.routing)
+        self.assertIsNone(self.topology.proxy)
+        self.assertIsNone(self.topology.cloudflare)
+        container = self.topology.container
+        self.assertEqual("trip-tokyo-2026", container.name)
+        self.assertEqual("198.51.100.10", container.ipv4)
+        self.assertEqual(8080, container.forward_port)
+        self.assertEqual("/srv/trips/trip_9f2c11aa4d", container.nfs_host_dir)
+        self.assertEqual("/trip", container.nfs_mount_path)
+        self.assertEqual("trip-site:sha256-0123456789ab", container.image)
+        self.assertEqual("tokyo-2026", container.trip_slug, "the topology's own name, never a second key")
+
+    def test_the_public_host_comes_from_the_container_section(self) -> None:
+        self.assertEqual("tokyo-2026.example.invalid", self.topology.public_host)
+        self.assertEqual("https://tokyo-2026.example.invalid", self.topology.container.public_origin)
+
+    def test_every_lxc_only_accessor_fails_closed_naming_the_placement(self) -> None:
+        for read in (lambda t: t.lxc, lambda t: t.lxc.name, lambda t: t.lxc.ipv4, lambda t: t.lxc.nfs_host_dir,
+                     lambda t: asdict(t.lxc)):
+            with self.subTest(read=read), self.assertRaisesRegex(ProvisioningError, "vm-container"):
+                read(self.topology)
+
+    def test_it_still_compares_and_prints(self) -> None:
+        self.assertEqual(self.topology, load_topology(self.raw))
+        self.assertIn("vm-container", repr(self.topology))
+        self.assertEqual(hash(self.topology), hash(load_topology(self.raw)))
+
+    def test_the_engine_refuses_to_plan_it_and_calls_no_adapter(self) -> None:
+        proxmox, npm, cloudflare = _providers()
+        with self.assertRaisesRegex(ProvisioningError, "vm-container"):
+            Provisioner(proxmox, npm, cloudflare).plan(self.topology)
+        for adapter in (proxmox, npm, cloudflare):
+            self.assertEqual([], adapter.method_calls)
+
+    def test_a_section_of_the_other_placement_is_refused_not_half_read(self) -> None:
+        for section, value in (
+            ("proxmox", {"node": "pve", "lxc": {}}), ("npm", {"hostname": "x.example.invalid"}),
+            ("cloudflare", {"tunnel_id": "t"}),
+        ):
+            with self.subTest(section=section):
+                raw = yaml.safe_load(VM_CONTAINER_TOPOLOGY_YAML)
+                raw[section] = value
+                with self.assertRaisesRegex(ProvisioningError, f"{section} is not allowed"):
+                    load_topology(raw)
+        raw = yaml.safe_load(WILDCARD_TOPOLOGY_YAML)
+        raw["container"] = yaml.safe_load(VM_CONTAINER_TOPOLOGY_YAML)["container"]
+        with self.assertRaisesRegex(ProvisioningError, "container"):
+            load_topology(raw)
+
+    def test_it_cannot_be_host_routed_or_leave_routing_to_a_default(self) -> None:
+        # An absent `routing:` reads as `host`, and a host route records no upstream address.
+        for routing in ("host", None, "absent"):
+            with self.subTest(routing=routing):
+                raw = yaml.safe_load(VM_CONTAINER_TOPOLOGY_YAML)
+                if routing == "absent":
+                    del raw["routing"]
+                else:
+                    raw["routing"] = routing
+                with self.assertRaisesRegex(ProvisioningError, "routing"):
+                    load_topology(raw)
+
+    def test_each_container_key_is_required_and_checked(self) -> None:
+        for key in ("name", "ipv4", "forward_port", "public_hostname", "nfs_host_dir", "nfs_mount_path", "image"):
+            with self.subTest(missing=key):
+                raw = yaml.safe_load(VM_CONTAINER_TOPOLOGY_YAML)
+                del raw["container"][key]
+                with self.assertRaisesRegex(ProvisioningError, f"container.{key}"):
+                    load_topology(raw)
+        for key, bad in (("ipv4", "198.51.100.10/24"), ("ipv4", "not-an-address"), ("forward_port", 70000),
+                         ("forward_port", "8080"), ("forward_port", True)):
+            with self.subTest(key=key, bad=bad):
+                raw = yaml.safe_load(VM_CONTAINER_TOPOLOGY_YAML)
+                raw["container"][key] = bad
+                with self.assertRaisesRegex(ProvisioningError, f"container.{key}"):
+                    load_topology(raw)
+
+
+class PlacementValue(unittest.TestCase):
+    """AC-1: no `placement:` means `lxc`, for every reader; an unknown value is refused."""
+
+    def test_a_topology_with_no_placement_is_an_lxc_with_its_lxc_spec(self) -> None:
+        for text in (LEGACY_TOPOLOGY_YAML, WILDCARD_TOPOLOGY_YAML):
+            with self.subTest(routing=yaml.safe_load(text).get("routing", "host")):
+                topology = load_topology(yaml.safe_load(text))
+                self.assertEqual("lxc", topology.placement)
+                self.assertIsNone(topology.container)
+                self.assertEqual("trip-tokyo-2026", topology.lxc.name)
+                self.assertEqual("tokyo-2026.example.invalid", topology.public_host)
+
+    def test_an_explicit_lxc_is_the_same_topology(self) -> None:
+        raw = yaml.safe_load(LEGACY_TOPOLOGY_YAML)
+        explicit = dict(raw, placement="lxc")
+        self.assertEqual(load_topology(raw), load_topology(explicit))
+
+    def test_an_unknown_placement_is_refused(self) -> None:
+        for value in ("docker", "VM-CONTAINER", "vm_container", "", None, 1, ["lxc"]):
+            with self.subTest(value=value):
+                raw = yaml.safe_load(LEGACY_TOPOLOGY_YAML)
+                raw["placement"] = value
+                with self.assertRaisesRegex(ProvisioningError, "placement"):
+                    load_topology(raw)
+
+    def test_an_lxc_topology_built_in_code_still_takes_its_old_keywords(self) -> None:
+        lxc = load_topology(yaml.safe_load(LEGACY_TOPOLOGY_YAML)).lxc
+        built = Topology(version=1, name="tokyo-2026", lxc=lxc, proxy=None, cloudflare=None, routing="wildcard")
+        self.assertEqual("lxc", built.placement)
+        self.assertIs(lxc, built.lxc)
 
 
 class CommandLineProvisioner(unittest.TestCase):

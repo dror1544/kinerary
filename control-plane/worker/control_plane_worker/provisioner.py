@@ -139,17 +139,32 @@ class TripRoute:
     routing: str = "host"
 
 
+def _placement_of(raw: Mapping[str, Any]) -> str | None:
+    """The topology's placement: `lxc` when the file says nothing, None when it
+    says something this code does not know (nothing is guessed from it)."""
+    placement = raw.get("placement", "lxc")
+    return placement if placement in ("lxc", "vm-container") else None
+
+
 def topology_public_hostname(raw: Any) -> str | None:
     """The trip's own public hostname from a parsed topology.yaml, or None.
 
+    `container.public_hostname` for a `vm-container` trip; for an LXC trip
     `proxmox.lxc.public_hostname` when the topology has no proxy host (wildcard
-    routing), otherwise `npm.hostname`, as every older file records it. An
+    routing), otherwise `npm.hostname`, as every older file records it. A
+    placement picks its own section and never falls back to the other's. An
     unresolved `${VAR}` placeholder is not a hostname."""
     if not isinstance(raw, Mapping):
         return None
-    lxc = (raw.get("proxmox") or {}).get("lxc") if isinstance(raw.get("proxmox"), Mapping) else None
-    npm = raw.get("npm")
-    for source, key in ((lxc, "public_hostname"), (npm, "hostname")):
+    placement = _placement_of(raw)
+    if placement is None:
+        return None
+    if placement == "vm-container":
+        sources = [(raw.get("container"), "public_hostname")]
+    else:
+        lxc = (raw.get("proxmox") or {}).get("lxc") if isinstance(raw.get("proxmox"), Mapping) else None
+        sources = [(lxc, "public_hostname"), (raw.get("npm"), "hostname")]
+    for source, key in sources:
         if isinstance(source, Mapping):
             value = source.get(key)
             if isinstance(value, str) and value.strip() and not value.strip().startswith("$"):
@@ -160,28 +175,40 @@ def topology_public_hostname(raw: Any) -> str | None:
 def topology_route(raw: Any) -> TripRoute | None:
     """The route a parsed topology.yaml describes, or None when it does not
     describe one (a hand-written topology with no usable address or port, a
-    DHCP container, an unresolved placeholder). Nothing is guessed: every part
-    is checked, and a part that fails makes the whole answer None."""
+    DHCP container, an unresolved placeholder, a placement this code does not
+    know). Nothing is guessed: every part is checked, and a part that fails
+    makes the whole answer None.
+
+    A `vm-container` trip reads its address and port from `container:` and is
+    always routed `wildcard`: the gateway is the only way to it, so a file
+    that says otherwise describes no route."""
     hostname = topology_public_hostname(raw)
     if hostname is None:
         return None
     hostname = hostname.lower()
     if not _PUBLIC_HOST.fullmatch(hostname):
         return None
-    proxmox = raw.get("proxmox") if isinstance(raw.get("proxmox"), Mapping) else {}
-    lxc = proxmox.get("lxc") if isinstance(proxmox.get("lxc"), Mapping) else {}
-    npm = raw.get("npm") if isinstance(raw.get("npm"), Mapping) else {}
-    ipv4 = lxc.get("ipv4")
+    vm_container = raw.get("placement") == "vm-container"
+    if vm_container:
+        site = raw.get("container") if isinstance(raw.get("container"), Mapping) else {}
+        npm: Mapping[str, Any] = {}
+    else:
+        proxmox = raw.get("proxmox") if isinstance(raw.get("proxmox"), Mapping) else {}
+        site = proxmox.get("lxc") if isinstance(proxmox.get("lxc"), Mapping) else {}
+        npm = raw.get("npm") if isinstance(raw.get("npm"), Mapping) else {}
+    ipv4 = site.get("ipv4")
     if not isinstance(ipv4, str):
         return None
     try:
         address = ipaddress.IPv4Address(ipv4.split("/", 1)[0].strip())
     except ValueError:
         return None
-    port = lxc.get("forward_port", npm.get("forward_port"))
+    port = site.get("forward_port", npm.get("forward_port"))
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         return None
     routing = raw.get("routing", "host")
+    if vm_container and routing != "wildcard":
+        return None
     return TripRoute(
         public_host=hostname, upstream_url=f"http://{address}:{port}",
         routing=routing if routing in ("host", "wildcard") else "host",
@@ -749,7 +776,9 @@ class ShellDeployAdapter:
         trip_dir = os.path.join(self._deploy_root, "trips", slug)
         raw = self._load_topology_dict(trip_dir)
         route = topology_route(raw) if raw is not None else None
-        wildcard = isinstance(raw, dict) and raw.get("routing") == "wildcard"
+        # A vm-container trip is reachable only through the gateway, whatever its `routing:` line says.
+        wildcard = isinstance(raw, dict) and (
+            raw.get("routing") == "wildcard" or raw.get("placement") == "vm-container")
         if route is None and wildcard:
             raise ValueError(
                 f"{slug}'s topology.yaml is wildcard-routed but gives no usable hostname, "

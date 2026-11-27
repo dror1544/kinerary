@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import os
 import re
 from typing import Any, Mapping
@@ -85,23 +86,107 @@ ROUTING_WILDCARD = "wildcard"
 ROUTINGS = (ROUTING_HOST, ROUTING_WILDCARD)
 
 
+#: Where a trip's site runs.
+#:   lxc            one privileged Proxmox LXC per trip (every trip built before
+#:                  placement was a choice).
+#:   vm-container   one Docker container on the control-plane host. Described by
+#:                  a `container:` section instead of `proxmox:`; it needs the
+#:                  runtime gateway (routing `wildcard`) and carries no proxy
+#:                  host, DNS record or Proxmox call.
+PLACEMENT_LXC = "lxc"
+PLACEMENT_VM_CONTAINER = "vm-container"
+PLACEMENTS = (PLACEMENT_LXC, PLACEMENT_VM_CONTAINER)
+
+
 @dataclass(frozen=True)
+class ContainerSpec:
+    """A `vm-container` trip's site. Its key names are the LXC ones on purpose
+    (`ipv4`, `forward_port`, `public_hostname`, `nfs_host_dir`, `nfs_mount_path`):
+    the worker's line scanners read `ipv4:` and `nfs_host_dir:` out of a
+    topology.yaml without parsing it, and must keep working on either placement."""
+
+    name: str
+    ipv4: str
+    forward_port: int
+    public_hostname: str
+    nfs_host_dir: str
+    nfs_mount_path: str
+    # The tag the container runs, `trip-site:<release digest>`.
+    image: str
+    # As on LxcSpec: the topology's own top-level `name`, and an origin computed
+    # from the hostname, never a YAML key of their own.
+    trip_slug: str = ""
+    public_origin: str = ""
+
+
+@dataclass(frozen=True, init=False)
 class Topology:
+    """A trip's validated topology.
+
+    `lxc` is the LXC placement's spec and ONLY that: on a `vm-container`
+    topology it raises, naming the placement, instead of handing back an
+    absent spec that the next attribute read would turn into an
+    `AttributeError` on None - or, worse, a half-built container request.
+    Every caller that reaches for `.lxc` is an LXC-only path and fails closed
+    here; a path that must work for both placements reads `placement`,
+    `container` and `public_host`. The constructor keeps its old keyword
+    names (`lxc=`), so the callers that build an LXC topology are unchanged."""
+
     version: int
     name: str
-    lxc: LxcSpec
+    _lxc: LxcSpec | None
     # Absent (None) only in a `wildcard` topology: there is no proxy host and no
     # DNS record to plan, inspect or tear down. A `host` topology always has both.
     proxy: ProxySpec | None
     cloudflare: CloudflareSpec | None
     # Absent from every file written before routing was a choice, which means
     # `host` - not "unknown".
-    routing: str = ROUTING_HOST
+    routing: str
+    # Absent from every file written before placement was a choice, which means
+    # `lxc` - not "unknown".
+    placement: str
+    container: ContainerSpec | None
+
+    def __init__(
+        self,
+        version: int,
+        name: str,
+        lxc: LxcSpec | None,
+        proxy: ProxySpec | None,
+        cloudflare: CloudflareSpec | None,
+        routing: str = ROUTING_HOST,
+        placement: str = PLACEMENT_LXC,
+        container: ContainerSpec | None = None,
+    ) -> None:
+        if placement not in PLACEMENTS:
+            raise ProvisioningError(f"placement must be one of {', '.join(PLACEMENTS)}")
+        if placement == PLACEMENT_LXC:
+            if lxc is None or container is not None:
+                raise ProvisioningError("an lxc topology needs an lxc spec and no container spec")
+        else:
+            if container is None or lxc is not None or proxy is not None or cloudflare is not None:
+                raise ProvisioningError(
+                    "a vm-container topology needs a container spec and no lxc, proxy or cloudflare spec")
+            if routing != ROUTING_WILDCARD:
+                raise ProvisioningError("placement vm-container requires routing wildcard")
+        for field_name, value in (
+            ("version", version), ("name", name), ("_lxc", lxc), ("proxy", proxy), ("cloudflare", cloudflare),
+            ("routing", routing), ("placement", placement), ("container", container),
+        ):
+            object.__setattr__(self, field_name, value)
+
+    @property
+    def lxc(self) -> LxcSpec:
+        if self.placement != PLACEMENT_LXC or self._lxc is None:
+            raise ProvisioningError(
+                f"topology {self.name!r} has placement {self.placement}: it has no proxmox.lxc, "
+                "and this operation is for LXC trips only")
+        return self._lxc
 
     @property
     def public_host(self) -> str:
         """The trip's public hostname, taken from the topology's own origin."""
-        origin = self.lxc.public_origin
+        origin = self.container.public_origin if self.placement == PLACEMENT_VM_CONTAINER else self.lxc.public_origin
         return origin[len("https://"):] if origin.startswith("https://") else ""
 
 
@@ -151,6 +236,50 @@ def _optional_mapping(data: Mapping[str, Any], key: str, context: str) -> Mappin
     return _mapping(data, key, context)
 
 
+def _load_vm_container_topology(raw: Mapping[str, Any], name: str, routing: str) -> Topology:
+    """A `placement: vm-container` file: a `container:` section, no `proxmox:`.
+
+    Refused rather than half-read: `proxmox`, `npm` or `cloudflare` present (a
+    file of two placements has no single truth), and any `routing` but
+    `wildcard` - an absent line would read as `host`, and a host-routed trip
+    records no upstream address, so the gateway could not reach it."""
+    for section in ("proxmox", "npm", "cloudflare"):
+        if section in raw:
+            raise ProvisioningError(f"topology.{section} is not allowed with placement vm-container")
+    if routing != ROUTING_WILDCARD:
+        raise ProvisioningError("placement vm-container requires routing: wildcard")
+    container = _mapping(raw, "container", "topology")
+    ipv4 = _nonempty_string(container, "ipv4", "container")
+    try:
+        ipaddress.IPv4Address(ipv4)
+    except ValueError:
+        raise ProvisioningError("container.ipv4 must be a plain IPv4 address") from None
+    port = _positive_int(container, "forward_port", "container")
+    if port > 65535:
+        raise ProvisioningError("container.forward_port must be a port number")
+    hostname = _nonempty_string(container, "public_hostname", "container")
+    return Topology(
+        version=1,
+        name=name,
+        lxc=None,
+        proxy=None,
+        cloudflare=None,
+        routing=routing,
+        placement=PLACEMENT_VM_CONTAINER,
+        container=ContainerSpec(
+            name=_nonempty_string(container, "name", "container"),
+            ipv4=ipv4,
+            forward_port=port,
+            public_hostname=hostname,
+            nfs_host_dir=_nonempty_string(container, "nfs_host_dir", "container"),
+            nfs_mount_path=_nonempty_string(container, "nfs_mount_path", "container"),
+            image=_nonempty_string(container, "image", "container"),
+            trip_slug=name,
+            public_origin=f"https://{hostname}",
+        ),
+    )
+
+
 def load_topology(raw: Mapping[str, Any]) -> Topology:
     """Convert parsed YAML into a validated topology without accepting secrets."""
     if not isinstance(raw, Mapping):
@@ -163,6 +292,16 @@ def load_topology(raw: Mapping[str, Any]) -> Topology:
     routing = raw["routing"] if "routing" in raw else ROUTING_HOST
     if routing not in ROUTINGS:
         raise ProvisioningError(f"routing must be one of {', '.join(ROUTINGS)}")
+    # Absent means `lxc`; present and unknown is refused for the same reason.
+    placement = raw["placement"] if "placement" in raw else PLACEMENT_LXC
+    if placement not in PLACEMENTS:
+        raise ProvisioningError(f"placement must be one of {', '.join(PLACEMENTS)}")
+    if placement == PLACEMENT_VM_CONTAINER:
+        return _load_vm_container_topology(raw, name, routing)
+    # The placement picks the section, with no fallback to the other one: an
+    # lxc file that also carries `container:` is half of a vm-container file.
+    if "container" in raw:
+        raise ProvisioningError("topology.container is only for placement vm-container")
     proxmox = _mapping(raw, "proxmox", "topology")
     lxc = _mapping(proxmox, "lxc", "proxmox")
     if routing == ROUTING_HOST:
@@ -193,6 +332,7 @@ def load_topology(raw: Mapping[str, Any]) -> Topology:
         version=1,
         name=name,
         routing=routing,
+        placement=PLACEMENT_LXC,
         lxc=LxcSpec(
             name=_nonempty_string(lxc, "name", "proxmox.lxc"),
             node=_nonempty_string(proxmox, "node", "proxmox"),

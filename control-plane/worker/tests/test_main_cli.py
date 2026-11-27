@@ -53,6 +53,28 @@ class ProvisionDefaultsTests(unittest.TestCase):
         self.assertEqual(args.companion_templates_dir, "/somewhere/else")
 
 
+class TripPlacementArgumentTests(unittest.TestCase):
+    """`--trip-placement` / TRIP_PLACEMENT sit beside `--trip-routing` / TRIP_ROUTING."""
+
+    def test_it_defaults_to_lxc(self) -> None:
+        self.assertEqual("lxc", _parse(["provision"], {"TRIP_PLACEMENT": ""}).trip_placement)
+
+    def test_the_environment_and_the_flag_both_set_it_and_the_flag_wins(self) -> None:
+        self.assertEqual("vm-container", _parse(["provision"], {"TRIP_PLACEMENT": "vm-container"}).trip_placement)
+        args = _parse(["provision", "--trip-placement", "lxc"], {"TRIP_PLACEMENT": "vm-container"})
+        self.assertEqual("lxc", args.trip_placement)
+
+    def test_an_unknown_flag_value_exits_non_zero_naming_the_variable(self) -> None:
+        with mock.patch("sys.stderr") as err, self.assertRaises(SystemExit) as raised:
+            _parse(["provision", "--trip-placement", "docker"], {"TRIP_PLACEMENT": ""})
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("TRIP_PLACEMENT", "".join(call.args[0] for call in err.write.call_args_list))
+
+    def test_the_other_commands_do_not_take_it(self) -> None:
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            _parse(["check-database", "--trip-placement", "lxc"])
+
+
 class BridgeProbeIntervalTests(unittest.TestCase):
     """Issue #119: the idle-loop bridge probe is ON by default (every 30
     minutes, so two consecutive failures are found within about an hour), and

@@ -122,6 +122,8 @@ def _choice_of(name: str, allowed: tuple[str, ...]) -> Callable[[str], str]:
 
 
 TRIP_ROUTINGS = ("host", "wildcard")
+# Where a NEW trip's site runs. `lxc` first: `_choice_of` reads an empty value as the first member.
+TRIP_PLACEMENTS = ("lxc", "vm-container")
 TRIP_MCP_BRIDGES = ("per_trip", "shared")
 
 # TRIP_MCP_SHARED_SITE_URL: where a TRIP CONTAINER reaches the shared bridge. A plain http(s) origin and
@@ -163,6 +165,15 @@ def _refuse_unsafe_key_and_bridge_settings(args: argparse.Namespace) -> None:
             "\"Rolling it out\")"
         )
     shared = args.trip_mcp_bridge == "shared"
+    if args.trip_placement == "vm-container":
+        # Both settings are named at once: an operator who fixed the first and restarted would otherwise
+        # be told about the second only now.
+        missing = [text for ok, text in (
+            (args.trip_routing == "wildcard", f"TRIP_ROUTING=wildcard (now {args.trip_routing})"),
+            (shared, f"TRIP_MCP_BRIDGE=shared (now {args.trip_mcp_bridge})"),
+        ) if not ok]
+        if missing:
+            raise ValueError(f"TRIP_PLACEMENT=vm-container requires {' and '.join(missing)}")
     if shared and not args.trip_mcp_shared_site_url:
         raise ValueError(
             "TRIP_MCP_SHARED_SITE_URL is required with TRIP_MCP_BRIDGE=shared: the address trip containers "
@@ -170,6 +181,14 @@ def _refuse_unsafe_key_and_bridge_settings(args: argparse.Namespace) -> None:
         )
     if args.trip_mcp_shared_site_url and not shared:
         raise ValueError("TRIP_MCP_SHARED_SITE_URL is set but TRIP_MCP_BRIDGE is not shared; unset one of them")
+    if args.trip_placement == "vm-container":
+        # Placement is modelled and its combinations are checked, but nothing builds a vm-container trip
+        # yet; starting would let the operator believe new trips were being placed there. The
+        # worker-adapters change lifts this.
+        raise ValueError(
+            "TRIP_PLACEMENT=vm-container is not available yet: the model is in place but this worker cannot "
+            "build such a trip; unset TRIP_PLACEMENT (or set it to lxc)"
+        )
 
 
 def _add_companion_ssh_arguments(parser: argparse.ArgumentParser) -> None:
@@ -289,6 +308,14 @@ def build_parser() -> argparse.ArgumentParser:
     # address in runtime_routes. Trips that already have a topology.yaml keep
     # what it says whichever this is. Compose passes `${TRIP_ROUTING:-}`, so an
     # unset variable arrives as "" and means `host`.
+    # Where a NEW trip's site runs. `lxc` (default): one Proxmox LXC per trip, as always. `vm-container`:
+    # one Docker container on the control-plane host; it needs TRIP_ROUTING=wildcard and
+    # TRIP_MCP_BRIDGE=shared, and is refused as "not available yet" for now. A trip's own topology.yaml
+    # records its placement and always wins. Compose passes `${TRIP_PLACEMENT:-}`, so an unset variable
+    # arrives as "" and means `lxc`.
+    provision.add_argument("--trip-placement", type=_choice_of("TRIP_PLACEMENT", TRIP_PLACEMENTS),
+                           default=os.environ.get("TRIP_PLACEMENT") or "lxc",
+                           help="lxc (default) | vm-container — see above (TRIP_PLACEMENT)")
     provision.add_argument("--trip-routing", type=_choice_of("TRIP_ROUTING", TRIP_ROUTINGS),
                            default=os.environ.get("TRIP_ROUTING") or "host",
                            help="host (default) | wildcard — see above (TRIP_ROUTING)")
@@ -436,7 +463,8 @@ def main(argv: list[str] | None = None) -> int:
             # variable and neither shows in a conversation: `wildcard` means a
             # new trip gets no DNS record or proxy host, `shared` means the
             # trip-mcp bridge is not this worker's to start.
-            print(f"trip routing: {args.trip_routing}; trip-mcp bridge: {args.trip_mcp_bridge}", flush=True)
+            print(f"trip routing: {args.trip_routing}; trip-mcp bridge: {args.trip_mcp_bridge}; "
+                  f"trip placement: {args.trip_placement}", flush=True)
             # Off by default: an unconfigured deployment keeps the pre-Phase-G
             # behavior exactly (a slug missing from --vmid-map fails loudly
             # instead of a real LXC/NPM/Cloudflare create happening).
