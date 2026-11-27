@@ -89,6 +89,7 @@ import {
   issueGroupBindingToken,
   redeemGroupBindingToken,
 } from "../group-binding.js";
+import { recordTelegramGroupTitle, redeemTelegramGroupCode, telegramGroupCodeFromStartPayload } from "../telegram-group-codes.js";
 import { structuredLog } from "../redaction.js";
 import {
   attachMedia,
@@ -645,6 +646,27 @@ async function unboundDmTripList(
   return { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined };
 }
 
+/** The title last written per group, so a chat that talks does not cost a statement per message. Bounded; a restart just writes again. */
+const writtenGroupTitles = new Map<string, string>();
+const WRITTEN_TITLES_MAX = 2000;
+
+/**
+ * Writes a Telegram group's title to its open binding (`recordTelegramGroupTitle`), unless this process already wrote that title for
+ * that chat. A failure (the column missing on an old schema, a database blip) is logged and never thrown: the title is a label on
+ * the dashboard's list, and no message or binding waits on it. `force` skips the memory (a fresh bind always writes).
+ */
+async function refreshGroupTitle(db: pg.Pool, chatId: string, title: unknown, log: (line: string) => void, force: boolean): Promise<void> {
+  if (typeof title !== "string" || title.trim() === "" || !chatId.startsWith("-")) return;
+  if (!force && writtenGroupTitles.get(chatId) === title) return;
+  try {
+    await recordTelegramGroupTitle(db, chatId, title);
+    if (writtenGroupTitles.size >= WRITTEN_TITLES_MAX) writtenGroupTitles.clear();
+    writtenGroupTitles.set(chatId, title);
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.group_title_not_recorded", { sqlstate: (error as { code?: unknown } | null)?.code ?? null }));
+  }
+}
+
 /** The chat an update came from, whatever its kind; null when it names none. */
 function chatIdOfUpdate(update: TelegramUpdate): string | null {
   const u = update as {
@@ -761,6 +783,12 @@ export async function dispatchUpdate(
   const groupStartToken = parsed.kind === "start" && message.chat?.type !== "private"
     ? groupBindingTokenFromStartPayload(parsed.payload)
     : null;
+  // The dashboard's version of the same link (#690): `?startgroup=<code>` where the code is a Telegram group code the owner's
+  // dashboard minted (`KWA-`, telegram-group-codes.ts). Claimed in the same place and on the same terms: a non-private chat, a
+  // payload that is EXACTLY a code. It is redeemed below through the same binding body as a `KIN-` token.
+  const groupStartCode = parsed.kind === "start" && message.chat?.type !== "private"
+    ? telegramGroupCodeFromStartPayload(parsed.payload)
+    : null;
 
   // The dashboard's "Link Telegram" deep link. Claimed before the enrollment
   // path because the payload shape (lk_ + 32 characters) is not an enrollment
@@ -836,7 +864,7 @@ export async function dispatchUpdate(
     return joinedReplies.length > 1 ? { kind: "multi_reply", replies: joinedReplies } : { kind: "reply", reply: joinedReplies[0]! };
   }
 
-  if (parsed.kind === "start" && !groupStartToken) {
+  if (parsed.kind === "start" && !groupStartToken && !groupStartCode) {
     const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code, telegramDisplayName(message.from), options.modelRunner);
     switch (outcome.kind) {
       case "started": {
@@ -984,10 +1012,12 @@ export async function dispatchUpdate(
   const postedToken = message.chat?.type !== "private"
     ? groupStartToken ?? extractGroupBindingToken(text)
     : null;
-  if (postedToken) {
+  if (postedToken || groupStartCode) {
     const senderId = message.from?.id === undefined ? null : String(message.from.id);
     const redeemed = senderId
-      ? await redeemGroupBindingToken(db, postedToken, chatId, senderId)
+      ? (groupStartCode
+        ? await redeemTelegramGroupCode(db, groupStartCode, chatId, senderId)
+        : await redeemGroupBindingToken(db, postedToken!, chatId, senderId))
       : ({ ok: false, reason: "WRONG_SENDER" } as const);
     if (!redeemed.ok) {
       log(structuredLog("info", "trip_bot.group_binding_refused", { reason: redeemed.reason }));
@@ -1003,7 +1033,9 @@ export async function dispatchUpdate(
       // whoever is guessing, in a room the organizer does not control.
       return { kind: "reply", reply: { chatId, text: strings.groupTokenRefused } };
     }
-    log(structuredLog("info", "trip_bot.group_bound", { rebound: redeemed.rebound }));
+    log(structuredLog("info", "trip_bot.group_bound", { rebound: redeemed.rebound, via: groupStartCode ? "dashboard_code" : "token" }));
+    // The group's name for the dashboard's list: a statement of its own, so a database without the column still binds (spec 690, D4).
+    await refreshGroupTitle(db, chatId, message.chat?.title, log, true);
     if (redeemed.movedFromTripId) {
       // In-memory, chat-keyed state belongs to the trip the group WAS: forget it, so the old
       // trip's overheard messages and held documents never reach the new trip's companion.
@@ -1390,6 +1422,10 @@ export async function dispatchUpdate(
       return { kind: "reply", reply: { chatId, text: uiString("notMyCommand", language) } };
     }
   }
+
+  // A bound group's title for the dashboard's list (#690): change-only and remembered per process, so a group bound before titles
+  // were kept gains its name at its next message, and a rename follows. Never in the way of the message.
+  if (message.chat?.type !== "private") await refreshGroupTitle(db, chatId, message.chat?.title, log, false);
 
   const outcome = await normalizeUpdate(db, update, options.canReachProfile);
   if (outcome.kind === "event") {

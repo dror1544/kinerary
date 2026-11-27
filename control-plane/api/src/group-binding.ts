@@ -338,42 +338,12 @@ export async function redeemGroupBindingToken(
       return { ok: false, reason: "TRIP_RETIRED" };
     }
 
-    // FOR UPDATE: the binding row is the second lock in the order described above, and what
-    // makes two redemptions (or a redemption and a teardown) of one chat take turns.
-    const readOpenBinding = async () => (await client.query<{ id: string; trip_id: string }>(
-      `SELECT id, trip_id FROM control_plane.telegram_chat_bindings
-        WHERE chat_id = $1 AND closed_at IS NULL
-        FOR UPDATE`,
-      [chatId],
-    )).rows[0];
-    let bound = await readOpenBinding();
-    // A redemption that waited on that row lock while a MOVE (or a re-bind) committed does not
-    // see the binding the winner just opened: the locked row no longer matches and a statement
-    // never sees rows inserted after it began. Read again - a fresh statement, a fresh view -
-    // so a group that is no longer free goes down the bound-elsewhere path below, authorization
-    // included, instead of being "bound" over the top of somebody else's move.
-    bound ??= await readOpenBinding();
-    let movedFromTripId: string | undefined;
-    if (bound && bound.trip_id !== row.trip_id) {
-      if (!(await senderMayMoveGroup(client, bound.trip_id, row.trip_id, senderTelegramUserId))) {
-        await client.query("ROLLBACK");
-        return { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" };
-      }
-      await client.query(
-        `UPDATE control_plane.telegram_chat_bindings
-            SET closed_at = now(), closed_reason = $2
-          WHERE id = $1`,
-        [bound.id, GROUP_MOVED_CLOSED_REASON],
-      );
-      await openBinding(client, chatId, row.trip_id);
-      movedFromTripId = bound.trip_id;
-    } else if (!bound) {
-      // The trip may have no companion installed yet (migration 0043): `openBinding` binds it
-      // anyway with a NULL profile. Routing and the assistant behind it are separate
-      // components, separately retryable, and a bound chat with no profile answers
-      // COMPANION_PENDING rather than "I don't have a trip for this chat".
-      await openBinding(client, chatId, row.trip_id);
+    const bound = await bindGroupToTrip(client, { chatId, tripId: row.trip_id, senderTelegramUserId });
+    if (!bound.ok) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: bound.reason };
     }
+
 
     // The token is NOT consumed here, on purpose. Owner decision 2026-10-16:
     // one trip may bind several groups; the token stays reusable until
@@ -389,8 +359,8 @@ export async function redeemGroupBindingToken(
     return {
       ok: true,
       tripId: row.trip_id,
-      rebound: Boolean(bound) && movedFromTripId === undefined,
-      ...(movedFromTripId !== undefined ? { movedFromTripId } : {}),
+      rebound: bound.rebound,
+      ...(bound.movedFromTripId !== undefined ? { movedFromTripId: bound.movedFromTripId } : {}),
     };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
@@ -405,7 +375,60 @@ export async function redeemGroupBindingToken(
   }
 }
 
-function isActiveChatBindingConflict(error: unknown): boolean {
+/**
+ * What binding a group to a trip comes to, inside the caller's open transaction: the one body every redeemer shares
+ * (`redeemGroupBindingToken` for a `KIN-` token, `redeemTelegramGroupCode` for the dashboard's code), so the rules for a
+ * free group, a group of this trip and a group of another trip are written once.
+ *
+ * The caller has proved its token or code and holds that row's lock (the first lock of the order in
+ * `redeemGroupBindingToken`'s docstring); this takes the group's open binding FOR UPDATE (the second) and reaches `trips`
+ * last, through the INSERT's foreign key. It writes, and never commits or rolls back: on `ok: false` it wrote nothing and
+ * the caller rolls back. `bindingId` is the open binding the group now has (the existing one, for a re-bind).
+ */
+export async function bindGroupToTrip(
+  client: pg.PoolClient,
+  input: { chatId: string; tripId: string; senderTelegramUserId: string },
+): Promise<
+  | { ok: true; rebound: boolean; movedFromTripId?: string; bindingId: string }
+  | { ok: false; reason: "GROUP_MOVE_NOT_ORGANIZER" }
+> {
+  const { chatId, tripId, senderTelegramUserId } = input;
+  // FOR UPDATE: the binding row is the second lock in the order described above, and what
+  // makes two redemptions (or a redemption and a teardown) of one chat take turns.
+  const readOpenBinding = async () => (await client.query<{ id: string; trip_id: string }>(
+    `SELECT id, trip_id FROM control_plane.telegram_chat_bindings
+      WHERE chat_id = $1 AND closed_at IS NULL
+      FOR UPDATE`,
+    [chatId],
+  )).rows[0];
+  let bound = await readOpenBinding();
+  // A redemption that waited on that row lock while a MOVE (or a re-bind) committed does not
+  // see the binding the winner just opened: the locked row no longer matches and a statement
+  // never sees rows inserted after it began. Read again - a fresh statement, a fresh view -
+  // so a group that is no longer free goes down the bound-elsewhere path below, authorization
+  // included, instead of being "bound" over the top of somebody else's move.
+  bound ??= await readOpenBinding();
+  if (bound && bound.trip_id !== tripId) {
+    if (!(await senderMayMoveGroup(client, bound.trip_id, tripId, senderTelegramUserId))) {
+      return { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" };
+    }
+    await client.query(
+      `UPDATE control_plane.telegram_chat_bindings
+          SET closed_at = now(), closed_reason = $2
+        WHERE id = $1`,
+      [bound.id, GROUP_MOVED_CLOSED_REASON],
+    );
+    return { ok: true, rebound: false, movedFromTripId: bound.trip_id, bindingId: await openBinding(client, chatId, tripId) };
+  }
+  if (bound) return { ok: true, rebound: true, bindingId: bound.id };
+  // The trip may have no companion installed yet (migration 0043): `openBinding` binds it
+  // anyway with a NULL profile. Routing and the assistant behind it are separate
+  // components, separately retryable, and a bound chat with no profile answers
+  // COMPANION_PENDING rather than "I don't have a trip for this chat".
+  return { ok: true, rebound: false, bindingId: await openBinding(client, chatId, tripId) };
+}
+
+export function isActiveChatBindingConflict(error: unknown): boolean {
   const e = error as { code?: string; constraint?: string } | null;
   return e?.code === "23505" && e.constraint === "telegram_chat_bindings_active_chat_idx";
 }

@@ -148,16 +148,22 @@ export type IssueResult =
  * member, not the owner where the owner is required, not a trip, retired, the switch off. The kind is checked only
  * after that, so a caller who is not entitled learns nothing from a malformed request.
  *
- * Earlier codes stay valid. At most ten are live per trip: the oldest are expired to make room, BEFORE the insert.
+ * Earlier codes stay valid. At most ten are live per trip AND PLATFORM (a Telegram group code never expires a WhatsApp one, #690):
+ * the oldest are expired to make room, BEFORE the insert.
  */
 export async function issueChatBindingCode(
   db: pg.Pool,
-  input: { tripId: string; userId: string; kind: unknown; ttlSeconds?: number; log?: (line: string) => void },
+  input: { tripId: string; userId: string; kind: unknown; ttlSeconds?: number; log?: (line: string) => void; platform?: "whatsapp" | "telegram" },
 ): Promise<IssueResult> {
+  const platform = input.platform ?? "whatsapp";
   const entitlement = await tripEntitlement(db, input.tripId, input.userId);
   if (!entitlement.member) return { ok: false, reason: "NOT_FOUND" };
-  if (!(await featureEnabled(db, input.tripId, WHATSAPP_SWITCH, input.log))) return { ok: false, reason: "NOT_FOUND" };
+  // The WhatsApp switch gates WhatsApp codes only. A Telegram group code (#690) is the owner's second door onto what `/group` already
+  // does, and answers to no switch (spec 690, D5); it is the owner's alone and has no `me` kind (a person links their own Telegram
+  // by the Telegram link route).
+  if (platform === "whatsapp" && !(await featureEnabled(db, input.tripId, WHATSAPP_SWITCH, input.log))) return { ok: false, reason: "NOT_FOUND" };
   if (input.kind !== "me" && input.kind !== "group") return { ok: false, reason: "INVALID_KIND" };
+  if (platform === "telegram" && input.kind !== "group") return { ok: false, reason: "INVALID_KIND" };
   if (input.kind === "group" && !entitlement.owner) return { ok: false, reason: "NOT_FOUND" };
 
   const kind = input.kind;
@@ -173,9 +179,9 @@ export async function issueChatBindingCode(
       // The trip's live codes, locked in a stable order.
       const live = await client.query<{ id: string }>(
         `SELECT id FROM control_plane.chat_binding_codes
-          WHERE trip_id = $1 AND state = 'issued' AND expires_at > now()
+          WHERE trip_id = $1 AND platform = $2 AND state = 'issued' AND expires_at > now()
           ORDER BY created_at, id FOR UPDATE`,
-        [input.tripId],
+        [input.tripId, platform],
       );
       const surplus = live.rows.length - (MAX_LIVE_CODES_PER_TRIP - 1);
       if (surplus > 0) {
@@ -187,8 +193,8 @@ export async function issueChatBindingCode(
       const expiresAt = new Date(Date.now() + ttl * 1000);
       await client.query(
         `INSERT INTO control_plane.chat_binding_codes (id, trip_id, platform, kind, issued_by_user_id, code_digest, expires_at)
-         VALUES ($1, $2, 'whatsapp', $3, $4, $5, $6)`,
-        [opaque("cbc"), input.tripId, kind, input.userId, chatBindingCodeDigest(code), expiresAt],
+         VALUES ($1, $2, $7, $3, $4, $5, $6)`,
+        [opaque("cbc"), input.tripId, kind, input.userId, chatBindingCodeDigest(code), expiresAt, platform],
       );
       await client.query("COMMIT");
       return { ok: true, code, kind, expiresAt };

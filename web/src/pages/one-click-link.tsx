@@ -63,11 +63,11 @@ export type OneClickState =
   | { state: "failed"; message: string; held: boolean; retry: () => void };
 
 /**
- * `limiter` names the server's limiter that counts the mint (one per route: Telegram links, WhatsApp codes of either kind); `service` and `id`
+ * `limiter` names the server's limiter that counts the mint (one per route: Telegram links, Telegram group links, WhatsApp codes of either kind); `service` and `id`
  * name this one code in the cache (which service and kind, which trip). `enabled` is
  * "the action is on screen": false asks for nothing and keeps nothing running.
  */
-export function useOneClickLink(input: { limiter: "telegram" | "whatsapp"; service: string; id: readonly string[]; enabled: boolean; mint: () => Promise<LinkOffer> }): OneClickState {
+export function useOneClickLink(input: { limiter: "telegram" | "telegram-group" | "whatsapp"; service: string; id: readonly string[]; enabled: boolean; mint: () => Promise<LinkOffer> }): OneClickState {
   const queryClient = useQueryClient();
   const queryKey = ["one-click-link", input.service, ...input.id];
   const manual = useRef(false);

@@ -128,6 +128,11 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/trips/:id/whatsapp-codes": "account",
   "GET /v1/trips/:id/whatsapp-connections": "account",
   "DELETE /v1/trips/:id/whatsapp-connections/:bindingId": "account",
+  // Telegram groups from the dashboard (#690, spec 690): a group link MINTS a way to bind a group to the trip, and the list and
+  // Unlink are the owner's: a password or Google sign-in only.
+  "POST /v1/trips/:id/telegram-group-link": "account",
+  "GET /v1/trips/:id/telegram-groups": "account",
+  "DELETE /v1/trips/:id/telegram-groups/:bindingId": "account",
   // A trip link for a secondary organizer (#523) mints a way into the trip, and removing one takes it from another person: a
   // password or Google sign-in only, like the site invites below.
   "POST /v1/trips/:id/secondary-organizer-link": "account",

@@ -17,6 +17,8 @@ import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
 import { issueChatBindingCode, listWhatsAppConnections, removeWhatsAppConnection, tripEntitlement, WHATSAPP_SWITCH } from "./chat-binding-codes.js";
 import { featureEnabled } from "./feature-switches.js";
+import { groupAddUrl } from "./companion-intro.js";
+import { listTelegramGroups, ownerHasLiveTelegramLink, removeTelegramGroup } from "./telegram-group-codes.js";
 import { structuredLog } from "./redaction.js";
 import {
   TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
@@ -716,6 +718,9 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       // Unlinked accounts the owner may Restore. A FULL session only (the caller decides): a Telegram-minted
       // session is never told which accounts were Unlinked, because it cannot restore one (portal-scope.ts).
       ...(opts.restorable ? { unlinked: (await unlinkedTelegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] } : {}),
+      // Telegram groups (#690): present for an organizer-side viewer with dashboard access on a FULL session (the three routes
+      // answer 403 to a scoped one), so the page never offers a button that will fail. `owner` is who may read and Unlink them.
+      ...(opts.restorable && trip.dashboard_access && isOrganizerSide(trip.role) ? { groups: { owner: trip.role === "owner" } } : {}),
     },
     // The WhatsApp section (spec 625): present ONLY when this deployment has a number, the trip's `whatsapp` switch is on,
     // the viewer runs the trip AND the session can use the routes behind it. A Telegram-minted (scoped) session gets 403 on all
@@ -1521,14 +1526,14 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   // is the same thing, to a caller, as "the feature is not present": the same 404, never a 500 that Fastify's default handler
   // would fill with the database's own words (`relation ... does not exist`). One warn line names the event and the SQLSTATE
   // and carries no SQL. This wraps ONLY the three WhatsApp routes; every other error still propagates, and there is no global handler.
-  async function whatsappRoute(reply: FastifyReply, route: string, run: () => Promise<unknown>): Promise<unknown> {
+  async function whatsappRoute(reply: FastifyReply, route: string, run: () => Promise<unknown>, event = "whatsapp.schema_missing"): Promise<unknown> {
     try {
       return await run();
     } catch (error) {
       const sqlstate = (error as { code?: unknown } | null)?.code;
       if (sqlstate !== "42P01" && sqlstate !== "42703") throw error;
       (deps.emailAuthLog ?? ((line: string) => process.stderr.write(`${line}\n`)))(
-        structuredLog("warn", "whatsapp.schema_missing", { route, sqlstate, effect: "answered 404 NOT_FOUND as if the feature were not present; apply the WhatsApp migration" }));
+        structuredLog("warn", event, { route, sqlstate, effect: "answered 404 NOT_FOUND as if the feature were not present; apply the WhatsApp migration" }));
       return reply.code(404).send({ error: "NOT_FOUND" });
     }
   }
@@ -1585,6 +1590,67 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     return whatsappRoute(reply, "DELETE /v1/trips/:id/whatsapp-connections/:bindingId", async () => {
       if (!(await whatsappOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
       const removed = await removeWhatsAppConnection(deps.db, { tripId, bindingId: params.bindingId ?? "" });
+      if (!removed.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+      return { status: "removed" };
+    });
+  });
+
+  // TELEGRAM GROUPS FROM THE DASHBOARD (#690, docs/specs/sprint-9/690-dashboard-chat-parity.md). Three routes, all policy "account"
+  // and all the trip OWNER's alone (`tripEntitlement().owner`: an active owner membership with dashboard access; never `authRequired`,
+  // which any member's session passes): a Telegram-minted session is refused 403 before the handler; a member, a co-organizer, an
+  // owner of another trip, a stranger, a trip that does not exist or is retired get one 404. No switch: this is a second door onto
+  // what `/group` does (spec D5). The code is bound to a Telegram sender at redemption (telegram-group-codes.ts), not here.
+  const telegramGroupLinkAttempts: Attempts = new Map();
+  const telegramGroupRoute = (reply: FastifyReply, route: string, run: () => Promise<unknown>) => whatsappRoute(reply, route, run, "telegram_groups.schema_missing");
+  const telegramGroupOwnerOf = async (tripId: string, userId: string) => (await tripEntitlement(deps.db, tripId, userId)).owner;
+
+  app.post("/v1/trips/:id/telegram-group-link", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    if (!admitLogin(telegramGroupLinkAttempts, user.id, 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "RATE_LIMITED" });
+    }
+    const tripId = (request.params as { id?: string }).id ?? "";
+    return telegramGroupRoute(reply, "POST /v1/trips/:id/telegram-group-link", async () => {
+      if (!(await telegramGroupOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+      // A code binds only for a Telegram account the control plane knows as this trip's main organizer: with none, say so.
+      if (!(await ownerHasLiveTelegramLink(deps.db, tripId, user.id))) return reply.code(409).send({ error: "TELEGRAM_NOT_LINKED" });
+      const issued = await issueChatBindingCode(deps.db, {
+        tripId, userId: user.id, kind: "group", platform: "telegram", ttlSeconds: deps.telegramLinkTtlSeconds ?? 900, log: deps.emailAuthLog,
+      });
+      if (!issued.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+      const link = groupAddUrl(deps.telegramBotUsername, issued.code);
+      if (!link) {
+        // Never a link with an empty handle, and never silent: the deployment has no bot username to build it from.
+        (deps.emailAuthLog ?? ((line: string) => process.stderr.write(`${line}\n`)))(
+          structuredLog("warn", "telegram_groups.bot_username_missing", { route: "POST /v1/trips/:id/telegram-group-link", effect: "answered 503; set the bot username in the profile's web block" }));
+        return reply.code(503).send({ error: "TELEGRAM_BOT_UNAVAILABLE" });
+      }
+      return reply.code(201).send({ link, expiresAt: issued.expiresAt.toISOString() });
+    });
+  });
+
+  app.get("/v1/trips/:id/telegram-groups", async (request, reply) => {
+    const user = await requireUser(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const tripId = (request.params as { id?: string }).id ?? "";
+    return telegramGroupRoute(reply, "GET /v1/trips/:id/telegram-groups", async () => {
+      if (!(await telegramGroupOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+      return { groups: await listTelegramGroups(deps.db, tripId) };
+    });
+  });
+
+  app.delete("/v1/trips/:id/telegram-groups/:bindingId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const params = request.params as { id?: string; bindingId?: string };
+    const tripId = params.id ?? "";
+    return telegramGroupRoute(reply, "DELETE /v1/trips/:id/telegram-groups/:bindingId", async () => {
+      if (!(await telegramGroupOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+      const removed = await removeTelegramGroup(deps.db, { tripId, bindingId: params.bindingId ?? "" });
       if (!removed.ok) return reply.code(404).send({ error: "NOT_FOUND" });
       return { status: "removed" };
     });

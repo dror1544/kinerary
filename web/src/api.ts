@@ -41,7 +41,13 @@ export type TripSummary = {
   /** Organizer view only: who is on the trip, for "remove member". */
   members?: MemberSummary[];
   /** The Telegram accounts that can open THIS trip as the viewer: the card's icon and its Unlink entries. */
-  telegram?: { links: TelegramLink[]; /** Unlinked accounts that can be restored without Telegram: absent for a Telegram-minted session. */ unlinked?: UnlinkedTelegramLink[] };
+  telegram?: {
+    links: TelegramLink[];
+    /** Unlinked accounts that can be restored without Telegram: absent for a Telegram-minted session. */
+    unlinked?: UnlinkedTelegramLink[];
+    /** Telegram groups (#690): present for an organizer on a full session; `owner` is who may add a group, read the list and Unlink. Absent means show nothing. */
+    groups?: { owner: boolean };
+  };
   /** The trip's secondary organizers (#523). Present only for its main organizer on a password or Google session. */
   secondaryOrganizers?: SecondaryOrganizer[];
   /**
@@ -137,7 +143,7 @@ const telegramLinkSchema: z.ZodType<TelegramLink> = z.object({
   id: z.string(), via: telegramViaSchema, name: z.string().optional(), username: z.string().optional(),
   linkedAt: z.string(), firstSignedInAt: z.string().nullable(), lastSignedInAt: z.string().nullable(),
 });
-const telegramSchema = z.object({ links: z.array(telegramLinkSchema), unlinked: z.array(unlinkedTelegramLinkSchema).optional() });
+const telegramSchema = z.object({ links: z.array(telegramLinkSchema), unlinked: z.array(unlinkedTelegramLinkSchema).optional(), groups: z.object({ owner: z.boolean() }).optional() });
 const tripSchema: z.ZodType<TripSummary> = z.object({
   id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
   tripType: z.string(), lifecycleState: z.string(), nextAction: z.string(),
@@ -239,6 +245,20 @@ const issuedLinkSchema = z.object({ deepLink: z.string().regex(/^https:\/\/t\.me
 /** A one-time, short-lived t.me link that links whichever Telegram account opens it to THIS trip. */
 export const issueTelegramLink = (tripId: string) =>
   api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/telegram-link`, { method: "POST" }).then((value) => issuedLinkSchema.parse(value));
+
+/**
+ * Telegram groups (#690), the trip OWNER's: a one-time link that asks Telegram which group to add the companion to and binds it
+ * (`?startgroup=<code>`), the groups already linked, and Unlink. The link is never shown as text. A Telegram-minted session gets 403.
+ */
+const telegramGroupLinkSchema = z.object({ link: z.string().regex(/^https:\/\/t\.me\/[A-Za-z0-9_]+\?startgroup=[A-Za-z0-9_-]+(&admin=[a-z_+]+)?$/), expiresAt: z.string() });
+export const issueTelegramGroupLink = (tripId: string) =>
+  api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/telegram-group-link`, { method: "POST" }).then((value) => telegramGroupLinkSchema.parse(value));
+export type TelegramGroup = { bindingId: string; name: string | null; connectedAt: string };
+const telegramGroupSchema: z.ZodType<TelegramGroup> = z.object({ bindingId: z.string(), name: z.string().nullable(), connectedAt: z.string() });
+export const getTelegramGroups = (tripId: string) =>
+  api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/telegram-groups`).then((value) => z.object({ groups: z.array(telegramGroupSchema) }).parse(value).groups);
+export const removeTelegramGroup = (tripId: string, bindingId: string) =>
+  api<{ status: string }>(`/v1/trips/${encodeURIComponent(tripId)}/telegram-groups/${encodeURIComponent(bindingId)}`, { method: "DELETE" });
 
 /** A one-time, short-lived t.me link that makes whoever opens it a SECONDARY organizer of this trip only (the trip's main organizer, password or Google session only). */
 export const issueSecondaryOrganizerLink = (tripId: string) =>
