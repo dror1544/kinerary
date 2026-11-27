@@ -30,13 +30,27 @@ const profile = validateArchitectureProfile({
 
 describe("telegram groups: dashboard routes", { skip: SKIP }, () => {
   let pool: pg.Pool;
-  const makeApp = (botUsername = "kinerary_bot") => buildApp(profile, {
+  // What the bot was told to leave, in order, and how it answers: the portal's `telegramGroups.leaveChat` is a seam, so what the
+  // route asks of Telegram is asserted here and the adapter's own call is asserted in telegram-leave-chat.test.ts.
+  const leaves: { chat: string; closedAtThatMoment: boolean }[] = [];
+  let leaveFails = false;
+  const logLines: string[] = [];
+  const makeApp = (botUsername = "kinerary_bot", withLeave = true) => buildApp(profile, {
     portal: {
       db: pool, runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
       publicOrigin: ORIGIN, runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
       runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: botUsername, sessionTtlSeconds: 3600,
-      enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600,
+      enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600, emailAuthLog: (line: string) => { logLines.push(line); },
       telegramMiniApp: { botToken: TEST_BOT_TOKEN, maxAgeSeconds: 300, enabled: () => true },
+      ...(withLeave ? {
+        telegramGroups: {
+          leaveChat: async (chat: string) => {
+            const open = await pool.query("SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL", [chat]);
+            leaves.push({ chat, closedAtThatMoment: open.rowCount === 0 });
+            if (leaveFails) throw Object.assign(new Error("telegram leaveChat failed: HTTP 403"), { httpStatus: 403 });
+          },
+        },
+      } : {}),
     } as PortalDependencies,
   });
   let app: ReturnType<typeof makeApp>;
@@ -152,8 +166,9 @@ describe("telegram groups: dashboard routes", { skip: SKIP }, () => {
 
   test("AC-2/AC-7: every non-owner session, and the scoped one, naming this trip's REAL group, private-chat and WhatsApp binding ids, on this trip's path and on their own trip's, changes nothing", async () => {
     const f = await fixture();
+    leaves.length = 0;
     const group = await openBinding(pool, { tripId: f.tripId, chatId: groupChat(), title: "Family" });
-    const dm = await openBinding(pool, { tripId: f.tripId, chatId: String(100000000 + Math.floor(Math.random() * 800000000)) });
+    const dm =await openBinding(pool, { tripId: f.tripId, chatId: String(100000000 + Math.floor(Math.random() * 800000000)) });
     const wa = await openBinding(pool, { tripId: f.tripId, chatId: waGroupId(), platform: "whatsapp" });
     // a member and a co-organizer who each own ANOTHER trip, so "their own trip's path" is a trip they may use
     const both = await mkUser(pool, "Both"); await mkMember(pool, f.tripId, both, "member");
@@ -179,6 +194,61 @@ describe("telegram groups: dashboard routes", { skip: SKIP }, () => {
     const state = await pool.query("SELECT id, closed_at IS NOT NULL AS closed FROM control_plane.telegram_chat_bindings WHERE id = ANY($1::text[])", [[group, dm, wa]]);
     console.log(`EVIDENCE after every refused DELETE, binding rows: ${JSON.stringify(state.rows.map((r) => r.closed))}`);
     assert.deepEqual(state.rows.map((r) => r.closed), [false, false, false]);
+    // And Telegram was never asked to do anything: nobody but the owner can make the bot leave a group.
+    console.log(`EVIDENCE leaveChat calls after every refused non-owner and scoped DELETE: ${leaves.length}`);
+    assert.deepEqual(leaves, []);
+  });
+
+  test("D6: Unlink closes the binding FIRST, then the bot leaves that one chat, once; the answer carries no chat id", async () => {
+    const f = await fixture();
+    leaves.length = 0; logLines.length = 0;
+    const chat = groupChat();
+    const other = groupChat();
+    const binding = await openBinding(pool, { tripId: f.tripId, chatId: chat, title: "Family" });
+    await openBinding(pool, { tripId: f.tripId, chatId: other });
+    const r = await call(f.owner, "DELETE", `/v1/trips/${f.tripId}/telegram-groups/${binding}`);
+    evidence("owner DELETE (the bot is told to leave)", r);
+    assert.equal(r.statusCode, 200); assert.deepEqual(r.json(), { status: "removed" });
+    assert.deepEqual(leaves, [{ chat, closedAtThatMoment: true }], "one leave, for that chat only, after the binding was already closed");
+    assert.ok(!r.body.includes(chat));
+    // a second Unlink of the same binding is not found and asks nothing of Telegram
+    notFound(await call(f.owner, "DELETE", `/v1/trips/${f.tripId}/telegram-groups/${binding}`));
+    assert.equal(leaves.length, 1);
+    // the other group is untouched
+    assert.equal((await pool.query("SELECT closed_at FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", [other])).rows[0].closed_at, null);
+  });
+
+  test("D6: a leaveChat failure never undoes Unlink: 200, the binding is closed, one warn line, and no chat id anywhere in the log", async () => {
+    const f = await fixture();
+    leaves.length = 0; logLines.length = 0;
+    const chat = groupChat();
+    const binding = await openBinding(pool, { tripId: f.tripId, chatId: chat });
+    leaveFails = true;
+    try {
+      const r = await call(f.owner, "DELETE", `/v1/trips/${f.tripId}/telegram-groups/${binding}`);
+      evidence("owner DELETE while Telegram refuses the leave", r);
+      assert.equal(r.statusCode, 200); assert.deepEqual(r.json(), { status: "removed" });
+    } finally { leaveFails = false; }
+    assert.equal(leaves.length, 1, "tried once, not retried");
+    assert.equal((await pool.query("SELECT closed_reason FROM control_plane.telegram_chat_bindings WHERE id = $1", [binding])).rows[0].closed_reason, "dashboard_removed");
+    const warn = logLines.filter((l) => l.includes("telegram_groups.leave_failed"));
+    console.log(`EVIDENCE leave failure log line: ${warn.join(" | ")}`);
+    assert.equal(warn.length, 1, logLines.join("\n"));
+    assert.ok(warn[0].includes("403"));
+    assert.ok(!logLines.join("\n").includes(chat), "the chat id is not logged");
+  });
+
+  test("D6: with no Telegram adapter to leave through, Unlink still closes the binding and says so in the log", async () => {
+    const f = await fixture();
+    logLines.length = 0;
+    const bare = makeApp("kinerary_bot", false);
+    try {
+      const binding = await openBinding(pool, { tripId: f.tripId, chatId: groupChat() });
+      const r = await call(f.owner, "DELETE", `/v1/trips/${f.tripId}/telegram-groups/${binding}`, undefined, bare);
+      assert.equal(r.statusCode, 200);
+      assert.equal((await pool.query("SELECT closed_at IS NOT NULL AS closed FROM control_plane.telegram_chat_bindings WHERE id = $1", [binding])).rows[0].closed, true);
+      assert.ok(logLines.some((l) => l.includes("telegram_groups.leave_unavailable")), logLines.join("\n"));
+    } finally { await bare.close(); }
   });
 
   test("AC-3: a scoped Telegram session is refused 403 ACCOUNT_SIGN_IN_REQUIRED on all three routes, even for the trip it is linked to", async () => {

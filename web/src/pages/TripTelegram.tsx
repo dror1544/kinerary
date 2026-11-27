@@ -183,7 +183,7 @@ function TelegramGroupEntries({ trip, canLink, onDone, menu }: { trip: TripSumma
       {(groups.data ?? []).map((entry) => (
         confirming === entry.bindingId
           ? <div key={entry.bindingId} className="telegram-confirm" role="group" aria-label="Confirm unlink">
-            <small>Unlink this Telegram group (linked {formatDay(entry.connectedAt)})? Nothing is sent to it. The companion stays in the group until you remove it in Telegram, and you can connect the group again from this page.</small>
+            <small>Unlink this Telegram group (linked {formatDay(entry.connectedAt)})? The companion leaves the group quietly and posts nothing there. You can add it again from this page.</small>
             <span>
               <button type="button" className="text-button" onClick={() => remove.mutate(entry.bindingId)} disabled={remove.isPending}>Confirm unlink</button>
               <button type="button" className="text-button" onClick={() => setConfirming(null)}>Keep</button>
@@ -286,7 +286,7 @@ export function TripTelegramCard({ trip }: { trip: TripSummary }) {
             <TelegramGroupEntries trip={trip} canLink={canLink} onDone={() => undefined} />
           </div>
           {groupAccess.groups.isSuccess && groupCount === 0 && <p className="subtle">No group is linked yet.</p>}
-          <p className="subtle">Unlinking a group tells it nothing. Remove the companion from the group in Telegram as well, or it keeps answering there that it has no trip.</p>
+          <p className="subtle">Unlinking a group makes the companion leave it quietly: nothing is posted there.</p>
         </>
       )}
     </aside>

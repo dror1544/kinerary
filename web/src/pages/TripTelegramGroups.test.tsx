@@ -66,8 +66,9 @@ it("lists the linked groups by name and day, as plain text, and Unlink asks firs
   expect(calls.some((c) => c.call.startsWith("DELETE"))).toBe(false);
   // It says what Unlink does and does not do before it does it.
   const confirm = screen.getByRole("group", { name: "Confirm unlink" });
-  expect(confirm).toHaveTextContent("Nothing is sent to it");
-  expect(confirm).toHaveTextContent("stays in the group until you remove it in Telegram");
+  expect(confirm).toHaveTextContent("The companion leaves the group quietly and posts nothing there");
+  expect(confirm).not.toHaveTextContent("remove it in Telegram");
+  expect(document.body.textContent).not.toMatch(/remove the companion from the group/i);
   fireEvent.click(within(confirm).getByRole("button", { name: "Confirm unlink" }));
   await vi.waitFor(() => expect(screen.queryByText(/Family <b>chat<\/b>/)).toBeNull());
   expect(calls.filter((c) => c.call.startsWith("DELETE")).map((c) => c.call)).toEqual([`DELETE /v1/trips/${TRIP}/telegram-groups/tcb_aaaaaaaaaaaaaaaa`]);

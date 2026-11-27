@@ -18,7 +18,7 @@ three actions through the SAME binding mechanism.
 - **Unbinding a group.** There is none. The only closes are `group_moved`, `trip_destroyed` (teardown), `operator_cleared`, and
   `telegram_unlinked` (a private chat). The relay does not read a bot's removal from a group (`my_chat_member` is read only for a
   join). So there is no existing Telegram group unbind behaviour to keep; Unlink below defines it, and copies WhatsApp's (spec 625
-  AC-15): the binding closes and nothing is sent to the group.
+  AC-15): the binding closes and nothing is posted to the group. Unlike WhatsApp it then also makes the bot leave (D6).
 - **`chat_binding_codes`** (migration 20261122090000) is platform-neutral by name and its CHECK allows `telegram`, but only
   `whatsapp` rows are written today. Its codes are single-use, stored as a digest, ten live per trip, and carry the issuing account.
   #661 (named in the brief) is a flaky WhatsApp lock-order test, not a Telegram path.
@@ -39,8 +39,8 @@ On the trip page's Telegram card and in the trip card's Telegram menu, for the t
    `one-click-link.tsx`. Telegram asks which group, adds the bot with the admin rights it needs and posts `/start@<bot> <code>` there
    from the person who added it. That redemption binds the group.
 2. **See the linked groups**: the group's name and the day it was linked.
-3. **Unlink one.** It asks first. It closes the binding and **sends nothing to the group**. The companion stays a member until
-   someone removes it in Telegram, and the card says so.
+3. **Unlink one.** It asks first. It closes the binding and then the bot **leaves the group silently**: nothing is posted there
+   (members see only Telegram's own "left" line). The card says so. It can be added again from the same page.
 
 A co-organizer, a member, another owner and a Telegram-minted session see none of this and get 404 or 403 from every route.
 
@@ -58,22 +58,43 @@ A co-organizer, a member, another owner and a Telegram-minted session see none o
   account must still be an active owner. A forwarded link redeemed by anyone else binds nothing and is not spent. This is
   stricter than WhatsApp's group code, which binds for whoever sends it (spec 625 AC-10), because a Telegram identity is checkable
   and WhatsApp's is not. It means the owner must have linked Telegram first; the card says so instead of minting a link that cannot work.
-- **D3: Unlink closes with `closed_reason = 'dashboard_removed'`** (WhatsApp's), and sends nothing. Rejected: `telegram_unlinked`, which
+- **D3: Unlink closes with `closed_reason = 'dashboard_removed'`** (WhatsApp's), and posts nothing to the group. Rejected: `telegram_unlinked`, which
   Restore reopens (`telegram-link-token.ts`) and which means a private chat. A group's `/proactive` level and conversation window stay on the
   closed row; they are history.
 - **D4: the group's name is stored in `telegram_chat_bindings.chat_title`** (the column 20261122090000 added), written by a statement of
   its own after the bind, never inside the bind's INSERT, so the Telegram bind keeps working on a database without the column. It
   is written when a group is bound and refreshed (change-only, remembered per process) from messages of a bound group, so groups bound
   before this release gain a name at their next message. Until then the list says "unnamed group". Titles are text people chose: cleaned
-  (`cleanChatText`), shown as text, never acted on.
-- **D5: no feature switch.** The Faster-delivery rule says a new feature ships off. This is not a new capability: the owner has had it
+  (`cleanChatText`), shown as text, never acted on. **The write can never stall the relay** (regression plan, 2026-11-27): the poller
+  handles one update at a time and the database has no lock or statement timeout of its own, so the write runs in a transaction with
+  `lock_timeout` 500 ms and `statement_timeout` 2 s; on timeout it is logged (`trip_bot.group_title_not_recorded`, SQLSTATE only) and that
+  chat is not tried again for 30 seconds. Rejected: fire-and-forget, which needs no timeout but leaves an unbounded write nobody awaits.
+- **D5: no feature switch (confirmed by the owner, 2026-11-27).** The Faster-delivery rule says a new feature ships off. This is not a new capability: the owner has had it
   through `/group` since 2026-09; the dashboard is a second door onto the same lock, owner-only, and every route answers as if absent
   to anyone else. Recorded for the owner to overrule (a switch would be a change to `shared/feature-switches.js`, outside this task).
-- **D6: the relay's unbound-group answer is unchanged.** After Unlink the bot is still in the group, and the next message it receives
-  is answered as in any unbound group ("I don't have a trip for this chat yet"; `relay-dispatch.test.ts` "an unbound group is told so,
-  not left in silence" pins that on purpose). With the admin rights the add link asks for, the bot sees every message, so an unlinked
-  group is told so repeatedly until the bot is removed from it. The card's copy tells the owner to remove the companion in Telegram. A
-  quiet unbound group would be a relay behaviour change and is a carry-forward decision, not part of this task.
+- **D6: Unlink makes the bot LEAVE the group (owner, 2026-11-27).** The relay's unbound-group answer is unchanged ("I don't have a trip
+  for this chat yet"; `relay-dispatch.test.ts` "an unbound group is told so, not left in silence" pins that on purpose), and with the admin
+  rights the add link asks for the bot sees every message, so a group that was Unlinked but still had the bot would be told so again and
+  again. Leaving removes that. The route (1) closes the binding, then (2) calls the Bot API's `leaveChat` for that chat through the outbox's
+  own Telegram adapter, the bot that is in the group and the credential path the group photo already uses (`portal.telegramGroups`, wired
+  in `server.ts`); no new token. **Best effort:** a failure (the bot is already gone, Telegram or the network is down) is logged as
+  `telegram_groups.leave_failed` with the HTTP status and no chat id, the Unlink still answers 200 and stays done, and nothing retries.
+  A deployment with no real Telegram adapter closes the binding and logs `telegram_groups.leave_unavailable`.
+  **Order, checked:** close first, because the closing statement is also what decides WHICH chat is left (`UPDATE … RETURNING chat_id`), so a
+  group moved to another trip BEFORE the close is not found and the bot is not taken out of it. A bind AFTER the close and before the leave
+  is caught by a check just before the call (`leaveClosedTelegramGroup` skips the leave when the chat has an open binding again). That
+  check and the call are two steps, so a bind landing between them is not caught: the bot leaves a group another trip just bound, and
+  nothing closes a binding when the bot leaves, so that trip's group has no bot until someone adds it back. It needs the owner's Unlink
+  and another trip's main organizer binding the same group within milliseconds. Recorded, not closed.
+  Rejected: leave first, which would need the binding row locked across an HTTP call to be safe against that race. The residue is one
+  Telegram call's time (bounded at 5 s, normally well under a second) in which the bot is still in a group it has no trip for; a message in
+  that window gets the unbound answer once. Nothing is posted by the leave itself.
+- **D7: what the relay remembers for a group is cleared on every fresh bind** (regression plan, 2026-11-27), not only on a move. A group
+  Unlinked from the dashboard has no open binding, so binding it to another trip is not a "move", yet overheard messages and held
+  attachments (up to about 15 minutes) would reach the new trip's assistant. `dispatch.ts` clears them whenever a redemption did not
+  re-bind the same trip, for both the `KIN-` and `KWA-` redeemers. A re-bind of the same trip keeps them.
+- **D8: redeeming a code reads the issuer's membership `FOR SHARE`,** as the WhatsApp redeem does, so a concurrent `removeMember` and a
+  redemption take turns. Lock order: code row, membership, the group's binding, `trips`.
 
 ## Acceptance criteria
 
@@ -93,8 +114,9 @@ Routes (all under policy `account` in `portal-scope.ts`; none uses `authRequired
 - AC-6 `GET /v1/trips/:id/telegram-groups` answers `{ groups: [{ bindingId, name, connectedAt }] }` for the owner, `no-store`: open bindings of
   THIS trip, `platform = 'telegram'`, chat id a negative number (a group; never a private chat), oldest first. `name` is the cleaned
   title or null. No chat id, no sender id, no code. Anyone else: 404 (AC-2's matrix).
-- AC-7 `DELETE /v1/trips/:id/telegram-groups/:bindingId` by the owner closes that binding (`dashboard_removed`) and answers `{ status: "removed" }`. Nothing is
-  sent to the group. A binding id of another trip, of a private Telegram chat of this trip, of a WhatsApp binding of this trip, of a closed
+- AC-7 `DELETE /v1/trips/:id/telegram-groups/:bindingId` by the owner closes that binding (`dashboard_removed`) and answers `{ status: "removed" }`, with no chat id. Then the
+  bot leaves that one chat, once (D6); a failure of the leave does not change the answer or the closed binding, and a refused request (any
+  404 or 403 below) never reaches Telegram. Nothing is posted to the group. A binding id of another trip, of a private Telegram chat of this trip, of a WhatsApp binding of this trip, of a closed
   binding, or a malformed id: 404 and nothing changes. A later message from the group is handled as from any unbound group, and `/group KIN-…`
   or a new add link binds it again.
 - AC-8 `GET /v1/trips/:id` carries `telegram.groups: { owner: boolean }` for an organizer-side viewer with dashboard access on a full session, and
@@ -120,7 +142,7 @@ Web:
   the code already in it, not asked for until the card or menu is on screen, kept until it expires, never shown as text, replaced silently at most
   three times, and under its own client allowance ("telegram-group"). Without a link: "Link Telegram first", and no mint.
 - AC-15 The list shows each group as "Unlink Telegram group · linked <day>" with its name (or "unnamed group"); choosing it asks first; "Confirm unlink"
-  sends the DELETE; "Keep" does nothing. The question says nothing is sent to the group and that the companion stays in it until removed in Telegram.
+  sends the DELETE; "Keep" does nothing. The question says the companion leaves the group quietly and posts nothing there; the card does not tell the owner to remove it by hand.
 - AC-16 A co-organizer, a member and a Telegram-minted session see no group section and fetch nothing.
 
 ## Conflicts checked (reported, not resolved)
@@ -134,7 +156,7 @@ Web:
   (AC-3's answer is the same as the switch being off) and AC-6's per-launch re-check would then find no group. The spec for member sign-in should
   say whether "one group" is the rule it wants, and the dashboard may need to say so. Not resolved here: the card does not mention member sign-in.
 - **`docs/group-participation-design.md`.** No conflict found: it governs what the companion does inside a bound group, not how a group is bound.
-  After Unlink the relay's unbound-group behaviour (D6) applies.
+  After Unlink the bot leaves the group (D6), so no unbound-group behaviour applies to it.
 
 ## Contracts
 
@@ -144,12 +166,14 @@ Web:
   accepts only `kind: group` for the owner, and counts live codes per platform.
 - `group-binding.ts`: `bindGroupToTrip` extracted from `redeemGroupBindingToken`, unchanged in behaviour.
 - New `telegram-group-codes.ts`: `telegramGroupCodeFromStartPayload`, `redeemTelegramGroupCode`, `listTelegramGroups`, `removeTelegramGroup`, `recordTelegramGroupTitle`.
-- `relay/dispatch.ts`: the group `/start` branch also recognises a Telegram group code; messages of a bound group refresh the title.
+- `relay/dispatch.ts`: the group `/start` branch also recognises a Telegram group code; messages of a bound group refresh the title (bounded, D4); every fresh bind clears the chat's in-memory state (D7).
+- `adapters/telegram.ts`: `leaveChat` (5 s timeout). `portal.ts`: `PortalDependencies.telegramGroups`, read by the Unlink route. `server.ts`: sets it to the outbox's Telegram adapter.
 - Web: `api.ts`, `one-click-link.tsx` (limiter name), `TripTelegram.tsx`.
 
 ## Non-goals
 
-- Reading the bot's removal from a group (`my_chat_member` left or kicked), and a quiet unbound group (D6).
+- Reading the bot's removal from a group (`my_chat_member` left or kicked), and a quiet unbound group (D6: the bot leaves instead).
+- Retrying a failed leave (D6), and any action on the group's side other than `leaveChat`.
 - A feature switch (D5). Telling the owner in Telegram when a group is bound by the dashboard (WhatsApp's AC-18 notice).
 - Clearing the trip site's own `TELEGRAM_CHAT_ID` on Unlink (the site setting `/api/agent/telegram-group` writes).
 - Changing `/group`, the greeting, or the `KIN-` token table.

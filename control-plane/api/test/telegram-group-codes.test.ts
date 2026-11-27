@@ -13,8 +13,10 @@ import { digestTelegramId } from "../src/identity.js";
 import { issueGroupBindingToken } from "../src/group-binding.js";
 import { uiString } from "../src/intake-copy.js";
 import { DEFAULT_STRINGS, dispatchUpdate } from "../src/relay/dispatch.js";
+import { GroupContext } from "../src/relay/group-context.js";
+import { PendingAttachments } from "../src/relay/pending-attachments.js";
 import {
-  listTelegramGroups, recordTelegramGroupTitle, redeemTelegramGroupCode, removeTelegramGroup, telegramGroupCodeFromStartPayload,
+  leaveClosedTelegramGroup, listTelegramGroups, recordTelegramGroupTitle, redeemTelegramGroupCode, removeTelegramGroup, telegramGroupCodeFromStartPayload,
 } from "../src/telegram-group-codes.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 import { freshDatabase, mkMember, mkTrip, mkUser, openBinding, waGroupAddress, waGroupId } from "./support/whatsapp-fixture.js";
@@ -228,13 +230,144 @@ describe("telegram group codes in the relay", { skip: SKIP }, () => {
     assert.equal(listed.length, 1);
     assert.equal(listed[0].name, "Family");
     assert.ok(!Number.isNaN(Date.parse(listed[0].connectedAt)));
-    assert.deepEqual(await removeTelegramGroup(pool, { tripId: f.tripId, bindingId: listed[0].bindingId }), { ok: true });
+    assert.deepEqual(await removeTelegramGroup(pool, { tripId: f.tripId, bindingId: listed[0].bindingId }), { ok: true, chatId: chat });
     assert.deepEqual(await listTelegramGroups(pool, f.tripId), []);
     assert.deepEqual(await removeTelegramGroup(pool, { tripId: f.tripId, bindingId: listed[0].bindingId }), { ok: false, reason: "NOT_FOUND" });
     // nothing was sent: the closed row says why, and a fresh code binds the same group again
     assert.equal((await pool.query("SELECT closed_reason FROM control_plane.telegram_chat_bindings WHERE id = $1", [listed[0].bindingId])).rows[0].closed_reason, "dashboard_removed");
     assert.equal((await dispatch(startInGroup(chat, await f.mint()))).kind, "group_intro");
     assert.equal((await listTelegramGroups(pool, f.tripId)).length, 1);
+  });
+
+  test("#695: binding an Unlinked group to ANOTHER trip forgets what the relay overheard and held for the first one, on a code and on a KIN- token; a re-bind of the same trip keeps it", async () => {
+    const f = await fixture();
+    // a second trip of the same owner, who is linked on it too, with its own code
+    const tripB = await mkTrip(pool, { title: "Second" });
+    await mkMember(pool, tripB, f.ownerId, "owner");
+    await pool.query(
+      "INSERT INTO control_plane.telegram_organizer_trip_links(id,user_id,trip_id,telegram_subject_digest,verified_via) VALUES ($1,$2,$3,$4,'enrollment_redemption')",
+      [`otl_${randomBytes(16).toString("hex")}`, f.ownerId, tripB, digestTelegramId(String(OWNER_TG))]);
+    const mintB = async () => {
+      const issued = await issueChatBindingCode(pool, { tripId: tripB, userId: f.ownerId, kind: "group", platform: "telegram" });
+      assert.ok(issued.ok);
+      return issued.code;
+    };
+    const remembered = (chat: string) => {
+      const groupContext = new GroupContext();
+      const pendingAttachments = new PendingAttachments();
+      groupContext.hold(chat, "Aunt", "mum's passport is 12345678", "31337");
+      pendingAttachments.hold(chat, "31337", { fileId: "file-from-trip-a", kind: "document", mime: "application/pdf" });
+      return { groupContext, pendingAttachments };
+    };
+    const held = (o: { groupContext: GroupContext; pendingAttachments: PendingAttachments }, chat: string) =>
+      ({ lines: o.groupContext.take(chat).length, files: o.pendingAttachments.take(chat, "31337").length });
+    const dispatchWith = (update: never, options: { groupContext: GroupContext; pendingAttachments: PendingAttachments }) =>
+      dispatchUpdate(pool, update, undefined, undefined, BOT, options);
+
+    // Via a dashboard code.
+    const viaCode = groupChat();
+    const bindingA = await openBinding(pool, { tripId: f.tripId, chatId: viaCode });
+    const a = remembered(viaCode);
+    assert.deepEqual(await removeTelegramGroup(pool, { tripId: f.tripId, bindingId: bindingA }), { ok: true, chatId: viaCode });
+    await dispatchWith(startInGroup(viaCode, await mintB()), a);
+    assert.equal((await open(viaCode))[0].trip_id, tripB, "it is bound to the other trip, and that was not a move: no open binding was left");
+    assert.deepEqual(held(a, viaCode), { lines: 0, files: 0 });
+
+    // Via a KIN- token (the same bind, the other redeemer).
+    const viaKin = groupChat();
+    const bindingK = await openBinding(pool, { tripId: f.tripId, chatId: viaKin });
+    const k = remembered(viaKin);
+    await removeTelegramGroup(pool, { tripId: f.tripId, bindingId: bindingK });
+    const kin = await issueGroupBindingToken(pool, tripB, String(OWNER_TG), { ttlSeconds: 3600 });
+    if (!kin.ok) throw new Error("issue failed");
+    await dispatchWith(startInGroup(viaKin, kin.token), k);
+    assert.equal((await open(viaKin))[0].trip_id, tripB);
+    assert.deepEqual(held(k, viaKin), { lines: 0, files: 0 });
+
+    // Control: the same trip, never Unlinked: what was overheard stays.
+    const same = groupChat();
+    await openBinding(pool, { tripId: f.tripId, chatId: same });
+    const s = remembered(same);
+    await dispatchWith(startInGroup(same, f.code), s);
+    assert.deepEqual(held(s, same), { lines: 1, files: 1 });
+  });
+
+  test("#695: a group title write waits at most a moment for a held binding row: the next update is not delayed, and the title is tried again later", async () => {
+    const f = await fixture();
+    const chat = groupChat();
+    await openBinding(pool, { tripId: f.tripId, chatId: chat, title: "Before" });
+    const lines: string[] = [];
+    const say = (title: string, text = "good morning everyone") => ({
+      update_id: 98, message: { message_id: 12, chat: { id: chat, type: "supergroup", title }, from: { id: STRANGER_TG, is_bot: false, first_name: "Noa" }, text },
+    }) as never;
+    // Another transaction (a redemption, a teardown) holds the binding row.
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT id FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL FOR UPDATE", [chat]);
+      const started = Date.now();
+      await dispatchUpdate(pool, say("Renamed while locked"), undefined, (line) => lines.push(line), BOT);
+      const first = Date.now() - started;
+      console.log(`EVIDENCE title write against a held binding row: update handled in ${first} ms (lock_timeout 500 ms); the next message in the same chat:`);
+      assert.ok(first < 3000, `the update waited ${first} ms for a row lock`);
+      assert.ok(lines.some((l) => l.includes("trip_bot.group_title_not_recorded") && l.includes("55P03")), lines.join("\n"));
+      // The very next update of that chat does not wait again, and a different chat is not touched at all.
+      const second = Date.now();
+      await dispatchUpdate(pool, say("Renamed while locked", "and another"), undefined, undefined, BOT);
+      await dispatchUpdate(pool, say("Renamed while locked", "and another"), undefined, undefined, BOT);
+      assert.ok(Date.now() - second < 400, `the next updates took ${Date.now() - second} ms`);
+      console.log(`EVIDENCE next two updates of the same chat: ${Date.now() - second} ms in total`);
+    } finally {
+      await holder.query("ROLLBACK").catch(() => undefined);
+      holder.release();
+    }
+    assert.equal((await open(chat))[0].chat_title, "Before", "nothing was written while the row was held");
+    // A direct write is bounded the same way and succeeds once the row is free.
+    assert.equal(await recordTelegramGroupTitle(pool, chat, "After"), true);
+  });
+
+  test("D8: the issuer's membership is read FOR SHARE: a redemption waits for a concurrent change to it and then sees it, so a removed owner's code binds nothing", async () => {
+    const f = await fixture();
+    const chat = groupChat();
+    const holder = await pool.connect();
+    try {
+      // `removeMember` takes the membership row FOR UPDATE; here a demotion holds it, uncommitted.
+      await holder.query("BEGIN");
+      await holder.query("UPDATE control_plane.trip_memberships SET role = 'member' WHERE trip_id = $1 AND user_id = $2", [f.tripId, f.ownerId]);
+      let settled = false;
+      const redeemed = dispatch(startInGroup(chat, f.code)).finally(() => { settled = true; });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      assert.equal(settled, false, "the redemption waits for the membership row instead of reading around it");
+      await holder.query("COMMIT");
+      const d = await redeemed;
+      assert.equal(d.kind === "reply" && d.reply.text, refusal);
+      assert.equal((await open(chat)).length, 0, "nothing was bound for an account that no longer owns the trip");
+      assert.equal((await codeRow(f.code)).state, "expired", "and the code can never work again");
+    } finally {
+      await holder.query("ROLLBACK").catch(() => undefined);
+      holder.release();
+    }
+  });
+
+  test("D6: the bot leaves a closed group only if it was not bound again meanwhile, and a failure is logged without the chat id", async () => {
+    const f = await fixture();
+    const lines: string[] = [];
+    const log = (line: string) => lines.push(line);
+    const left: string[] = [];
+    const telegram = { leaveChat: async (chatId: string) => { left.push(chatId); } };
+    const chat = groupChat();
+    assert.equal(await leaveClosedTelegramGroup(pool, telegram, chat, log), "left");
+    assert.deepEqual(left, [chat]);
+    // bound again (here to the same trip: any open binding of the chat counts) before the bot got to leave
+    const again = groupChat();
+    await openBinding(pool, { tripId: f.tripId, chatId: again });
+    assert.equal(await leaveClosedTelegramGroup(pool, telegram, again, log), "skipped_bound_again");
+    assert.deepEqual(left, [chat], "the bot did not leave a group that has a trip again");
+    assert.equal(await leaveClosedTelegramGroup(pool, undefined, chat, log), "unavailable");
+    const failing = { leaveChat: async () => { throw Object.assign(new Error("boom"), { httpStatus: 403 }); } };
+    assert.equal(await leaveClosedTelegramGroup(pool, failing, chat, log), "failed");
+    assert.ok(lines.some((l) => l.includes("leave_failed") && l.includes("403")));
+    assert.ok(!lines.join("\n").includes(chat) && !lines.join("\n").includes(again), "no chat id in any line");
   });
 
   test("AC-13: /group and the greeting are unchanged: one reusable KIN- token per trip, still bound to its issuer, and a dashboard mint never replaces it", async () => {

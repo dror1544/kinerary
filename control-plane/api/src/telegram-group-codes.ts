@@ -16,7 +16,8 @@
  */
 import type pg from "pg";
 import { isMainTripOrganizer } from "./chat-router.js";
-import { CLOSE_REASONS, chatBindingCodeDigest, cleanChatText, extractChatBindingCode, tripEntitlement } from "./chat-binding-codes.js";
+import { CLOSE_REASONS, chatBindingCodeDigest, cleanChatText, extractChatBindingCode } from "./chat-binding-codes.js";
+import { structuredLog } from "./redaction.js";
 import { bindGroupToTrip, isActiveChatBindingConflict, type GroupBindingRedeemResult } from "./group-binding.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 
@@ -69,8 +70,15 @@ export async function redeemTelegramGroupCode(
     if (!(await isMainTripOrganizer(client, row.trip_id, senderTelegramUserId))) { await rollback(); return { ok: false, reason: "WRONG_SENDER" }; }
     if (row.trip_retired) { await rollback(); return { ok: false, reason: "TRIP_RETIRED" }; }
     // The account that minted it must still own the trip: an owner removed since binds nothing, and the code is dead for good.
-    const issuer = await tripEntitlement(client, row.trip_id, row.issued_by_user_id);
-    if (!issuer.owner) {
+    // THE READ IS LOCKED, as the WhatsApp redeem's is (chat-binding-codes.ts): `removeMember` takes the trip's memberships FOR UPDATE, so an
+    // unlocked check could pass, the removal commit, and this transaction then bind a group for an account that no longer owns the trip.
+    // FOR SHARE makes the two take turns. Lock order: code row, then this membership, then the group's binding and `trips` (bindGroupToTrip).
+    const held = await client.query<{ role: string; dashboard_access: boolean }>(
+      "SELECT role, dashboard_access FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 AND status = 'active' FOR SHARE",
+      [row.trip_id, row.issued_by_user_id],
+    );
+    const issuerOwns = held.rows.some((m) => m.role === "owner" && m.dashboard_access === true);
+    if (!issuerOwns) {
       await client.query("UPDATE control_plane.chat_binding_codes SET state = 'expired' WHERE id = $1", [row.id]);
       await client.query("COMMIT");
       return { ok: false, reason: "NOT_FOUND" };
@@ -101,16 +109,35 @@ export async function redeemTelegramGroupCode(
  * The group's title, written to the open binding of that chat, in a statement of its own after the bind (never inside the bind's
  * INSERT, so a Telegram bind keeps working on a database without the column). Change-only: a row that already holds this title is
  * not touched. Returns whether a row changed. A title is text a person chose: cleaned to one line, never acted on.
+ *
+ * IT MUST NEVER STALL THE RELAY. The relay's poller handles one update at a time and the database has no lock or statement timeout of
+ * its own (0), so a plain UPDATE would wait, and every chat with it, for as long as any other transaction holds that binding row
+ * (a redemption, a teardown). The write runs in a transaction of its own with a short `lock_timeout` and `statement_timeout`: on
+ * timeout (SQLSTATE 55P03 or 57014) it throws, and the caller logs and skips; the title is a label, and the next message tries again.
  */
-export async function recordTelegramGroupTitle(db: Queryable, chatId: string, title: unknown): Promise<boolean> {
+export const TITLE_LOCK_TIMEOUT_MS = 500;
+export const TITLE_STATEMENT_TIMEOUT_MS = 2000;
+export async function recordTelegramGroupTitle(db: pg.Pool, chatId: string, title: unknown): Promise<boolean> {
   const cleaned = cleanChatText(title, 100);
   if (cleaned === null || !TELEGRAM_GROUP_CHAT_ID.test(chatId)) return false;
-  const r = await db.query(
-    `UPDATE control_plane.telegram_chat_bindings SET chat_title = $2
-      WHERE chat_id = $1 AND closed_at IS NULL AND platform = 'telegram' AND chat_title IS DISTINCT FROM $2`,
-    [chatId, cleaned],
-  );
-  return (r.rowCount ?? 0) > 0;
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SET LOCAL lock_timeout = '${TITLE_LOCK_TIMEOUT_MS}ms'`);
+    await client.query(`SET LOCAL statement_timeout = '${TITLE_STATEMENT_TIMEOUT_MS}ms'`);
+    const r = await client.query(
+      `UPDATE control_plane.telegram_chat_bindings SET chat_title = $2
+        WHERE chat_id = $1 AND closed_at IS NULL AND platform = 'telegram' AND chat_title IS DISTINCT FROM $2`,
+      [chatId, cleaned],
+    );
+    await client.query("COMMIT");
+    return (r.rowCount ?? 0) > 0;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -124,6 +151,39 @@ export async function ownerHasLiveTelegramLink(db: Queryable, tripId: string, us
     [tripId, userId],
   );
   return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * The bot leaves the chat Unlink just closed, unless the chat has been bound again in the meantime (to this trip or another): then the
+ * bot stays, because the group has a trip again. Best effort in every way: a failure is logged (HTTP status only, never the chat id)
+ * and swallowed, nothing retries. Returns what happened, for the caller's tests. The check and the call are two steps, so a bind
+ * landing in the few milliseconds between them is not caught; that costs trip B's group its bot until someone adds it again (no
+ * handler closes a binding when the bot leaves), and it needs the owner's Unlink and another trip's main organizer in the same group
+ * at the same moment.
+ */
+export async function leaveClosedTelegramGroup(
+  db: Queryable,
+  telegram: { leaveChat(chatId: string): Promise<void> } | undefined,
+  chatId: string,
+  log: (line: string) => void,
+): Promise<"left" | "failed" | "skipped_bound_again" | "unavailable"> {
+  if (!telegram) {
+    log(structuredLog("warn", "telegram_groups.leave_unavailable", { effect: "the binding is closed; the bot stays in the group, nothing here can make it leave" }));
+    return "unavailable";
+  }
+  const open = await db.query("SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL LIMIT 1", [chatId]);
+  if ((open.rowCount ?? 0) > 0) {
+    log(structuredLog("info", "telegram_groups.leave_skipped", { reason: "the group was bound again before the bot left" }));
+    return "skipped_bound_again";
+  }
+  try {
+    await telegram.leaveChat(chatId);
+    return "left";
+  } catch (error) {
+    const status = (error as { httpStatus?: unknown } | null)?.httpStatus;
+    log(structuredLog("warn", "telegram_groups.leave_failed", { http_status: typeof status === "number" ? status : null, effect: "the binding is closed; the bot may still be in the group" }));
+    return "failed";
+  }
 }
 
 export interface TelegramGroup {
@@ -148,20 +208,26 @@ export async function listTelegramGroups(db: Queryable, tripId: string): Promise
 }
 
 /**
- * Unlink, from the dashboard: the binding closes `dashboard_removed` and NOTHING is sent to the group (there is no existing Telegram
- * unbind to keep, spec 690). The bot stays a member until someone removes it in Telegram. Only an open Telegram GROUP binding of
- * THIS trip can be named: another trip's, a private chat's, a WhatsApp binding, a closed one, a malformed id are all "not found".
+ * Unlink, from the dashboard: the binding closes `dashboard_removed` and NOTHING is posted to the group (there is no existing Telegram
+ * unbind to keep, spec 690). It returns the chat so the caller can make the bot LEAVE it (owner's decision 2026-11-27, D6): the route
+ * does that after this statement (`leaveClosedTelegramGroup`), best effort. Only an open Telegram GROUP binding of THIS trip can be named: another trip's, a
+ * private chat's, a WhatsApp binding, a closed one, a malformed id are all "not found".
  */
 export async function removeTelegramGroup(
   db: pg.Pool,
   input: { tripId: string; bindingId: string },
-): Promise<{ ok: true } | { ok: false; reason: "NOT_FOUND" }> {
+): Promise<{ ok: true; chatId: string } | { ok: false; reason: "NOT_FOUND" }> {
   if (!OPAQUE_ID.test(input.bindingId ?? "")) return { ok: false, reason: "NOT_FOUND" };
-  const r = await db.query(
+  // The one statement both closes the binding and says WHICH chat it was: the caller leaves exactly the chat whose binding THIS
+  // statement closed. A group moved to another trip BEFORE this statement is not found here, so the bot is not taken out of it;
+  // a bind AFTER it is caught by `leaveClosedTelegramGroup`'s check. `chatId` is for the caller's Telegram call only; no route sends it to a client.
+  const r = await db.query<{ chat_id: string }>(
     `UPDATE control_plane.telegram_chat_bindings
         SET closed_at = now(), closed_reason = $3
-      WHERE id = $1 AND trip_id = $2 AND platform = 'telegram' AND chat_id ~ '^-[0-9]+$' AND closed_at IS NULL`,
+      WHERE id = $1 AND trip_id = $2 AND platform = 'telegram' AND chat_id ~ '^-[0-9]+$' AND closed_at IS NULL
+      RETURNING chat_id`,
     [input.bindingId, input.tripId, CLOSE_REASONS.dashboardRemoved],
   );
-  return (r.rowCount ?? 0) > 0 ? { ok: true } : { ok: false, reason: "NOT_FOUND" };
+  const row = r.rows[0];
+  return row ? { ok: true, chatId: row.chat_id } : { ok: false, reason: "NOT_FOUND" };
 }

@@ -649,6 +649,9 @@ async function unboundDmTripList(
 /** The title last written per group, so a chat that talks does not cost a statement per message. Bounded; a restart just writes again. */
 const writtenGroupTitles = new Map<string, string>();
 const WRITTEN_TITLES_MAX = 2000;
+/** When a failed title write for a chat may be tried again. */
+const titleRetryAfter = new Map<string, number>();
+const TITLE_RETRY_MS = 30_000;
 
 /**
  * Writes a Telegram group's title to its open binding (`recordTelegramGroupTitle`), unless this process already wrote that title for
@@ -658,11 +661,17 @@ const WRITTEN_TITLES_MAX = 2000;
 async function refreshGroupTitle(db: pg.Pool, chatId: string, title: unknown, log: (line: string) => void, force: boolean): Promise<void> {
   if (typeof title !== "string" || title.trim() === "" || !chatId.startsWith("-")) return;
   if (!force && writtenGroupTitles.get(chatId) === title) return;
+  // A write that timed out (the binding row is held by another transaction) is not tried again for this chat for a while: the relay
+  // handles one update at a time, and a held row must cost it one short wait, not one per message.
+  if (!force && (titleRetryAfter.get(chatId) ?? 0) > Date.now()) return;
   try {
     await recordTelegramGroupTitle(db, chatId, title);
     if (writtenGroupTitles.size >= WRITTEN_TITLES_MAX) writtenGroupTitles.clear();
     writtenGroupTitles.set(chatId, title);
+    titleRetryAfter.delete(chatId);
   } catch (error) {
+    if (titleRetryAfter.size >= WRITTEN_TITLES_MAX) titleRetryAfter.clear();
+    titleRetryAfter.set(chatId, Date.now() + TITLE_RETRY_MS);
     log(structuredLog("warn", "trip_bot.group_title_not_recorded", { sqlstate: (error as { code?: unknown } | null)?.code ?? null }));
   }
 }
@@ -1036,12 +1045,17 @@ export async function dispatchUpdate(
     log(structuredLog("info", "trip_bot.group_bound", { rebound: redeemed.rebound, via: groupStartCode ? "dashboard_code" : "token" }));
     // The group's name for the dashboard's list: a statement of its own, so a database without the column still binds (spec 690, D4).
     await refreshGroupTitle(db, chatId, message.chat?.title, log, true);
-    if (redeemed.movedFromTripId) {
+    if (!redeemed.rebound) {
       // In-memory, chat-keyed state belongs to the trip the group WAS: forget it, so the old
       // trip's overheard messages and held documents never reach the new trip's companion.
+      // On EVERY fresh bind, not only a move (#695): a group the owner Unlinked from the dashboard has no open
+      // binding, so binding it to another trip is not a "move", yet the relay still holds the old trip's context
+      // for it (up to ~15 minutes of overheard messages and held attachments). A re-bind to the SAME trip keeps it.
       options.groupContext?.clear(chatId);
       options.pendingAttachments?.clearChat(chatId);
       options.moments?.clearChat(chatId);
+    }
+    if (redeemed.movedFromTripId) {
       log(structuredLog("info", "trip_bot.group_moved", { from_trip_id: redeemed.movedFromTripId, to_trip_id: redeemed.tripId }));
     }
     const facts = await companionIntroFacts(db, redeemed.tripId);

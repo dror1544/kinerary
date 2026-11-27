@@ -18,7 +18,7 @@ import { removeMember } from "./member-removal.js";
 import { issueChatBindingCode, listWhatsAppConnections, removeWhatsAppConnection, tripEntitlement, WHATSAPP_SWITCH } from "./chat-binding-codes.js";
 import { featureEnabled } from "./feature-switches.js";
 import { groupAddUrl } from "./companion-intro.js";
-import { listTelegramGroups, ownerHasLiveTelegramLink, removeTelegramGroup } from "./telegram-group-codes.js";
+import { leaveClosedTelegramGroup, listTelegramGroups, ownerHasLiveTelegramLink, removeTelegramGroup } from "./telegram-group-codes.js";
 import { structuredLog } from "./redaction.js";
 import {
   TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
@@ -350,6 +350,12 @@ export interface PortalDependencies {
    * per-trip `whatsapp` switch is read on every request on top of this.
    */
   whatsapp?: { number: string; codeTtlSeconds: number };
+  /**
+   * Telegram groups from the dashboard (#690): what Unlink needs from Telegram, the bot leaving the group. It is the OUTBOX's real
+   * Telegram adapter (server.ts), the bot that is in the trip's bound group; the same credential path as the group photo, no new token.
+   * Absent (a deployment whose outbox is not the real adapter): Unlink still closes the binding and logs that the bot stayed.
+   */
+  telegramGroups?: { leaveChat(chatId: string): Promise<void> };
   /**
    * Carries the verification and password-reset messages. ABSENT means email is
    * not configured: `POST /v1/auth/sign-up` and `/v1/auth/password/forgot` answer
@@ -1650,8 +1656,17 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const tripId = params.id ?? "";
     return telegramGroupRoute(reply, "DELETE /v1/trips/:id/telegram-groups/:bindingId", async () => {
       if (!(await telegramGroupOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+      // 1. Close the binding, in one statement that also names the chat. From the moment it commits, a message in that group is
+      //    handled as from any unbound group.
       const removed = await removeTelegramGroup(deps.db, { tripId, bindingId: params.bindingId ?? "" });
       if (!removed.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+      // 2. Then the bot leaves, silently (owner's decision 2026-11-27). BEST EFFORT: Unlink has already happened and stays done if
+      //    this fails (the bot was removed already, Telegram or the network is down); the failure is logged, never with the chat id,
+      //    and nothing retries. ORDER: close first because that statement alone decides which chat is left (a group moved to another
+      //    trip before it is not found above), and the bot is not taken out of a group that was bound again meanwhile
+      //    (`leaveClosedTelegramGroup`). The price is one Telegram call's worth of time in which the bot is still in a group it has
+      //    no trip for, and a message in that window gets the unbound-group answer: a stray line, once, at worst.
+      await leaveClosedTelegramGroup(deps.db, deps.telegramGroups, removed.chatId, deps.emailAuthLog ?? ((line: string) => process.stderr.write(`${line}\n`)));
       return { status: "removed" };
     });
   });

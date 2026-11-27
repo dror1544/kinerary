@@ -57,6 +57,7 @@ export interface GroupPhotoApi {
 }
 
 const TELEGRAM_CALL_TIMEOUT_MS = 15_000;
+const LEAVE_CHAT_TIMEOUT_MS = 5_000;
 
 /**
  * Sends the real Telegram approval DM and records the short callback_data
@@ -177,7 +178,17 @@ export class TelegramNotificationAdapter implements NotificationAdapter, GroupPh
   // ── The trip group's photo (group-photo.ts) ──────────────────────────────────────────────────────────────────────────
 
   /** One Bot API call, JSON or multipart, bounded in time. Throws TelegramApiError; returns `result`. */
-  private async call(method: string, body: Record<string, unknown> | FormData): Promise<unknown> {
+  /**
+   * The bot leaves a group or supergroup (`leaveChat`), silently: Telegram posts nothing to the chat from the bot's side (members
+   * see Telegram's own "left" service line, which the bot does not write). Used by the dashboard's Unlink of a Telegram group (spec 690).
+   * It throws `TelegramApiError` on any failure (the bot is already gone, the chat is gone, no network); the caller decides it is
+   * best effort. A short timeout of its own, because a person is waiting on the click.
+   */
+  async leaveChat(chatId: string): Promise<void> {
+    await this.call("leaveChat", { chat_id: chatId }, LEAVE_CHAT_TIMEOUT_MS);
+  }
+
+  private async call(method: string, body: Record<string, unknown> | FormData, timeoutMs: number = TELEGRAM_CALL_TIMEOUT_MS): Promise<unknown> {
     let response: Response;
     try {
       response = await fetch(`${this.apiRoot}/bot${this.config.botToken}/${method}`, {
@@ -185,7 +196,7 @@ export class TelegramNotificationAdapter implements NotificationAdapter, GroupPh
         ...(body instanceof FormData
           ? { body }
           : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
-        signal: AbortSignal.timeout(TELEGRAM_CALL_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch {
       throw new TelegramApiError(method, 0, "Telegram could not be reached");
