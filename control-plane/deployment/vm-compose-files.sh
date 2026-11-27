@@ -7,7 +7,12 @@
 #
 # Sets VM_COMPOSE_FILES to `-f compose.vm.yml`, plus `-f compose.vm.whatsapp.yml` when
 # WHATSAPP_BRIDGE_ENABLED is on in the env files (the last file to set it wins, as with
-# compose's own --env-file order) AND this checkout carries the overlay.
+# compose's own --env-file order) AND this checkout carries the overlay, plus
+# `-f compose.vm.trips.yml` when TRIP_CONTAINER_NETWORK is set (non-empty) in the env files AND
+# this checkout carries that overlay. The trips overlay puts the runtime gateway on the network
+# trip containers run on (and gives the worker the key for the host that runs them): a gateway
+# recreated without it is off that network and every container trip answers 502 while healthy.
+# The order is always whatsapp, then trips.
 #
 # WHY A SHARED HELPER: the overlay gives the relay its two WhatsApp secrets. A relay
 # recreated from compose.vm.yml alone has none, logs `relay.whatsapp_disabled` and
@@ -51,6 +56,10 @@ vm_compose_files_init() {
   value="$(vm_compose_env_value WHATSAPP_BRIDGE_ENABLED "$@")" || return 1
   if vm_compose_flag_on "$value" && [ -f "$dir/compose.vm.whatsapp.yml" ]; then
     VM_COMPOSE_FILES=("${VM_COMPOSE_FILES[@]}" -f "$dir/compose.vm.whatsapp.yml")
+  fi
+  value="$(vm_compose_env_value TRIP_CONTAINER_NETWORK "$@")" || return 1
+  if [ -n "$value" ] && [ -f "$dir/compose.vm.trips.yml" ]; then
+    VM_COMPOSE_FILES=("${VM_COMPOSE_FILES[@]}" -f "$dir/compose.vm.trips.yml")
   fi
   return 0
 }

@@ -52,7 +52,11 @@ done
 vm_compose_files_init "$DIR" "$PROVISIONING_ENV" "$VM_ENV" || die "cannot work out the compose file set from the env files"
 # With the overlay on, the relay is created WITH the two WhatsApp secret files; compose cannot create it
 # when one is missing, and --force-recreate has already removed the running one by then. Look first.
-if [ "${#VM_COMPOSE_FILES[@]}" -gt 2 ]; then
+whatsapp_overlay=0
+for f in "${VM_COMPOSE_FILES[@]}"; do
+  case "$f" in */compose.vm.whatsapp.yml) whatsapp_overlay=1 ;; esac
+done
+if [ "$whatsapp_overlay" -eq 1 ]; then
   for name in whatsapp_bridge_secret whatsapp_sender_id_key; do
     sudo test -f "$DIR/.local-secrets/$name" || die "WhatsApp is on in vm.env but .local-secrets/$name is missing: the relay would not start (docs/control-plane-vm-deployment.md, WhatsApp)"
   done

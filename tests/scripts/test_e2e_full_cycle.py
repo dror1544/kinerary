@@ -250,3 +250,95 @@ class VerificationEvidenceTests(unittest.TestCase):
 
     def test_an_unknown_check_is_a_problem(self) -> None:
         self.assertTrue(any("surprise" in p for p in self.mod.evidence_problems({**self.BASE, "surprise": "passed"})))
+
+
+class VmContainerPlacementTests(unittest.TestCase):
+    """The harness reads a trip's own files where its placement keeps them (spec x-trip-vm-container-placement.md,
+    AC-10): a vm-container trip has no container id to `pct exec` into, so its `.env` and config come from the trip's
+    directory on the document store, and its evidence names stay what a build records."""
+
+    TRIP = "trip_0123456789abcdef0123456789abcdef"
+    CONTAINER_TOPOLOGY = (
+        "version: 1\nname: alsace-2026\nplacement: vm-container\nrouting: wildcard\ncontainer:\n"
+        "  name: trip-alsace-2026\n  ipv4: 10.250.0.10\n  forward_port: 8080\n"
+        "  public_hostname: alsace-2026.trips.example.invalid\n"
+        f"  nfs_host_dir: /srv/kinerary-nfs/{TRIP}\n  nfs_mount_path: /trip-store\n  image: trip-site:{'ab' * 32}\n")
+    LXC_TOPOLOGY = (
+        "version: 1\nname: alsace-2026\nproxmox:\n  node: pve\n  vmid: '205'\n  lxc:\n    ipv4: 192.0.2.210/24\n"
+        "    nfs_host_dir: /mnt/pve/nfs/trip_9f2c11aa4d\n")
+
+    def setUp(self) -> None:
+        import shutil
+        self.mod = load()
+        self.tmp = Path(tempfile.mkdtemp(prefix="e2e-placement-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = self.tmp / "nfs"
+        (self.root / self.TRIP / "trip").mkdir(parents=True)
+        (self.root / self.TRIP / "trip" / "trip.config.json").write_text('{"meta": {"title": "Alsace"}}')
+        (self.root / self.TRIP / ".env").write_text("SEED_PASSWORD=k7mq-x3ra-pw9d-hn4t\nJWT_SECRET=x\n")
+
+    def topology(self, text: str) -> Path:
+        path = self.tmp / "topology.yaml"
+        path.write_text(text)
+        return path
+
+    def test_the_placement_is_read_off_the_topology_and_absent_means_lxc(self) -> None:
+        self.assertEqual("vm-container", self.mod.topology_placement(self.topology(self.CONTAINER_TOPOLOGY)))
+        self.assertEqual("lxc", self.mod.topology_placement(self.topology(self.LXC_TOPOLOGY)))
+
+    def test_the_stores_directory_is_the_hosts_root_and_the_trip_id_and_never_the_workers_path(self) -> None:
+        got = self.mod.trip_store_dir(self.topology(self.CONTAINER_TOPOLOGY), str(self.root))
+        self.assertEqual(self.root / self.TRIP, got)
+
+    def test_without_the_roots_setting_it_fails_loudly_naming_it(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(self.mod.Failed, "KINERARY_NFS_ROOT"):
+            self.mod.trip_store_dir(self.topology(self.CONTAINER_TOPOLOGY))
+
+    def test_a_topology_that_names_no_trip_id_directory_is_refused(self) -> None:
+        text = self.CONTAINER_TOPOLOGY.replace(self.TRIP, "../../etc")
+        with self.assertRaisesRegex(self.mod.Failed, "trip-id directory"):
+            self.mod.trip_store_dir(self.topology(text), str(self.root))
+
+    def test_a_container_trips_files_come_from_its_directory_and_no_pct_is_run(self) -> None:
+        ctx = {"slug": "alsace-2026", "placement": "vm-container", "vmid": None, "store": self.root / self.TRIP}
+        calls = []
+        env = self.mod.read_site_file(ctx, ".env", run=lambda *a, **k: calls.append(a))
+        config = self.mod.read_site_file(ctx, "trip.config.json", run=lambda *a, **k: calls.append(a))
+        self.assertIn("SEED_PASSWORD=k7mq-x3ra-pw9d-hn4t", env)
+        self.assertIn("Alsace", config)
+        self.assertEqual([], calls)
+
+    def test_an_lxc_trips_files_are_still_read_with_pct_exec_in_its_own_container(self) -> None:
+        import subprocess
+        ctx = {"slug": "alsace-2026", "placement": "lxc", "vmid": "205"}
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, stdout="X", stderr="")
+        self.assertEqual("X", self.mod.read_site_file(ctx, ".env", run=run))
+        self.assertEqual("X", self.mod.read_site_file(ctx, "trip.config.json", run=run))
+        self.assertEqual(["pct exec 205 -- cat /opt/kinerary/.env",
+                          "pct exec 205 -- cat /opt/kinerary/trips/alsace-2026/trip.config.json"], seen)
+
+    def test_a_file_the_site_does_not_hold_is_not_a_file_to_ask_for(self) -> None:
+        with self.assertRaises(ValueError):
+            self.mod.read_site_file({"placement": "vm-container", "store": self.root / self.TRIP}, "../../etc/passwd")
+
+    def test_a_container_trip_must_have_recorded_site_to_bridge_and_an_lxc_need_not(self) -> None:
+        base = VerificationEvidenceTests.BASE
+        self.assertEqual([], self.mod.evidence_problems(dict(base)))
+        problems = self.mod.evidence_problems(dict(base), shared_bridge_required=True)
+        self.assertEqual(1, len(problems))
+        self.assertIn("site_to_bridge missing", problems[0])
+        self.assertEqual([], self.mod.evidence_problems({**base, "site_to_bridge": "passed"}, shared_bridge_required=True))
+        self.assertTrue(self.mod.evidence_problems({**base, "site_to_bridge": "failed"}, shared_bridge_required=True))
+
+    def test_the_per_trip_bridge_restart_is_not_a_container_trips_business(self) -> None:
+        ctx = {"slug": "alsace-2026", "placement": "vm-container", "vmid": None}
+        ran = self.mod.stage_bridge_reach(ctx, system="Darwin", run=lambda *a, **k: self.fail("nothing is run"))
+        self.assertFalse(ran)
+
+    def test_only_read_site_file_may_pct_exec_into_a_trips_container(self) -> None:
+        # every read of a site's own file goes through read_site_file, the one place that branches on placement
+        self.assertEqual(1, SCRIPT.read_text().count("pct exec {ctx['vmid']}"))

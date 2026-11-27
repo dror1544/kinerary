@@ -328,11 +328,23 @@ class StartupTests(unittest.TestCase):
 
 
 _SHARED_BRIDGE = {"TRIP_MCP_BRIDGE": "shared", "TRIP_MCP_SHARED_SITE_URL": "http://192.0.2.77:3999"}
+# TRIP_PLACEMENT=vm-container, complete. No Proxmox variable, no LXC address pool: the container path needs none.
+_CONTAINER_SETTINGS = {
+    "TRIP_CONTAINER_SSH_HOST": "host.example.invalid", "TRIP_CONTAINER_SSH_USER": "tripctl",
+    "TRIP_CONTAINER_SSH_KEY": "/keys/trip-container", "TRIP_CONTAINER_SSH_KNOWN_HOSTS": "/keys/known_hosts",
+    "TRIP_CONTAINER_IP_POOL": '["10.250.0.10", "10.250.0.11"]', "TRIP_CONTAINER_BRIDGE_URL": "http://172.30.0.1:4311",
+}
+_VM_CONTAINER_ENV = {
+    "PROVISIONER_DEPLOY_ROOT": "/deploy-root", "PROVISIONER_VMID_MAP": "{}",
+    "CONTROL_PLANE_DATABASE_URL_FILE": "/unused", "PROVISIONER_COMPUTE_ENABLED": "1",
+    "PROVISIONER_LXC_HOSTNAME_DOMAIN": DOMAIN, "TRIP_ROUTING": "wildcard", **_SHARED_BRIDGE,
+    "TRIP_PLACEMENT": "vm-container", "PROVISIONER_TRIP_NFS_LOCAL_BASE": "/srv/kinerary-nfs", **_CONTAINER_SETTINGS,
+}
 
 
 class PlacementStartupTests(unittest.TestCase):
-    """TRIP_PLACEMENT (spec x-trip-vm-container-placement.md, AC-2). Every vm-container start still
-    exits non-zero in this change, so each test asserts WHICH refusal it is, never only the exit code."""
+    """TRIP_PLACEMENT (spec x-trip-vm-container-placement.md, AC-2). A start that is refused says WHICH
+    setting is wrong, so each test asserts the message and not only the exit code."""
 
     NOT_YET = "not available yet"
 
@@ -372,7 +384,7 @@ class PlacementStartupTests(unittest.TestCase):
                 code, text, kwargs, _b = _run_main({**_REQUIRED_BASE, **_HOST_ONLY, **env})
                 self.assertEqual(0, code, text)
                 self.assertIn("trip placement: lxc", text, "the placement is said at every start")
-                self.assertNotIn("placement", kwargs, "the adapter is not told: nothing builds a vm-container trip")
+                self.assertNotIn("placement", kwargs, "the adapter is not told: its construction is what it always was")
 
     def test_vm_container_with_the_wrong_routing_names_routing_and_not_the_bridge(self) -> None:
         code, text, adapter, _b = _run_main({**_REQUIRED_BASE, **_HOST_ONLY, **_SHARED_BRIDGE,
@@ -399,19 +411,114 @@ class PlacementStartupTests(unittest.TestCase):
         self.assertIn("TRIP_MCP_BRIDGE=shared", text)
         self.assertNotIn(self.NOT_YET, text)
 
-    def test_a_valid_combination_is_still_refused_as_not_available_yet(self) -> None:
-        env = {**_REQUIRED_BASE, "TRIP_ROUTING": "wildcard", **_SHARED_BRIDGE, "TRIP_PLACEMENT": "vm-container"}
-        code, text, adapter, bridge = _run_main(env)
+    # -- the placement is built now (PR4): a complete configuration starts, an incomplete one names what is missing
+
+    def test_a_complete_vm_container_configuration_starts_and_builds_the_container_path(self) -> None:
+        with mock.patch("control_plane_worker.trip_container.DockerSiteAdapter.preflight") as preflight:
+            code, text, kwargs, _b = _run_main(_VM_CONTAINER_ENV)
+        self.assertEqual(0, code, text)
+        self.assertNotIn(self.NOT_YET, text)
+        preflight.assert_called_once_with()
+        self.assertEqual("vm-container", kwargs["placement"])
+        self.assertEqual("wildcard", kwargs["routing"])
+        self.assertEqual(["10.250.0.10", "10.250.0.11"], kwargs["container_ip_pool"])
+        self.assertEqual("/srv/kinerary-nfs", kwargs["nfs_local_base"])
+        from control_plane_worker.trip_container import DockerSiteAdapter
+        self.assertIsInstance(kwargs["container_site"], DockerSiteAdapter)
+        self.assertIn("trip placement: vm-container", text)
+        self.assertIn("trip container host: ssh -> tripctl@host.example.invalid", text)
+
+    def test_the_hosts_key_and_pin_are_never_printed(self) -> None:
+        with mock.patch("control_plane_worker.trip_container.DockerSiteAdapter.preflight"):
+            _code, text, _a, _b = _run_main(_VM_CONTAINER_ENV)
+        for secret_path in ("/keys/trip-container", "/keys/known_hosts"):
+            self.assertNotIn(secret_path, text)
+
+    def test_every_missing_container_setting_is_named_and_nothing_is_built(self) -> None:
+        for name in _CONTAINER_SETTINGS:
+            with self.subTest(missing=name):
+                env = {k: v for k, v in _VM_CONTAINER_ENV.items() if k != name}
+                code, text, adapter, _b = _run_main(env)
+                self.assertEqual(2, code)
+                self.assertIn(name, text)
+                self.assertEqual({}, adapter)
+
+    def test_the_other_requirements_of_the_container_path_are_named_together(self) -> None:
+        env = {k: v for k, v in _VM_CONTAINER_ENV.items()
+               if k not in ("PROVISIONER_COMPUTE_ENABLED", "PROVISIONER_TRIP_NFS_LOCAL_BASE")}
+        env["PROVISIONER_COMPUTE_ENABLED"] = "0"
+        code, text, adapter, _b = _run_main(env)
         self.assertEqual(2, code)
-        self.assertIn(self.NOT_YET, text)
-        self.assertIn("TRIP_PLACEMENT=vm-container", text)
-        self.assertNotIn("TRIP_ROUTING", text, "the combination is right; the message must not blame it")
-        self.assertNotIn("TRIP_MCP_BRIDGE", text)
-        self.assertEqual({}, adapter, "nothing was built")
-        self.assertEqual({}, bridge)
+        self.assertIn("PROVISIONER_COMPUTE_ENABLED=1", text)
+        self.assertIn("PROVISIONER_TRIP_NFS_LOCAL_BASE", text)
+        self.assertEqual({}, adapter)
+
+    def test_the_container_path_needs_no_proxmox_variable_and_no_lxc_address_pool(self) -> None:
+        for name in ("PROXMOX_NODE", "PROXMOX_LXC_TEMPLATE", "PROXMOX_STORAGE", "PROXMOX_BRIDGE", "PROVISIONER_LXC_IP_POOL"):
+            self.assertNotIn(name, _VM_CONTAINER_ENV)
+        with mock.patch("control_plane_worker.trip_container.DockerSiteAdapter.preflight"):
+            code, text, kwargs, _b = _run_main(_VM_CONTAINER_ENV)
+        self.assertEqual(0, code, text)
+        self.assertEqual([], kwargs["ip_pool"])
+        self.assertEqual("", kwargs["node"])
+
+    def test_the_lxc_variables_are_kept_when_they_are_set_so_an_lxc_trip_can_still_be_re_provisioned(self) -> None:
+        with mock.patch("control_plane_worker.trip_container.DockerSiteAdapter.preflight"):
+            code, text, kwargs, _b = _run_main({**_VM_CONTAINER_ENV, **_REQUIRED_BASE})
+        self.assertEqual(0, code, text)
+        self.assertEqual(["192.0.2.210"], kwargs["ip_pool"])
+        self.assertEqual("pve", kwargs["node"])
+
+    def test_an_lxc_worker_with_no_container_settings_is_built_exactly_as_before(self) -> None:
+        code, text, kwargs, _b = _run_main({**_REQUIRED_BASE, **_HOST_ONLY})
+        self.assertEqual(0, code, text)
+        for name in ("placement", "container_site", "container_ip_pool", "nfs_local_base"):
+            self.assertNotIn(name, kwargs, "the adapter is not told: its construction is what it always was")
+
+    def test_a_complete_container_configuration_on_an_lxc_worker_only_re_provisions_and_asks_the_host_nothing(self) -> None:
+        env = {**_REQUIRED_BASE, **_HOST_ONLY, **{k: v for k, v in _VM_CONTAINER_ENV.items() if k in _CONTAINER_SETTINGS},
+               "PROVISIONER_TRIP_NFS_LOCAL_BASE": "/srv/kinerary-nfs"}
+        with mock.patch("control_plane_worker.trip_container.DockerSiteAdapter.preflight") as preflight:
+            code, text, kwargs, _b = _run_main(env)
+        self.assertEqual(0, code, text)
+        preflight.assert_not_called()
+        self.assertEqual("lxc", kwargs["placement"])
+        self.assertIsNotNone(kwargs["container_site"])
+
+    def test_an_incomplete_container_configuration_on_an_lxc_worker_refuses_naming_the_rest(self) -> None:
+        env = {**_REQUIRED_BASE, **_HOST_ONLY, "TRIP_CONTAINER_SSH_HOST": "host.example.invalid"}
+        code, text, adapter, _b = _run_main(env)
+        self.assertEqual(2, code)
+        self.assertIn("TRIP_CONTAINER_* is set but incomplete", text)
+        self.assertIn("TRIP_CONTAINER_SSH_KEY", text)
+        self.assertNotIn("TRIP_CONTAINER_SSH_HOST,", text)
+        self.assertEqual({}, adapter)
+
+    def test_a_bad_bridge_url_names_its_own_variable(self) -> None:
+        code, text, _a, _b = _run_main({**_VM_CONTAINER_ENV, "TRIP_CONTAINER_BRIDGE_URL": "http://bridge.example.invalid/x"})
+        self.assertEqual(2, code)
+        self.assertIn("TRIP_CONTAINER_BRIDGE_URL", text)
+        self.assertNotIn("TRIP_MCP_SHARED_SITE_URL must be", text)
+
+    def test_a_bad_address_pool_refuses_at_start(self) -> None:
+        for bad in ("[]", '["10.250.0.10", "10.250.0.10"]', '["nope"]', "not json"):
+            with self.subTest(pool=bad), mock.patch("control_plane_worker.trip_container.DockerSiteAdapter.preflight"):
+                code, text, adapter, _b = _run_main({**_VM_CONTAINER_ENV, "TRIP_CONTAINER_IP_POOL": bad})
+                self.assertEqual(2, code, text)
+                self.assertIn("TRIP_CONTAINER_IP_POOL", text)
+                self.assertEqual({}, adapter)
+
+    def test_a_host_that_does_not_answer_the_preflight_stops_the_worker_loudly(self) -> None:
+        from control_plane_worker.trip_container import TripContainerRefused
+        with mock.patch("control_plane_worker.trip_container.DockerSiteAdapter.preflight",
+                        side_effect=TripContainerRefused("the trip-container host refused read: the host configuration "
+                                                         "file is missing or is not a plain file")):
+            code, text, adapter, _b = _run_main(_VM_CONTAINER_ENV)
+        self.assertNotEqual(0, code)
+        self.assertIn("host configuration file is missing", text)
+        self.assertEqual({}, adapter)
 
     def test_the_same_valid_combination_starts_with_placement_lxc(self) -> None:
-        # The refusal is the placement's, not the combination's.
         env = {**_REQUIRED_BASE, "TRIP_ROUTING": "wildcard", **_SHARED_BRIDGE, "TRIP_PLACEMENT": "lxc"}
         code, text, _a, _b = _run_main(env)
         self.assertEqual(0, code, text)

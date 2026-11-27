@@ -411,6 +411,7 @@ class TripSiteImages(unittest.TestCase):
         self.assertEqual(cp.trip_site_protected_digests(), {f"sha256:{DIGEST_A}", DIGEST_B})
         self.assertIn("current_release_id", seen[0])
         self.assertIn("previous_release_id", seen[0])
+        self.assertIn("status = 'available'", seen[0], "an image built ahead of the next trip is not pruned")
 
     def test_a_digest_that_cannot_be_read_stops_the_pruning_instead_of_pruning_everything(self):
         cp = vr.ControlPlane(vr.Report(io.StringIO(), color=False))
@@ -461,6 +462,131 @@ class TripSiteImages(unittest.TestCase):
         cp.build_trip_site_image(f"sha256:{DIGEST_B}", Path("/tree"))
         self.assertEqual(len(ran), 1)
         self.assertEqual(ran[0][ran[0].index("-t") + 1], f"trip-site:{DIGEST_B}")
+
+
+class TripImageCommand(unittest.TestCase):
+    """`kinerary-cp-release trip-image <release-id|digest|available> [--rebuild]` (spec x-trip-vm-container-placement,
+    PR4): the step between promoting a release and provisioning a container trip on it. The trip-container host
+    never builds, so this is where `trip-site:<release digest>` comes from."""
+
+    ROW = f"rls_alsace|{'1' * 40}|sha256:{DIGEST_A}"
+
+    def _cp(self, *, exists=False, psql_out=None, dry_run=False):
+        out = io.StringIO()
+        cp = vr.ControlPlane(vr.Report(out, color=False), dry_run=dry_run)
+        cp.image_exists = lambda tag: exists
+        self.sql = []
+        cp.psql = lambda sql, check=True, db=vr.DB_NAME: self.sql.append(sql) or (self.ROW if psql_out is None else psql_out)
+        self.ran = []
+        cp.sh.act = lambda argv, **kw: self.ran.append(list(argv))
+        return cp, out
+
+    def _module(self, tree, error=None):
+        built = {}
+
+        class Err(Exception):
+            safe_error_code = "RELEASE_ARTIFACT_DIGEST_MISMATCH"
+
+        def materialize(repo, revision, digest):
+            built["args"] = (repo, revision, digest)
+            if error:
+                raise Err(error)
+            return str(tree)
+        module = mock.Mock(materialize_release_source=materialize, ReleaseSourceError=Err)
+        return module, built
+
+    def test_a_release_id_a_digest_and_available_each_become_one_safe_query(self):
+        for target, fragment in (
+            ("rls_alsace", "id = 'rls_alsace'"),
+            (f"sha256:{DIGEST_A}", f"artifact_digest = 'sha256:{DIGEST_A}'"),
+            (DIGEST_A, f"artifact_digest = 'sha256:{DIGEST_A}'"),
+            ("available", "status = 'available' ORDER BY created_at DESC LIMIT 1"),
+        ):
+            with self.subTest(target=target):
+                cp, _ = self._cp()
+                self.assertEqual(("rls_alsace", "1" * 40, f"sha256:{DIGEST_A}"), cp.release_row(target))
+                self.assertIn(fragment, self.sql[0])
+
+    def test_anything_else_never_reaches_the_database(self):
+        for bad in ("", "x'; DROP TABLE control_plane.releases; --", "--rebuild", "a b", "rls\\n", "-v", "../x",
+                    "sha256:" + "A" * 64, "x" * 200, "rls_alsace'"):
+            with self.subTest(target=bad):
+                cp, _ = self._cp()
+                with self.assertRaises(vr.Refused):
+                    cp.release_row(bad)
+                self.assertEqual([], self.sql)
+
+    def test_no_such_release_and_an_ambiguous_one_are_refused(self):
+        for rows in ("", "a|b|c\nd|e|f", "only|two"):
+            with self.subTest(rows=rows):
+                cp, _ = self._cp(psql_out=rows)
+                with self.assertRaises(vr.Refused):
+                    cp.release_row("rls_alsace")
+
+    def test_an_existing_image_is_left_alone_and_the_tree_is_never_checked_out(self):
+        cp, out = self._cp(exists=True)
+        with mock.patch.object(vr, "release_source_module", side_effect=AssertionError("no checkout")):
+            self.assertEqual(0, vr.cmd_trip_image(cp, "rls_alsace", False))
+        self.assertEqual([], self.ran)
+        self.assertIn("already built", out.getvalue())
+
+    def test_a_missing_image_is_built_from_the_verified_tree_and_the_tree_is_removed(self):
+        tree = Path(tempfile.mkdtemp(prefix="release-tree-"))
+        cp, _ = self._cp()
+        module, built = self._module(tree)
+        with mock.patch.object(vr, "release_source_module", return_value=module):
+            self.assertEqual(0, vr.cmd_trip_image(cp, "rls_alsace", False))
+        self.assertEqual((str(vr.REPO), "1" * 40, f"sha256:{DIGEST_A}"), built["args"], "verified against the release's digest")
+        self.assertEqual(1, len(self.ran))
+        argv = self.ran[0]
+        self.assertEqual(f"trip-site:{DIGEST_A}", argv[argv.index("-t") + 1])
+        self.assertEqual(str(tree), argv[-1])
+        self.assertFalse(tree.exists(), "the throwaway checkout is removed")
+
+    def test_rebuild_builds_over_an_existing_image(self):
+        tree = Path(tempfile.mkdtemp(prefix="release-tree-"))
+        cp, _ = self._cp(exists=True)
+        module, _built = self._module(tree)
+        with mock.patch.object(vr, "release_source_module", return_value=module):
+            self.assertEqual(0, vr.cmd_trip_image(cp, "rls_alsace", True))
+        self.assertEqual(1, len(self.ran))
+
+    def test_a_tree_that_does_not_match_its_digest_builds_nothing_and_says_why(self):
+        cp, _ = self._cp()
+        module, _built = self._module(Path("/nowhere"), error="release tree digest does not match the promoted artifact")
+        with mock.patch.object(vr, "release_source_module", return_value=module):
+            with self.assertRaisesRegex(vr.Refused, "RELEASE_ARTIFACT_DIGEST_MISMATCH"):
+                vr.cmd_trip_image(cp, "rls_alsace", False)
+        self.assertEqual([], self.ran)
+
+    def test_a_dry_run_checks_nothing_out_and_builds_nothing(self):
+        cp, out = self._cp(dry_run=True)
+        with mock.patch.object(vr, "release_source_module", side_effect=AssertionError("no checkout")):
+            self.assertEqual(0, vr.cmd_trip_image(cp, "rls_alsace", False))
+        self.assertEqual([], self.ran)
+        self.assertIn(f"trip-site:{DIGEST_A}", out.getvalue())
+
+    def test_the_release_source_it_verifies_with_is_the_workers_own_file_and_loads_standalone(self):
+        # one implementation of "this tree hashes to that digest": the worker's. Loaded by path from the checkout.
+        with mock.patch.object(vr, "REPO", ROOT):
+            module = vr.release_source_module()
+        self.assertTrue(callable(module.materialize_release_source))
+        self.assertTrue(issubclass(module.ReleaseSourceError, RuntimeError))
+        with mock.patch.object(vr, "REPO", Path("/nowhere")), self.assertRaises(vr.Refused):
+            vr.release_source_module()
+
+    def test_the_subcommand_is_wired_with_its_flag(self):
+        seen = []
+        with mock.patch.object(vr, "cmd_trip_image", lambda cp, target, rebuild: seen.append((target, rebuild)) or 0), \
+                mock.patch.object(vr, "ON_THE_VM", False), mock.patch.object(vr, "lock", contextlib.nullcontext), \
+                mock.patch.object(vr, "ControlPlane", lambda *a, **k: mock.Mock()):
+            self.assertEqual(0, vr.main(["trip-image", "rls_alsace", "--rebuild"]))
+            self.assertEqual(0, vr.main(["trip-image", "available"]))
+        self.assertEqual([("rls_alsace", True), ("available", False)], seen)
+        for argv in (["trip-image"], ["trip-image", "a", "b"]):
+            with mock.patch.object(vr, "ON_THE_VM", False), mock.patch.object(vr, "lock", contextlib.nullcontext), \
+                    mock.patch.object(vr, "ControlPlane", lambda *a, **k: mock.Mock()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(1, vr.main(argv))
 
 
 class History(unittest.TestCase):
