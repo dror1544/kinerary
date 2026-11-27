@@ -465,6 +465,13 @@ def parse_topology(text: str) -> dict:
     return root
 
 
+def site_port_of(topo: dict) -> str:
+    """The trip site's port: `proxmox.lxc.forward_port`, which every topology since the wildcard spec carries and the
+    only one a `routing: wildcard` trip has (it has no `npm:` section), else the older `npm.forward_port`."""
+    lxc = (topo.get("proxmox") or {}).get("lxc") or {}
+    return str(lxc.get("forward_port") or (topo.get("npm") or {}).get("forward_port") or "")
+
+
 @dataclasses.dataclass
 class Trip:
     row: dict
@@ -523,11 +530,10 @@ def resolve_trip(cfg: Config, db: Db, slug: str) -> Trip:
     topo = parse_topology(topology_path.read_text(encoding="utf-8", errors="replace"))
     proxmox = topo.get("proxmox") or {}
     lxc = proxmox.get("lxc") or {}
-    npm = topo.get("npm") or {}
     vmid = str(proxmox.get("vmid") or "")
     container = str(lxc.get("name") or "")
     host = str(lxc.get("ipv4") or "").split("/")[0]
-    port = str(npm.get("forward_port") or "")
+    port = site_port_of(topo)
     if topo.get("name") != slug:
         raise Refused(f"{slug}: its topology describes {topo.get('name')!r}, not this trip")
     if not (re.fullmatch(r"[0-9]{1,6}", vmid) and container and IPV4.match(host)
