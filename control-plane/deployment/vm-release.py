@@ -12,6 +12,7 @@ and the first rollback target predates this file.
     kinerary-cp-release verify
     kinerary-cp-release restart-bridges [--dry-run]
     kinerary-cp-release prune [--dry-run]
+    kinerary-cp-release trip-image <release-id|digest|available> [--rebuild] [--dry-run]
     kinerary-cp-release history | snapshots
     kinerary-cp-release install [--gate-pubkey-file F] [--dry-run]
     kinerary-cp-release gate <verb> …       the agent path (trip-monitor), see GATE below
@@ -358,6 +359,11 @@ def compose_defines_web(compose_text: str) -> bool:
 # --------------------------------------------------------------------------- #
 WHATSAPP_FLAG = "WHATSAPP_BRIDGE_ENABLED"
 WHATSAPP_OVERLAY = "compose.vm.whatsapp.yml"
+# Trip sites as containers (docs/specs/sprint-9/x-trip-vm-container-placement.md): an OPTIONAL overlay that puts the
+# runtime gateway on the trips network and gives the worker its trip-container key. On exactly when vm.env sets
+# TRIP_CONTAINER_NETWORK (non-empty) and the checked-out version carries the file; in EVERY compose call or in none.
+TRIPS_NETWORK_VAR = "TRIP_CONTAINER_NETWORK"
+TRIPS_OVERLAY = "compose.vm.trips.yml"
 WHATSAPP_SERVICE = "whatsapp-bridge"
 WHATSAPP_SECRET_NAMES = ("whatsapp_bridge_secret", "whatsapp_sender_id_key")
 WHATSAPP_DEFAULT_PORT = "4340"
@@ -961,6 +967,9 @@ def backups_to_prune(backups: Sequence[Tuple[str, int]], *, keep: int, max_total
 
 
 TRIP_SITE_IMAGE = "trip-site"
+#: What `trip-image` accepts: `available`, a digest, or a release id. Letters, digits and `_.-` only: it is put
+#: into one SQL string (and is never a flag, a path or a docker argument).
+TRIP_IMAGE_TARGET = re.compile(r"^(?:available|sha256:[0-9a-f]{64}|[0-9a-f]{64}|[A-Za-z0-9][A-Za-z0-9_.-]{0,79})$")
 TRIP_SITE_DIGEST = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 TRIP_SITE_TAG = re.compile(r"^trip-site:([0-9a-f]{64})$")
 
@@ -1403,6 +1412,7 @@ class ControlPlane:
         # The WhatsApp overlay is in EVERY compose call or in none (see the comment above
         # WHATSAPP_FLAG). Off, this is the argv it always was.
         overlay = ["-f", str(DEPLOYMENT_DIR / WHATSAPP_OVERLAY)] if self.whatsapp_active() else []
+        overlay += ["-f", str(DEPLOYMENT_DIR / TRIPS_OVERLAY)] if self.trips_active() else []
         return ["docker", "compose", "-f", str(DEPLOYMENT_DIR / "compose.vm.yml"), *overlay,
                 "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *profile, *args]
 
@@ -1416,6 +1426,21 @@ class ControlPlane:
         """Is WhatsApp switched on in this VM's env files? Read from the files alone, like web_enabled()."""
         read = lambda path: path.read_text() if path.exists() else ""  # noqa: E731
         return whatsapp_flag(read(PROVISIONING_ENV), read(VM_ENV))
+
+    def trips_network_set(self) -> bool:
+        """TRIP_CONTAINER_NETWORK non-empty in the env files (vm.env wins), as vm-compose-files.sh reads it."""
+        return bool(self.merged_env().get(TRIPS_NETWORK_VAR, "").strip().strip("\"'").strip())
+
+    def trips_active(self) -> bool:
+        """Is the trips overlay part of this checkout's compose file set right now? Set in vm.env AND the checked-out
+        version carries the file (a rollback to a version from before it has none, and `-f <missing file>` would fail
+        every compose call). A dry run never checks the target out, so it asks git about the target instead."""
+        if not self.trips_network_set():
+            return False
+        if self.dry_run and self.target_full:
+            proc = self.sh.read(self.git_argv("show", f"{self.target_full}:control-plane/deployment/{TRIPS_OVERLAY}"), timeout=60)
+            return proc.returncode == 0
+        return (DEPLOYMENT_DIR / TRIPS_OVERLAY).exists()
 
     def whatsapp_in_compose(self, full: str) -> bool:
         proc = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/{WHATSAPP_OVERLAY}"), timeout=60)
@@ -1875,21 +1900,43 @@ class ControlPlane:
     def trip_site_protected_digests(self) -> set:
         """The release digests a trip's current or previous release names: the images a trip runs, and the way
         back it keeps. Raises Refused when they cannot be read, so a caller prunes nothing rather than guessing."""
+        # Also every `available` release: that is what the planner gives the NEXT trip, and `trip-image` builds its
+        # image ahead of that trip. Pruned in between, the first container provision would find no image.
         out = self.psql(
             "SELECT DISTINCT r.artifact_digest FROM control_plane.releases r "
-            "JOIN control_plane.trips t ON r.id IN (t.current_release_id, t.previous_release_id)")
+            "WHERE r.status = 'available' OR EXISTS (SELECT 1 FROM control_plane.trips t "
+            "WHERE r.id IN (t.current_release_id, t.previous_release_id))")
         return {line.strip() for line in out.splitlines() if line.strip()}
 
-    def build_trip_site_image(self, digest: str, release_tree: Path) -> None:
+    def build_trip_site_image(self, digest: str, release_tree: Path, force: bool = False) -> None:
         """Build `trip-site:<digest>` from a sealed release tree unless it already exists. The tag is the
-        release's identity, so an existing one is the same code and is left alone."""
+        release's identity, so an existing one is the same code and is left alone. `force` builds over it
+        (the tag then names the new image; a container keeps running its old one until `deploy`)."""
         tag = trip_site_tag(digest)
-        if self.image_exists(tag):
+        if self.image_exists(tag) and not force:
             self.r.ok(f"{tag} already built")
             return
         self.sh.act(trip_site_build_argv(digest, REPO, release_tree), describe=f"build {tag} from {release_tree}",
                     timeout=3600)
         self.r.ok(f"built {tag}")
+
+    def release_row(self, target: str) -> Tuple[str, str, str]:
+        """(release id, source revision, artifact digest) of the release a `trip-image` target names: a release
+        id, a digest (`sha256:<hex>` or bare), or `available` for the newest release the planner may pick."""
+        if not TRIP_IMAGE_TARGET.match(target or ""):
+            raise Refused(f"{target!r} is not a release id, a release digest (sha256:<64 hex>) or `available`")
+        digest = TRIP_SITE_DIGEST.match(target)
+        if target == "available":
+            where = "status = 'available' ORDER BY created_at DESC LIMIT 1"
+        elif digest:
+            where = f"artifact_digest = 'sha256:{digest.group(1)}'"
+        else:
+            where = f"id = '{target}'"            # TRIP_IMAGE_TARGET allows letters, digits and _.- only
+        out = self.psql(f"SELECT id, source_revision, artifact_digest FROM control_plane.releases WHERE {where}")
+        rows = [line.split("|") for line in out.splitlines() if line.strip()]
+        if len(rows) != 1 or len(rows[0]) != 3:
+            raise Refused(f"no release matches {target!r}" if not rows else f"{target!r} names more than one release")
+        return rows[0][0], rows[0][1], rows[0][2]
 
     def web_images_wanted(self, full: Optional[str]) -> bool:
         """The portal and gateway images belong to a release only when the profile is on
@@ -1966,6 +2013,7 @@ class ControlPlane:
             handle.write(text)
             temp = handle.name
         overlay_temp: Optional[str] = None
+        trips_temp: Optional[str] = None
         try:
             profile = ["--profile", WEB_PROFILE] if self.web_enabled() else []
             overlay: List[str] = []
@@ -1977,12 +2025,21 @@ class ControlPlane:
                     handle.write(text)
                     overlay_temp = handle.name
                 overlay = ["-f", overlay_temp]
+            if self.trips_network_set():
+                shown = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/{TRIPS_OVERLAY}"))
+                if shown.returncode == 0:
+                    with tempfile.NamedTemporaryFile(prefix="kinerary-compose-trips.", suffix=".yml", delete=False) as handle:
+                        handle.write(shown.stdout)
+                        trips_temp = handle.name
+                    overlay += ["-f", trips_temp]
             proc = self.sh.read(["docker", "compose", "--project-directory", str(DEPLOYMENT_DIR), "-f", temp, *overlay,
                                  "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *profile, "config", "-q"], timeout=60)
         finally:
             os.unlink(temp)
             if overlay_temp:
                 os.unlink(overlay_temp)
+            if trips_temp:
+                os.unlink(trips_temp)
         if proc.returncode != 0:
             self.r.fail(f"the target's compose.vm.yml does not validate against this VM's env files and secrets: "
                         f"{proc.stderr.decode(errors='replace').strip()[-300:]}")
@@ -3503,6 +3560,54 @@ def cmd_prune(cp: ControlPlane) -> int:
     return 1 if r.failures else 0
 
 
+def release_source_module():
+    """control_plane_worker/release_source.py of THIS checkout, loaded by path: the one implementation of
+    "this tree at that revision hashes to the release's digest" (both seals), standard library only. This tool is
+    installed outside the checkout and must not grow a second copy of it."""
+    import importlib.util
+    path = REPO / "control-plane" / "worker" / "control_plane_worker" / "release_source.py"
+    if not path.is_file():
+        raise Refused(f"{path} is not in this checkout: cannot verify a release tree")
+    spec = importlib.util.spec_from_file_location("kinerary_release_source", path)
+    module = importlib.util.module_from_spec(spec)          # type: ignore[arg-type]
+    spec.loader.exec_module(module)                         # type: ignore[union-attr]
+    return module
+
+
+def cmd_trip_image(cp: ControlPlane, target: str, rebuild: bool) -> int:
+    """Build the image a `vm-container` trip runs: `trip-site:<release digest>`, from the release's own sealed tree.
+
+    The trip-container host never builds (a request naming an image it lacks is refused), so this is the step
+    between promoting a release and provisioning a container trip on it; a provision that finds no image stops
+    with this command's name in its error and retries once it exists. The release's tree is checked out at its
+    source revision and must hash to the digest the release recorded, as the worker verifies it, before docker
+    sees it. An image that exists is left alone (the tag is the release's identity); --rebuild builds over it,
+    which is what a change to the image's own files (trip-site.Dockerfile, its entrypoint, its nginx config)
+    needs, since those are not in the digest. A running container keeps its old image until its next `deploy`."""
+    r = cp.r
+    r.head("Trip site image" + ("  [DRY RUN — nothing will be built]" if cp.dry_run else ""))
+    release_id, revision, digest = cp.release_row(target)
+    tag = trip_site_tag(digest)
+    r.fact("release", f"{release_id} at {revision[:12]}")
+    r.fact("image", tag)
+    if not rebuild and cp.image_exists(tag):
+        r.ok(f"{tag} already built (--rebuild builds over it)")
+        return 0
+    if cp.dry_run:
+        r.step(f"would check out {revision[:12]} from {REPO}, verify it hashes to {digest}, and build {tag}")
+        return 0
+    module = release_source_module()
+    try:
+        tree = Path(module.materialize_release_source(str(REPO), revision, digest))
+    except module.ReleaseSourceError as error:
+        raise Refused(f"cannot build {tag}: {error} ({getattr(error, 'safe_error_code', 'unknown')})")
+    try:
+        cp.build_trip_site_image(digest, tree, force=rebuild)
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
+    return 1 if r.failures else 0
+
+
 def install_tool_files(cp: ControlPlane, quiet: bool = False) -> None:
     sources = {
         DEPLOYMENT_DIR / "vm-release.py": INSTALLED_TOOL,
@@ -3850,6 +3955,11 @@ def main(argv: Sequence[str]) -> int:
                 return cmd_restart_bridges(cp)
             if command == "prune":
                 return cmd_prune(cp)
+            if command == "trip-image":
+                rebuild = flag("--rebuild")
+                if len(rest) != 1:
+                    raise Refused("trip-image <release-id|digest|available> [--rebuild] [--dry-run]")
+                return cmd_trip_image(cp, rest[0], rebuild)
         print(f"unknown command {command!r}\n\n{__doc__}", file=sys.stderr)
         return 2
     except Refused as error:

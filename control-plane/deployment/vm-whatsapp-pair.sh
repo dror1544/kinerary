@@ -39,7 +39,11 @@ case "$ACTION" in pair|unlink) ;; *) echo "usage: $0 [pair|unlink]" >&2; exit 2 
 # The same file set the release tool uses; without the overlay there is no bridge service at all.
 . "$DIR/vm-compose-files.sh"
 vm_compose_files_init "$DIR" "$PROVISIONING_ENV" "$VM_ENV" || die "cannot read the env files"
-[ "${#VM_COMPOSE_FILES[@]}" -gt 2 ] || die "WhatsApp is not switched on: set WHATSAPP_BRIDGE_ENABLED=1 in vm.env (and run a version that carries compose.vm.whatsapp.yml)"
+whatsapp_overlay=0
+for f in "${VM_COMPOSE_FILES[@]}"; do
+  case "$f" in */compose.vm.whatsapp.yml) whatsapp_overlay=1 ;; esac
+done
+[ "$whatsapp_overlay" -eq 1 ] || die "WhatsApp is not switched on: set WHATSAPP_BRIDGE_ENABLED=1 in vm.env (and run a version that carries compose.vm.whatsapp.yml)"
 compose() { sudo docker compose "${VM_COMPOSE_FILES[@]}" --env-file "$PROVISIONING_ENV" --env-file "$VM_ENV" "$@"; }
 
 SESSION="$(vm_compose_env_value WHATSAPP_SESSION_DIR "$PROVISIONING_ENV" "$VM_ENV")" || die "cannot read the env files"

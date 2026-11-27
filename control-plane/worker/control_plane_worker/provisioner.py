@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
@@ -114,6 +115,7 @@ class DeployAdapter(Protocol):
         source_dir: str | None = None,
         documents: Sequence[TripDocumentFile] | None = None,
         trip_id: str | None = None,
+        release_digest: str | None = None,
     ) -> str: ...
 
 
@@ -523,6 +525,9 @@ class ShellDeployAdapter:
         # built (see `_trip_nfs_dirname`). Unset: the worker cannot reach trip
         # NFS directories, and documents travel with the deploy instead.
         self._trip_nfs_local_base = trip_nfs_local_base or os.environ.get("PROVISIONER_TRIP_NFS_LOCAL_BASE") or None
+        # origin ("http://<container ip>:<port>") -> slug, for each vm-container trip deployed by this process:
+        # what `http_get` answers from the host and the store instead of a network the worker is not on.
+        self._container_origins: dict[str, str] = {}
 
     def _trip_nfs_dirname(self, slug: str) -> str | None:
         """The last path segment of this trip's `nfs_host_dir`, read from its
@@ -626,6 +631,7 @@ class ShellDeployAdapter:
         source_dir: str | None = None,
         documents: Sequence[TripDocumentFile] | None = None,
         trip_id: str | None = None,
+        release_digest: str | None = None,
     ) -> str:
         # A static vmid_map entry (the two legacy, hand-provisioned trips)
         # always wins; a slug with no entry falls to the compute adapter —
@@ -633,7 +639,15 @@ class ShellDeployAdapter:
         # used to raise unconditionally before Phase G existed. first_provision
         # only reaches the compute path (a vmid_map trip is a long-lived hand
         # box whose data is never reset here).
-        vmid = self._vmid_map.get(slug) or self._compute.create_container(
+        vmid = self._vmid_map.get(slug)
+        if not vmid and self._placement_of(slug) == "vm-container":
+            # The trip's recorded placement decides (its topology.yaml), and only a trip with no topology
+            # takes the worker's TRIP_PLACEMENT. No vmid, no deploy.sh, no pct: a container on the control-plane host.
+            return self._deploy_container(
+                slug, config, first_provision=first_provision, sidecars=sidecars, documents=documents,
+                trip_id=trip_id, release_digest=release_digest,
+            )
+        vmid = vmid or self._compute.create_container(
             slug, first_provision=first_provision, trip_id=trip_id,
         )
 
@@ -650,50 +664,7 @@ class ShellDeployAdapter:
             with open(os.path.join(trip_dir, name), "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=2)
 
-        # The trip's source documents, under their content-addressed names.
-        #
-        # FIRST CHOICE: the trip's own NFS directory, which the container
-        # already mounts. Hard-linked there from the control plane's store, both
-        # names point at ONE physical copy on the export: no second copy, no
-        # transfer, and the site reads it from its mount (TRIP_DOCUMENTS_DIR).
-        # The container still sees only its own trip's directory; the store
-        # stays outside every trip's mount.
-        #
-        # FALLBACK, per document: beside the config, which deploy.sh carries onto
-        # the container — when this worker cannot see the trip's NFS directory,
-        # or the export refuses the write (root squashing, say). A document that
-        # cannot be published either way is logged and left out, never a failed
-        # deploy.
-        if documents:
-            nfs_documents_dir = self._trip_nfs_documents_dir(slug)
-            documents_dir = os.path.join(trip_dir, "documents")
-            published: dict[str, int] = {}
-            for document in documents:
-                strategy: str | None = None
-                if nfs_documents_dir:
-                    try:
-                        strategy = f"nfs_{publish_document(document, nfs_documents_dir)}"
-                    except (OSError, ValueError):
-                        logger.warning(
-                            "provisioner.document_nfs_publish_failed",
-                            extra={"slug": slug, "document_id": document.document_id},
-                            exc_info=True,
-                        )
-                if strategy is None:
-                    try:
-                        strategy = publish_document(document, documents_dir)
-                    except (OSError, ValueError):
-                        logger.warning(
-                            "provisioner.document_not_published",
-                            extra={"slug": slug, "document_id": document.document_id},
-                            exc_info=True,
-                        )
-                        continue
-                published[strategy] = published.get(strategy, 0) + 1
-            logger.info(
-                "provisioner.documents_published",
-                extra={"slug": slug, **{f"documents_{how}": count for how, count in published.items()}},
-            )
+        self._publish_documents(slug, trip_dir, documents)
 
         deploy_sh = os.path.join(self._deploy_root, "deploy.sh")
         env = {**os.environ}
@@ -725,6 +696,153 @@ class ShellDeployAdapter:
             raise RuntimeError(f"deploy.sh exited {result.returncode}: {detail or '(no output)'}")
 
         return self._private_url(trip_dir)
+
+    # ── placement: vm-container ───────────────────────────────────────────────
+    #
+    # The trip's site is one Docker container on the control-plane host
+    # (docs/specs/sprint-9/x-trip-vm-container-placement.md). The order is fixed:
+    #
+    #   1. prepare_container   `ensure`: the trip's directory on the store, its .env, the container
+    #                          (nothing written by the worker may precede it: `ensure` hands each directory
+    #                          it makes to the container's uid)
+    #   2. the config, the sidecars and the documents, written into the trip's own directory
+    #   3. activate_container  `deploy` on the release's image (the container is recreated, so it starts
+    #                          on the config just written), then `check` until it is healthy
+    #
+    # No deploy.sh, no pct, no NPM, no DNS, no Proxmox.
+
+    def _placement_of(self, slug: str) -> str:
+        reader = getattr(self._compute, "placement_of", None)
+        return reader(slug) if callable(reader) else "lxc"
+
+    def _deploy_container(
+        self,
+        slug: str,
+        config: dict[str, Any],
+        *,
+        first_provision: bool,
+        sidecars: Mapping[str, Any] | None,
+        documents: Sequence[TripDocumentFile] | None,
+        trip_id: str | None,
+        release_digest: str | None,
+    ) -> str:
+        compute = self._compute
+        site = compute.prepare_container(  # type: ignore[attr-defined]
+            slug, first_provision=first_provision, trip_id=trip_id, release_digest=release_digest,
+        )
+        files = {"trip.config.json": json.dumps(config, ensure_ascii=False, indent=2).encode("utf-8")}
+        for name, payload in (sidecars or {}).items():
+            files[name] = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        site.store.write_trip_files(files)
+        # The worker's own copy beside topology.yaml, as for an LXC: what is read from this directory
+        # (the e2e harness, a person) finds the same trip.config.json whichever placement it has.
+        trip_dir = os.path.join(self._deploy_root, "trips", slug)
+        os.makedirs(trip_dir, exist_ok=True)
+        with open(os.path.join(trip_dir, "trip.config.json"), "wb") as fh:
+            fh.write(files["trip.config.json"])
+        self._publish_documents(slug, trip_dir, documents, fallback=False)
+        compute.activate_container(site)  # type: ignore[attr-defined]
+        self._container_origins[f"http://{site.ip}:{site.port}"] = slug
+        return self._private_url(trip_dir)
+
+    def http_get(self, url: str, timeout: float = 10.0) -> "tuple[int, str]":
+        """The verification gate's GET (ProvisionerWorker prefers the deploy adapter's own).
+
+        A real GET for every trip but a vm-container one. Its container is on a Docker network the worker is
+        deliberately not on (the spec: the worker verifies a site through the host's `check` verb), so the three
+        reads the gate makes are answered from what the host and the store can say:
+
+          /api/health                    the host's `check`, which asks /api/health from INSIDE the labelled container
+          /api/config/roster             the roster of the trip.config.json this worker wrote into the trip's store
+          /api/config/deployment-identity  that file's meta.deploymentNonce
+
+        The last two read the store copy back, they do not fetch what the site serves: no verb of the host's
+        returns that (spec carry-forward). The container mounts exactly that directory (the host reads its
+        mounts back after every run) and was recreated after the write, so this is the same file the site read;
+        what it cannot catch is a site that loaded something else."""
+        parts = urllib.parse.urlsplit(url)
+        slug = self._container_origins.get(f"{parts.scheme}://{parts.netloc}")
+        if slug is None:
+            return verification.default_http_get(url, timeout)
+        compute = self._compute
+        if parts.path == "/api/health":
+            healthy, evidence = compute.container_health(slug)  # type: ignore[attr-defined]
+            if healthy:
+                return 200, json.dumps({"ok": True, "source": "trip-container-host check, from inside the container"})
+            return 503, json.dumps({"ok": False, "evidence": evidence})
+        if parts.path in ("/api/config/roster", "/api/config/deployment-identity"):
+            raw = compute.container_store(slug).read_trip_file("trip.config.json")  # type: ignore[attr-defined]
+            if raw is None:
+                return 404, "trip.config.json is not in the trip's store"
+            try:
+                config = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                return 502, "trip.config.json in the trip's store is not JSON"
+            source = "read back from the trip's store, not fetched from the site"
+            if parts.path == "/api/config/roster":
+                roster = [
+                    {key: p.get(key) for key in ("username", "name", "name_en", "color")}
+                    for p in (config.get("participants") or []) if isinstance(p, dict)
+                ]
+                return 200, json.dumps({"participants": roster, "source": source})
+            meta = config.get("meta") if isinstance(config.get("meta"), dict) else {}
+            return 200, json.dumps({"deploymentNonce": meta.get("deploymentNonce"), "source": source})
+        return 404, "not found"
+
+    def _publish_documents(
+        self, slug: str, trip_dir: str, documents: Sequence[TripDocumentFile] | None, *, fallback: bool = True,
+    ) -> None:
+        # The trip's source documents, under their content-addressed names.
+        #
+        # FIRST CHOICE: the trip's own NFS directory, which the container
+        # already mounts. Hard-linked there from the control plane's store, both
+        # names point at ONE physical copy on the export: no second copy, no
+        # transfer, and the site reads it from its mount (TRIP_DOCUMENTS_DIR).
+        # The container still sees only its own trip's directory; the store
+        # stays outside every trip's mount.
+        #
+        # FALLBACK, per document: beside the config, which deploy.sh carries onto
+        # the container — when this worker cannot see the trip's NFS directory,
+        # or the export refuses the write (root squashing, say). A document that
+        # cannot be published either way is logged and left out, never a failed
+        # deploy.
+        if documents:
+            nfs_documents_dir = self._trip_nfs_documents_dir(slug)
+            documents_dir = os.path.join(trip_dir, "documents")
+            published: dict[str, int] = {}
+            for document in documents:
+                strategy: str | None = None
+                if nfs_documents_dir:
+                    try:
+                        strategy = f"nfs_{publish_document(document, nfs_documents_dir)}"
+                    except (OSError, ValueError):
+                        logger.warning(
+                            "provisioner.document_nfs_publish_failed",
+                            extra={"slug": slug, "document_id": document.document_id},
+                            exc_info=True,
+                        )
+                if strategy is None and fallback:
+                    try:
+                        strategy = publish_document(document, documents_dir)
+                    except (OSError, ValueError):
+                        logger.warning(
+                            "provisioner.document_not_published",
+                            extra={"slug": slug, "document_id": document.document_id},
+                            exc_info=True,
+                        )
+                        continue
+                if strategy is None:
+                    # A container has no "beside the config" to fall back to: the site mounts its own directory only.
+                    logger.warning(
+                        "provisioner.document_not_published",
+                        extra={"slug": slug, "document_id": document.document_id},
+                    )
+                    continue
+                published[strategy] = published.get(strategy, 0) + 1
+            logger.info(
+                "provisioner.documents_published",
+                extra={"slug": slug, **{f"documents_{how}": count for how, count in published.items()}},
+            )
 
     def _load_topology_dict(self, trip_dir: str) -> dict | None:
         """topology.yaml as plain data, or None when there is none to read.
@@ -1555,6 +1673,12 @@ class ProvisionerWorker:
                     # Names the trip's data directory on a FIRST provision; an
                     # existing trip's directory comes from its topology file.
                     trip_id=trip_id,
+                    # The release's own digest, only when it is a verified one: a vm-container trip runs the
+                    # image built from exactly that sealed tree, and the dev-seed release (a placeholder
+                    # digest, no manifest) has none. An LXC trip ignores it.
+                    release_digest=(
+                        plan_desired.get("release_artifact_digest") if plan_desired.get("release_verified") else None
+                    ),
                 )
             finally:
                 if source_dir:

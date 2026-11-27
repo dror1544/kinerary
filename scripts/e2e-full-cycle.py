@@ -643,7 +643,9 @@ def stage_confirm_and_build(ctx: dict, wait_minutes: int, build: bool = True) ->
         f"WHERE trip_id='{trip}' ORDER BY check_name"
     ).splitlines()
     evidence = dict(r.split("=", 1) for r in rows if "=" in r)
-    problems = evidence_problems(evidence)
+    topology = DEPLOY_ROOT / "trips" / ctx["slug"] / "topology.yaml"
+    placement = topology_placement(topology) if topology.exists() else "lxc"
+    problems = evidence_problems(evidence, shared_bridge_required=placement == PLACEMENT_VM_CONTAINER)
     check(not problems, f"{len(evidence)} verification check(s) recorded",
           f"verification_evidence is not what a build records: {'; '.join(problems)} — {evidence}")
     for hard_gated in ("release_compatibility", "runtime_health", "rendered_data"):
@@ -659,14 +661,65 @@ BASE_EVIDENCE = ("backup_checkpoint", "mcp_isolation", "messaging_binding",
 SHARED_BRIDGE_EVIDENCE = "site_to_bridge"
 
 
-def evidence_problems(evidence: dict) -> "list[str]":
-    """What is wrong with one trip's verification_evidence rows; empty when nothing is."""
+def evidence_problems(evidence: dict, shared_bridge_required: bool = False) -> "list[str]":
+    """What is wrong with one trip's verification_evidence rows; empty when nothing is.
+
+    `shared_bridge_required`: the trip is a vm-container one, which only exists on the shared bridge
+    (TRIP_MCP_BRIDGE=shared is a precondition of that placement), so a missing site_to_bridge is a problem
+    there and not merely an absent optional check."""
     problems = [f"{name} missing" for name in BASE_EVIDENCE if name not in evidence]
     problems += [f"{name} is not a check a build records" for name in evidence
                  if name not in BASE_EVIDENCE and name != SHARED_BRIDGE_EVIDENCE]
+    if shared_bridge_required and SHARED_BRIDGE_EVIDENCE not in evidence:
+        problems.append(f"{SHARED_BRIDGE_EVIDENCE} missing (a vm-container trip is always on the shared bridge)")
     if SHARED_BRIDGE_EVIDENCE in evidence and evidence[SHARED_BRIDGE_EVIDENCE] != "passed":
         problems.append(f"{SHARED_BRIDGE_EVIDENCE}: {evidence[SHARED_BRIDGE_EVIDENCE]}")
     return problems
+
+
+#: `placement:` in a trip's topology.yaml (docs/specs/sprint-9/x-trip-vm-container-placement.md).
+PLACEMENT_LXC, PLACEMENT_VM_CONTAINER = "lxc", "vm-container"
+
+
+def topology_placement(topology: Path) -> str:
+    """The trip's recorded placement; absent means lxc, as everywhere else."""
+    for line in topology.read_text().splitlines():
+        if line.startswith("placement:"):          # top level only: nothing nested is indented to column 0
+            return line.split(":", 1)[1].strip().strip("'\"")
+    return PLACEMENT_LXC
+
+
+def trip_store_dir(topology: Path, root: "str | None" = None) -> Path:
+    """A vm-container trip's directory on the document store, as THIS host sees it: <KINERARY_NFS_ROOT>/<trip id>.
+    The topology's nfs_host_dir is the worker's view of the export; only its last segment (the trip id) is portable."""
+    root = root if root is not None else os.environ.get("KINERARY_NFS_ROOT", "")
+    if not root:
+        raise Failed("KINERARY_NFS_ROOT is not set: a vm-container trip's .env and config are read from the document "
+                     "store, and the harness has to be told where this host mounts it (vm-e2e.sh passes vm.env's value)")
+    for line in topology.read_text().splitlines():
+        if line.strip().startswith("nfs_host_dir:"):
+            segment = line.split(":", 1)[1].strip().strip("'\"").rstrip("/").rsplit("/", 1)[-1]
+            if re.fullmatch(r"trip_[0-9a-f]{8,64}", segment):
+                return Path(root) / segment
+            break
+    raise Failed("topology.yaml names no trip-id directory (container.nfs_host_dir)")
+
+
+def read_site_file(ctx: dict, name: str, run=subprocess.run) -> str:
+    """A file the TRIP SITE holds - its own `.env` or `trip.config.json` - read where that placement keeps it:
+    inside the LXC through pct for an lxc trip, from the trip's directory on the document store for a
+    vm-container one (the container mounts exactly that directory). Not the Mac's copy: that was right on a run
+    where the site's own was not."""
+    if name not in (".env", "trip.config.json"):
+        raise ValueError(name)
+    if ctx.get("placement") == PLACEMENT_VM_CONTAINER:
+        return (ctx["store"] / ("trip/" + name if name == "trip.config.json" else name)).read_text()
+    remote = "/opt/kinerary/.env" if name == ".env" else f"/opt/kinerary/trips/{ctx['slug']}/trip.config.json"
+    return run(
+        ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519_proxmox_hermes"), "root@192.168.0.40",
+         f"pct exec {ctx['vmid']} -- cat {remote}"],
+        capture_output=True, text=True,
+    ).stdout
 
 
 def stage_site(ctx: dict) -> None:
@@ -678,7 +731,14 @@ def stage_site(ctx: dict) -> None:
                for l in topology.read_text().splitlines() if "ipv4:" in l), "")
     check(bool(ip), f"container ip {ip}", "no ipv4 in topology")
     ctx["ip"] = ip
-    ctx["vmid"] = vmid_for(topology)
+    ctx["placement"] = topology_placement(topology)
+    if ctx["placement"] == PLACEMENT_VM_CONTAINER:
+        # No container id to pct into and no vmid: the site's own files are on the document store.
+        ctx["vmid"] = None
+        ctx["store"] = trip_store_dir(topology)
+        ok(f"a vm-container trip: its directory is {ctx['store']}")
+    else:
+        ctx["vmid"] = vmid_for(topology)
 
     code = subprocess.run(
         ["curl", "-s", "-o", "/dev/null", "-m", "10", "-w", "%{http_code}", f"http://{ip}:8080/"],
@@ -688,11 +748,7 @@ def stage_site(ctx: dict) -> None:
 
     # The config the CONTAINER holds, not the copy on this Mac — that copy was
     # right on a run where the container's was not.
-    cfg = subprocess.run(
-        ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519_proxmox_hermes"), "root@192.168.0.40",
-         f"pct exec {vmid_for(topology)} -- cat /opt/kinerary/trips/{slug}/trip.config.json"],
-        capture_output=True, text=True,
-    ).stdout
+    cfg = read_site_file(ctx, "trip.config.json")
     check(bool(cfg.strip()), "container holds a trip.config.json", "no config inside the container")
     data = json.loads(cfg)
     title = (data.get("meta") or {}).get("title", "")
@@ -1267,11 +1323,7 @@ def stage_served(ctx: dict) -> None:
     """
     stage("The site serves it — logged in, the way a traveller reads it")
     ip, slug = ctx["ip"], ctx["slug"]
-    env = subprocess.run(
-        ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519_proxmox_hermes"), "root@192.168.0.40",
-         f"pct exec {ctx['vmid']} -- cat /opt/kinerary/.env"],
-        capture_output=True, text=True,
-    ).stdout
+    env = read_site_file(ctx, ".env")
     password = next((l.split("=", 1)[1].strip() for l in env.splitlines() if l.startswith("SEED_PASSWORD=")), "")
     check(bool(password), "the site has a password to log in with",
           "no SEED_PASSWORD in the container's .env — nobody can log in to this trip at all")
@@ -1409,6 +1461,10 @@ def stage_bridge_reach(ctx: dict, system: "str | None" = None, run=subprocess.ru
                        deploy_root: "Path | None" = None, repo: "Path | None" = None) -> bool:
     """On macOS, restart the trip's bridge from this process and assert that it
     can reach the trip. Returns whether it ran (False off macOS, doing nothing)."""
+    if ctx.get("placement") == PLACEMENT_VM_CONTAINER:
+        # A container trip is on the shared bridge, which is its own service: there is no per-trip bridge to
+        # restart from here, and the site-to-bridge check the worker recorded is what proves the reach.
+        return False
     plan = bridge_restart_command(platform.system() if system is None else system, deploy_root or DEPLOY_ROOT,
                                   str(ctx["slug"]), repo or REPO)
     if plan is None:
@@ -1426,7 +1482,7 @@ def stage_bridge_reach(ctx: dict, system: "str | None" = None, run=subprocess.ru
     shutil.rmtree(log.parent, ignore_errors=True)
     check(result.returncode == 0, "setup-mcp.sh --restart-only restarted the bridge",
           f"setup-mcp.sh --restart-only failed:\n{tail}")
-    port = _env_file_value(trip_dir / "mcp" / ".env", "MCP_PORT") or str(3000 + int(ctx["vmid"]))
+    port = _env_file_value(trip_dir / "mcp" / ".env", "MCP_PORT") or (str(3000 + int(ctx["vmid"])) if ctx.get("vmid") else "")
     healthy, body = False, ""
     for _ in range(5):
         healthy, body = bridge_health(port, key, run=run)
@@ -1510,11 +1566,7 @@ def site_login(ctx: dict) -> "tuple[str, str]":
     container's own .env, and a participant from the trip's config.
     """
     base = f"http://{ctx['ip']}:8080"
-    env = subprocess.run(
-        ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519_proxmox_hermes"), "root@192.168.0.40",
-         f"pct exec {ctx['vmid']} -- cat /opt/kinerary/.env"],
-        capture_output=True, text=True,
-    ).stdout
+    env = read_site_file(ctx, ".env")
     password = next((l.split("=", 1)[1].strip() for l in env.splitlines() if l.startswith("SEED_PASSWORD=")), "")
     username = next((p.get("username") for p in (ctx["config"].get("participants") or []) if p.get("username")), "")
     login = subprocess.run(

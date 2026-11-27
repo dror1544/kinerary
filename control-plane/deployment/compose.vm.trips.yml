@@ -1,0 +1,47 @@
+# compose.vm.trips.yml — trip sites as containers on this host (`placement: vm-container`). An OVERLAY on
+# compose.vm.yml, never run alone:
+#
+#   docker compose -f compose.vm.yml -f compose.vm.trips.yml --env-file ... up -d
+#
+# (docs/specs/sprint-9/x-trip-vm-container-placement.md.) It does two things, and only when vm.env sets
+# `TRIP_CONTAINER_NETWORK`:
+#
+#   1. The runtime gateway joins the Docker network the trip containers run on, as an EXTERNAL network, so it
+#      can reach a trip's address (`runtime_routes.upstream_url`). The network is the trip-container host's
+#      (scripts/trip-container-host.sh creates it from TRIP_CONTAINER_NETWORK + TRIP_CONTAINER_SUBNET in its
+#      own root-owned configuration file), so it must EXIST before the gateway is brought up with this
+#      overlay: create it once, with exactly that subnet, or run one `ensure` first.
+#   2. The worker gets the key and the host pin it talks to that host's forced command with. The worker does
+#      NOT join the trips network: it verifies a site through the host's `check` verb, and the host's docker
+#      is never given to it.
+#
+# It exists as a second file, and not as a default in compose.vm.yml, because a compose network or a bind mount
+# cannot be attached conditionally: with `external: true` an unset variable would make every `up` of every
+# existing deployment fail on a network that does not exist. With the overlay left out, compose.vm.yml is byte
+# for byte what it was.
+#
+# EVERY compose call must carry the overlay or none of them may: a gateway recreated from compose.vm.yml alone
+# is off the trips network, and every container trip answers 502 while its site is healthy. The release tool
+# (vm-release.py) and the scripts that call compose by hand take the file set from vm-compose-files.sh, which
+# adds this file exactly when TRIP_CONTAINER_NETWORK is set in the env files.
+name: kinerary-cp
+
+services:
+  runtime-gateway:
+    networks: [ingress, trips]
+  worker:
+    environment:
+      # The same values the container sees (the paths below), so the two cannot drift apart.
+      TRIP_CONTAINER_SSH_KEY: /run/trip-container/ssh-key
+      TRIP_CONTAINER_SSH_KNOWN_HOSTS: /run/trip-container/known-hosts
+    volumes:
+      # The worker's OWN key for the trip-container host's forced command; never the companion's. 0600, readable by
+      # the worker's user (root here).
+      - ${TRIP_CONTAINER_SSH_KEY_HOST:?set TRIP_CONTAINER_SSH_KEY_HOST in vm.env to the worker's trip-container ssh key}:/run/trip-container/ssh-key:ro
+      # The host's key, pinned (ssh-keyscan once, then compared by a person): this channel carries every site's secrets.
+      - ${TRIP_CONTAINER_SSH_KNOWN_HOSTS_HOST:?set TRIP_CONTAINER_SSH_KNOWN_HOSTS_HOST in vm.env to the pinned known_hosts file}:/run/trip-container/known-hosts:ro
+
+networks:
+  trips:
+    name: ${TRIP_CONTAINER_NETWORK:?set TRIP_CONTAINER_NETWORK in vm.env}
+    external: true
