@@ -34,9 +34,13 @@ undo. A trip that already has a topology.yaml keeps whatever it says.
 """
 from __future__ import annotations
 
+import dataclasses
 import hmac
 import ipaddress
+import logging
 import os
+import re
+import time
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
@@ -47,13 +51,30 @@ from provisioning.adapters import (
     NpmProxyHostAdapter,
     ProxmoxLxcAdapter,
     SubprocessSshTransport,
+    generate_site_password,
 )
 from provisioning.engine import Provisioner
 from provisioning.models import (
-    CloudflareSpec, LxcSpec, PLACEMENT_LXC, PLACEMENT_VM_CONTAINER, ProxySpec, ROUTING_HOST, ROUTING_WILDCARD, ROUTINGS, Topology,
-    load_topology,
+    CloudflareSpec, ContainerSpec, LxcSpec, PLACEMENT_LXC, PLACEMENT_VM_CONTAINER, PLACEMENTS, ProxySpec, ROUTING_HOST,
+    ROUTING_WILDCARD, ROUTINGS, Topology, load_topology,
 )
 from provisioning.runtime import HttpJsonTransport
+
+from .trip_container import (
+    DockerSiteAdapter, TripContainerError, TripStore, TripStoreError, image_digest, validate_ip_pool,
+)
+
+logger = logging.getLogger(__name__)
+
+#: The port the trip-site image answers on (nginx in the container; the image fixes it).
+CONTAINER_SITE_PORT = 8080
+#: Where the container sees the trip's directory. Recorded in topology.yaml for a person reading it.
+CONTAINER_MOUNT_PATH = "/trip-store"
+#: A freshly started site needs a moment to answer /api/health: `check` is asked until it does, then this gives up.
+HEALTH_ATTEMPTS = 24
+HEALTH_DELAY_SECONDS = 5.0
+IMAGE_REPO = "trip-site"
+RELEASE_TAG = re.compile(rf"{IMAGE_REPO}:([0-9a-f]{{64}})")
 
 
 #: Label of a trip's own exchange key (docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md, K2). Versioned and
@@ -62,6 +83,20 @@ TRIP_KEY_LABEL = "kinerary-trip-exchange:v1:"
 
 #: What `runtime_routes.trip_key` can say about the key a trip's site holds.
 TRIP_KEY_KINDS = ("shared", "derived")
+
+
+@dataclasses.dataclass(frozen=True)
+class ContainerSite:
+    """One vm-container trip as the steps after `ensure` need it. Holds no secret except the exchange-key
+    candidates, which are the worker's own configuration and live only for the duration of one provision."""
+
+    slug: str
+    trip_id: str
+    ip: str
+    port: int
+    digest: str                      # the 64 hex digits of the release digest: the image is trip-site:<digest>
+    store: TripStore
+    key_candidates: dict = dataclasses.field(default_factory=dict, repr=False)
 
 
 def derive_trip_key(master: str, trip_id: str) -> str:
@@ -174,7 +209,37 @@ class LxcProvisionAdapter:
         provisioner_factory: Callable[[], Provisioner] | None = None,
         routing: str = ROUTING_HOST,
         shared_bridge_site_url: str = "",
+        placement: str = PLACEMENT_LXC,
+        container_site: DockerSiteAdapter | None = None,
+        container_ip_pool: Sequence[str] = (),
+        nfs_local_base: str = "",
+        health_attempts: int = HEALTH_ATTEMPTS,
+        health_delay_s: float = HEALTH_DELAY_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        # TRIP_PLACEMENT: where a NEW trip's site runs. `lxc` (default) is everything above. `vm-container`:
+        # one Docker container on the control-plane host, driven through `container_site` (the forced-command
+        # client); it needs wildcard routing, a pool of container addresses and the document store as THIS
+        # process sees it (the worker writes the trip's `trip/` directory there). A trip that already has a
+        # topology.yaml keeps its own recorded placement whatever this says, and a worker that places new trips
+        # on LXCs still re-provisions the containers it built, when `container_site` is given.
+        if placement not in PLACEMENTS:
+            raise ValueError(f"placement must be one of {', '.join(PLACEMENTS)}")
+        if placement == PLACEMENT_VM_CONTAINER:
+            if routing != ROUTING_WILDCARD:
+                raise ValueError("placement vm-container requires routing wildcard")
+            if container_site is None or not nfs_local_base or not list(container_ip_pool):
+                raise ValueError(
+                    "placement vm-container needs the trip-container host (TRIP_CONTAINER_SSH_*), a "
+                    "TRIP_CONTAINER_IP_POOL and PROVISIONER_TRIP_NFS_LOCAL_BASE"
+                )
+        self._placement = placement
+        self._container = container_site
+        self._container_ip_pool = validate_ip_pool(list(container_ip_pool))
+        self._nfs_local_base = nfs_local_base.rstrip("/") if nfs_local_base else ""
+        self._health_attempts = health_attempts
+        self._health_delay_s = health_delay_s
+        self._sleep = sleep
         # TRIP_ROUTING. `host`: every NEW trip gets an NPM proxy host, a
         # Cloudflare DNS record and a tunnel ingress rule (all the parameters
         # below are then required by the worker's startup, as before).
@@ -267,14 +332,22 @@ class LxcProvisionAdapter:
         topology_path = self._topology_path(slug)
         topology = self._load_topology(topology_path)
         if topology is None:
+            if self._placement != PLACEMENT_LXC:
+                # create_container is the LXC path. A caller that reached it for a NEW trip under
+                # TRIP_PLACEMENT=vm-container would otherwise get an LXC the operator did not ask for.
+                raise RuntimeError(
+                    f"this worker places new trips as {self._placement}; {slug} must go through "
+                    "prepare_container, not create_container"
+                )
             topology = self._build_topology(slug, trip_id)
             self._write_topology(topology_path, topology, slug)
         if topology.placement != PLACEMENT_LXC:
-            # A recorded placement always wins, and this adapter only knows LXCs. Refuse before a
-            # transport is built or an adapter is asked anything, so nothing can act on half a trip.
+            # A recorded placement always wins, and this is the LXC path. Refuse before a transport is built
+            # or an adapter is asked anything, so nothing can act on half a trip. (A vm-container trip is
+            # built by prepare_container / activate_container; ShellDeployAdapter picks by placement_of.)
             raise RuntimeError(
-                f"{slug}'s topology.yaml records placement {topology.placement}, which this worker "
-                "cannot build or re-provision yet"
+                f"{slug}'s topology.yaml records placement {topology.placement}, which create_container "
+                "(the LXC path) never builds or re-provisions"
             )
 
         # Consumed by _build_provisioner below. On a first provision the
@@ -343,6 +416,8 @@ class LxcProvisionAdapter:
 
         Needs the trip's bridge route to exist, so the worker calls it AFTER the companion step has
         wired the trip, never before."""
+        if self._recorded_placement(slug) == PLACEMENT_VM_CONTAINER:
+            return self._verify_container_bridge(slug)
         if not self._shared_bridge_site_url:
             return None
         topology = self._load_topology(self._topology_path(slug))
@@ -355,6 +430,194 @@ class LxcProvisionAdapter:
                 host=self._proxmox_host, user=self._proxmox_ssh_user, identity_file=self._proxmox_ssh_key,
             ))
         return proxmox.check_site_to_bridge(topology.lxc, self._shared_bridge_site_url)
+
+    # ── placement: vm-container ──────────────────────────────────────────
+    #
+    # A trip's site as one Docker container on the control-plane host. Nothing below calls Proxmox, NPM,
+    # Cloudflare or the engine (`provisioning.engine.Provisioner` refuses a vm-container topology, and stays
+    # that way): the worker asks the host's forced command (DockerSiteAdapter) and writes the trip's own
+    # directory on the document store. The caller (ShellDeployAdapter) runs the three steps in this order:
+    #
+    #   prepare_container    topology, first-provision wipe, `ensure` (which makes the directory and hands it
+    #                        to the container's uid, so it has to come before anything is written there)
+    #   <the caller writes trip/ and the documents into site.store>
+    #   activate_container   `deploy` on the release's image, `check` until healthy, the read-backs
+    #
+    # Every step is idempotent, and the topology (with its container address) is committed before the first
+    # side effect, as for an LXC, so a retried job reuses the address it chose.
+
+    def _recorded_placement(self, slug: str) -> str | None:
+        """The placement this trip's own topology.yaml records; None when it has none or cannot be read."""
+        try:
+            raw = yaml.safe_load(self._topology_path(slug).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        value = raw.get("placement", PLACEMENT_LXC)
+        return value if isinstance(value, str) else None
+
+    def placement_of(self, slug: str) -> str:
+        """Where this trip's site runs: what its topology.yaml records, always winning, else what this worker
+        places NEW trips on (TRIP_PLACEMENT)."""
+        return self._recorded_placement(slug) or self._placement
+
+    def prepare_container(
+        self, slug: str, *, first_provision: bool = False, trip_id: str | None = None,
+        release_digest: str | None = None,
+    ) -> "ContainerSite":
+        digest = image_digest(release_digest)          # first: a provision with no image to run changes nothing
+        if self._container is None:
+            raise RuntimeError(
+                f"{slug} is a vm-container trip but this worker has no trip-container host configured "
+                "(TRIP_CONTAINER_SSH_HOST and its key)"
+            )
+        if not trip_id:
+            # An LXC falls back to the slug for its directory; a container never does: the host's directory,
+            # its TRIP.txt and its mount point are all named by trip id.
+            raise RuntimeError(f"a vm-container trip is built from its trip id; none was given for {slug}")
+        exchange_key, key_candidates = self._exchange_keys_for(trip_id)
+        self._site_key_kinds.pop(slug, None)
+        self._site_passwords.pop(slug, None)
+        topology_path = self._topology_path(slug)
+        topology = self._load_topology(topology_path)
+        if topology is None:
+            if self._placement != PLACEMENT_VM_CONTAINER:
+                raise RuntimeError(f"{slug} has no topology and this worker places new trips as {self._placement}")
+            topology = self._build_container_topology(slug, trip_id, digest)
+            self._write_topology(topology_path, topology, slug)
+        if topology.placement != PLACEMENT_VM_CONTAINER:
+            raise RuntimeError(f"{slug}'s topology.yaml records placement {topology.placement}, not vm-container")
+        spec = topology.container
+        dirname = spec.nfs_host_dir.rstrip("/").rsplit("/", 1)[-1]
+        if dirname != trip_id:
+            raise RuntimeError(f"{slug}'s recorded directory {dirname!r} is not named by its trip id")
+        store = TripStore(self._nfs_local_base, dirname, trip_id)
+
+        # The first-provision wipe: what `reset_trip_data` removes for an LXC (the SQLite data and the media), done
+        # through the stop verb and the worker's own view of the store. The container holds the database open on
+        # that very directory, so it is stopped first; `ensure` below makes the directories again and starts it.
+        if first_provision and os.path.isfile(os.path.join(store.path, "TRIP.txt")):
+            self._container.stop(trip_id, slug, missing_ok=True)
+            store.reset_data()
+
+        answer = self._container.ensure(
+            trip_id, slug, ip=spec.ipv4, image=digest,
+            # A candidate only: the host writes it solely when the trip has no .env yet, so a re-provision never
+            # rotates the password people already use (read back below).
+            seed_password=generate_site_password(),
+            exchange_key=exchange_key or None,
+            public_origin=spec.public_origin, trip_mcp_enabled=True,
+        )
+        logger.info("compute.container_ensured slug=%s container=%s env=%s", slug, answer.get("container"), answer.get("env"))
+        return ContainerSite(
+            slug=slug, trip_id=trip_id, ip=spec.ipv4, port=spec.forward_port, digest=digest, store=store,
+            key_candidates=key_candidates,
+        )
+
+    def activate_container(self, site: "ContainerSite") -> None:
+        assert self._container is not None
+        answer = self._container.deploy(site.trip_id, site.slug, ip=site.ip, image=site.digest)
+        self._record_container_image(site)
+        logger.info("compute.container_deployed slug=%s image=%s previous=%s", site.slug, site.digest[:12],
+                    (answer.get("previous_image") or "none")[-12:])
+        self._wait_until_healthy(site)
+        # What the site accepts and holds, read from the site's own .env by the host: on a first provision the
+        # values just generated, on a re-provision the ones it already had. A failure raises on purpose: the job
+        # retries, rather than the organizer being introduced to a site with no password to type.
+        fields = ["seed_password"] + (["exchange_key_kind"] if site.key_candidates else [])
+        read = self._container.read(
+            site.trip_id, site.slug, fields,
+            exchange_key_candidates=site.key_candidates or None,
+        )
+        password = read.get("seed_password")
+        self._site_passwords[site.slug] = password if isinstance(password, str) and password else None
+        self._site_key_kinds[site.slug] = (
+            self._key_kind_of(read.get("exchange_key_kind")) if site.key_candidates else None
+        )
+
+    def container_health(self, slug: str) -> "tuple[bool, str]":
+        """/api/health of this trip's container, asked from inside it by the host: (healthy, one-line evidence)."""
+        site = self._container_of(slug)
+        answer = self._container.check(site.trip_id, slug)       # type: ignore[union-attr]
+        healthy = answer.get("healthy") is True
+        return healthy, f"running={answer.get('running')} healthy={healthy} status={answer.get('status')}"
+
+    def container_store(self, slug: str) -> "TripStore":
+        return self._container_of(slug).store
+
+    def _container_of(self, slug: str) -> "ContainerSite":
+        topology = self._load_topology(self._topology_path(slug))
+        if self._container is None or topology is None or topology.placement != PLACEMENT_VM_CONTAINER:
+            raise RuntimeError(f"{slug} is not a vm-container trip this worker can reach")
+        spec = topology.container
+        dirname = spec.nfs_host_dir.rstrip("/").rsplit("/", 1)[-1]
+        match = RELEASE_TAG.fullmatch(spec.image)
+        return ContainerSite(
+            slug=slug, trip_id=dirname, ip=spec.ipv4, port=spec.forward_port, digest=match.group(1) if match else "",
+            store=TripStore(self._nfs_local_base, dirname, dirname), key_candidates={},
+        )
+
+    def _wait_until_healthy(self, site: "ContainerSite") -> None:
+        assert self._container is not None
+        last = "no answer"
+        for attempt in range(self._health_attempts):
+            answer = self._container.check(site.trip_id, site.slug)
+            if answer.get("healthy") is True:
+                return
+            last = f"running={answer.get('running')} status={answer.get('status')}"
+            if attempt + 1 < self._health_attempts:
+                self._sleep(self._health_delay_s)
+        raise TripContainerError(
+            f"{site.slug}'s container did not become healthy after {self._health_attempts} checks ({last})"
+        )
+
+    def _record_container_image(self, site: "ContainerSite") -> None:
+        """The topology says which image the container runs now (a reader finds the way back from the host's
+        `previous_image`, not from here)."""
+        path = self._topology_path(site.slug)
+        topology = self._load_topology(path)
+        if topology is None or topology.placement != PLACEMENT_VM_CONTAINER:
+            return
+        tag = f"{IMAGE_REPO}:{site.digest}"
+        if topology.container.image == tag:
+            return
+        updated = Topology(
+            version=topology.version, name=topology.name, lxc=None, proxy=None, cloudflare=None,
+            routing=topology.routing, placement=topology.placement,
+            container=dataclasses.replace(topology.container, image=tag),
+        )
+        self._write_topology(path, updated, site.slug)
+
+    def _verify_container_bridge(self, slug: str) -> "tuple[bool, str] | None":
+        topology = self._load_topology(self._topology_path(slug))
+        if topology is None:
+            return None
+        if self._container is None:
+            raise RuntimeError(f"{slug} is a vm-container trip but this worker has no trip-container host configured")
+        trip_id = topology.container.nfs_host_dir.rstrip("/").rsplit("/", 1)[-1]
+        answer = self._container.read(trip_id, slug, ["site_to_bridge"]).get("site_to_bridge")
+        if not isinstance(answer, dict) or not isinstance(answer.get("ok"), bool) or not isinstance(answer.get("evidence"), str):
+            raise TripContainerError("the trip-container host's site_to_bridge answer was not (ok, evidence)")
+        return answer["ok"], answer["evidence"][:300]
+
+    def _build_container_topology(self, slug: str, trip_id: str, digest: str) -> Topology:
+        """A NEW vm-container trip's topology: a `container:` section reusing the LXC key names, no proxmox,
+        npm or cloudflare section, wildcard routing. The container's address is the first free one in
+        TRIP_CONTAINER_IP_POOL; its directory on the store is named by trip id, as an LXC's is."""
+        ipv4 = self._allocate_ip(slug, self._container_ip_pool, "TRIP_CONTAINER_IP_POOL")
+        hostname = f"{slug}.{self._hostname_domain}"
+        return Topology(
+            version=1, name=slug, lxc=None, proxy=None, cloudflare=None,
+            routing=ROUTING_WILDCARD, placement=PLACEMENT_VM_CONTAINER,
+            container=ContainerSpec(
+                name=f"trip-{slug}", ipv4=ipv4, forward_port=CONTAINER_SITE_PORT, public_hostname=hostname,
+                # The worker's view of the trip's directory (the host derives its own from the trip id); both
+                # paths end in the trip id, which is all the line scanners read.
+                nfs_host_dir=f"{self._nfs_local_base}/{trip_id}", nfs_mount_path=CONTAINER_MOUNT_PATH,
+                image=f"{IMAGE_REPO}:{digest}", trip_slug=slug, public_origin=f"https://{hostname}",
+            ),
+        )
 
     @staticmethod
     def _key_kind_of(answer: object) -> str | None:
@@ -468,14 +731,17 @@ class LxcProvisionAdapter:
         # kebab-case slug with a trip- prefix is short in practice.
         return f"trip-{slug}"[:63]
 
-    def _allocate_ip(self, slug: str) -> str:
+    def _allocate_ip(
+        self, slug: str, pool: Sequence[str] | None = None, setting: str = "PROVISIONER_LXC_IP_POOL",
+    ) -> str:
+        pool = self._ip_pool if pool is None else pool
         used = self._ips_already_claimed(exclude_slug=slug)
-        for candidate in self._ip_pool:
+        for candidate in pool:
             if candidate not in used:
                 return candidate
         raise RuntimeError(
-            f"no free IP in the configured pool ({len(self._ip_pool)} candidates, "
-            f"{len(used)} already claimed) — add more to PROVISIONER_LXC_IP_POOL"
+            f"no free IP in the configured pool ({len(pool)} candidates, "
+            f"{len(used)} already claimed) — add more to {setting}"
         )
 
     def _ips_already_claimed(self, exclude_slug: str) -> set[str]:

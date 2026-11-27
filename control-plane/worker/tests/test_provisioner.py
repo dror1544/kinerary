@@ -68,6 +68,7 @@ class FakeDeployAdapter:
         source_dir: str | None = None,
         documents: Any = None,
         trip_id: str | None = None,
+        release_digest: str | None = None,
     ) -> str:
         if self._fail:
             exc = RuntimeError("simulated deploy failure")
@@ -76,7 +77,7 @@ class FakeDeployAdapter:
         self.deployed.append({
             "slug": slug, "config": config, "first_provision": first_provision,
             "sidecars": sidecars or {}, "source_dir": source_dir,
-            "documents": list(documents or []), "trip_id": trip_id,
+            "documents": list(documents or []), "trip_id": trip_id, "release_digest": release_digest,
         })
         return f"https://{slug}.test.example"
 

@@ -134,17 +134,21 @@ _SHARED_SITE_URL = re.compile(
 )
 
 
-def _shared_site_url(raw: str) -> str:
+def _shared_site_url(raw: str, name: str = "TRIP_MCP_SHARED_SITE_URL") -> str:
     """"" (unset, or passed through empty by compose) or a plain http(s) origin with a valid port."""
     if raw == "":
         return ""
     port = raw.rsplit(":", 1)[-1] if re.search(r":[0-9]+$", raw) else ""
     if not _SHARED_SITE_URL.fullmatch(raw) or (port and not 0 < int(port) < 65536):
         raise argparse.ArgumentTypeError(
-            "TRIP_MCP_SHARED_SITE_URL must be a plain http(s) origin, http(s)://<host>[:<port>], "
+            f"{name} must be a plain http(s) origin, http(s)://<host>[:<port>], "
             "with no path, credentials, query or fragment"
         )
     return raw
+
+
+def _container_bridge_url(raw: str) -> str:
+    return _shared_site_url(raw, "TRIP_CONTAINER_BRIDGE_URL")
 
 
 def _refuse_unsafe_key_and_bridge_settings(args: argparse.Namespace) -> None:
@@ -165,15 +169,28 @@ def _refuse_unsafe_key_and_bridge_settings(args: argparse.Namespace) -> None:
             "\"Rolling it out\")"
         )
     shared = args.trip_mcp_bridge == "shared"
+    container_settings = _container_settings(args)
     if args.trip_placement == "vm-container":
-        # Both settings are named at once: an operator who fixed the first and restarted would otherwise
-        # be told about the second only now.
+        # Every setting that is missing is named at once: an operator who fixed the first and restarted would
+        # otherwise be told about the second only now.
         missing = [text for ok, text in (
             (args.trip_routing == "wildcard", f"TRIP_ROUTING=wildcard (now {args.trip_routing})"),
             (shared, f"TRIP_MCP_BRIDGE=shared (now {args.trip_mcp_bridge})"),
+            (args.enable_compute, "PROVISIONER_COMPUTE_ENABLED=1 (the container path is the compute adapter's)"),
+            (bool(os.environ.get("PROVISIONER_TRIP_NFS_LOCAL_BASE")),
+             "PROVISIONER_TRIP_NFS_LOCAL_BASE (the document store as this worker sees it: it writes each trip's "
+             "trip/ directory there)"),
         ) if not ok]
+        missing += [f"{name}" for name, value in container_settings.items() if not value]
         if missing:
             raise ValueError(f"TRIP_PLACEMENT=vm-container requires {' and '.join(missing)}")
+    elif any(container_settings.values()) and not all(container_settings.values()):
+        # Configured for re-provisioning the containers a vm-container worker built, but not completely: the
+        # trip-container host would be reachable for some trips and silently not for others.
+        raise ValueError(
+            "TRIP_CONTAINER_* is set but incomplete; it needs "
+            + ", ".join(name for name, value in container_settings.items() if not value)
+        )
     if shared and not args.trip_mcp_shared_site_url:
         raise ValueError(
             "TRIP_MCP_SHARED_SITE_URL is required with TRIP_MCP_BRIDGE=shared: the address trip containers "
@@ -181,14 +198,58 @@ def _refuse_unsafe_key_and_bridge_settings(args: argparse.Namespace) -> None:
         )
     if args.trip_mcp_shared_site_url and not shared:
         raise ValueError("TRIP_MCP_SHARED_SITE_URL is set but TRIP_MCP_BRIDGE is not shared; unset one of them")
+
+
+def _container_settings(args: argparse.Namespace) -> "dict[str, str]":
+    """The trip-container host settings, by the name an operator sets them under. An unset one is ""."""
+    return {
+        "TRIP_CONTAINER_SSH_HOST": args.trip_container_ssh_host or "",
+        "TRIP_CONTAINER_SSH_USER": args.trip_container_ssh_user or "",
+        "TRIP_CONTAINER_SSH_KEY": args.trip_container_ssh_key or "",
+        "TRIP_CONTAINER_SSH_KNOWN_HOSTS": args.trip_container_ssh_known_hosts or "",
+        "TRIP_CONTAINER_IP_POOL": args.trip_container_ip_pool or "",
+        "TRIP_CONTAINER_BRIDGE_URL": args.trip_container_bridge_url or "",
+    }
+
+
+def _container_adapter_arguments(args: argparse.Namespace) -> "dict[str, object]":
+    """What LxcProvisionAdapter is told about the trip-container host: nothing at all for a worker with no
+    TRIP_CONTAINER_* and the default placement (its construction is then exactly what it always was), the
+    client and the pool otherwise. With TRIP_PLACEMENT=vm-container the host is asked once, now, whether its
+    forced command answers, so a missing key, a wrong pin or an uninstalled sudoers line stops the worker at
+    start instead of failing the first organizer's provision."""
+    settings = _container_settings(args)
+    if args.trip_placement != "vm-container" and not any(settings.values()):
+        return {}
+    from .trip_container import DockerSiteAdapter, TripContainerError, ssh_transport, validate_ip_pool
+    try:
+        pool = validate_ip_pool(json.loads(settings["TRIP_CONTAINER_IP_POOL"]))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"TRIP_CONTAINER_IP_POOL is not a usable pool: {exc}") from None
+    if not pool:
+        raise ValueError("TRIP_CONTAINER_IP_POOL must be a non-empty JSON array of IPv4 addresses")
+    client = DockerSiteAdapter(
+        ssh_transport(
+            settings["TRIP_CONTAINER_SSH_HOST"], settings["TRIP_CONTAINER_SSH_USER"],
+            os.path.expanduser(settings["TRIP_CONTAINER_SSH_KEY"]), settings["TRIP_CONTAINER_SSH_KNOWN_HOSTS"],
+        ),
+        bridge_url=settings["TRIP_CONTAINER_BRIDGE_URL"],
+    )
     if args.trip_placement == "vm-container":
-        # Placement is modelled and its combinations are checked, but nothing builds a vm-container trip
-        # yet; starting would let the operator believe new trips were being placed there. The
-        # worker-adapters change lifts this.
-        raise ValueError(
-            "TRIP_PLACEMENT=vm-container is not available yet: the model is in place but this worker cannot "
-            "build such a trip; unset TRIP_PLACEMENT (or set it to lxc)"
-        )
+        try:
+            client.preflight()
+        except TripContainerError as exc:
+            # Composed from the host's own reason, never from a request value: safe to print, and the one thing the
+            # operator needs. (main() shows a ValueError's text and suppresses any other exception's.)
+            raise ValueError(f"the trip-container host failed its start-up check: {exc}") from None
+        print(f"trip container host: ssh -> {settings['TRIP_CONTAINER_SSH_USER']}@{settings['TRIP_CONTAINER_SSH_HOST']} "
+              "(forced-command key, pinned host key)", flush=True)
+    return {
+        "placement": args.trip_placement,
+        "container_site": client,
+        "container_ip_pool": pool,
+        "nfs_local_base": os.environ.get("PROVISIONER_TRIP_NFS_LOCAL_BASE", ""),
+    }
 
 
 def _add_companion_ssh_arguments(parser: argparse.ArgumentParser) -> None:
@@ -309,13 +370,35 @@ def build_parser() -> argparse.ArgumentParser:
     # what it says whichever this is. Compose passes `${TRIP_ROUTING:-}`, so an
     # unset variable arrives as "" and means `host`.
     # Where a NEW trip's site runs. `lxc` (default): one Proxmox LXC per trip, as always. `vm-container`:
-    # one Docker container on the control-plane host; it needs TRIP_ROUTING=wildcard and
-    # TRIP_MCP_BRIDGE=shared, and is refused as "not available yet" for now. A trip's own topology.yaml
+    # one Docker container on the control-plane host; it needs TRIP_ROUTING=wildcard, TRIP_MCP_BRIDGE=shared and
+    # the TRIP_CONTAINER_* settings below. A trip's own topology.yaml
     # records its placement and always wins. Compose passes `${TRIP_PLACEMENT:-}`, so an unset variable
     # arrives as "" and means `lxc`.
     provision.add_argument("--trip-placement", type=_choice_of("TRIP_PLACEMENT", TRIP_PLACEMENTS),
                            default=os.environ.get("TRIP_PLACEMENT") or "lxc",
                            help="lxc (default) | vm-container — see above (TRIP_PLACEMENT)")
+    # The trip-container host: a forced-command SSH key (scripts/trip-container-host.sh) on the control-plane
+    # host, which runs each vm-container trip's site as a Docker container. The worker never holds the Docker
+    # socket. All six are needed together (TRIP_PLACEMENT=vm-container requires them; set without it, they only
+    # let this worker re-provision containers it built before, and then must be complete too). The key is its
+    # own - never the companion one - and the host key is pinned: this channel carries each site's secrets.
+    provision.add_argument("--trip-container-ssh-host", default=os.environ.get("TRIP_CONTAINER_SSH_HOST"),
+                           help="the control-plane host's address as the worker reaches it (TRIP_CONTAINER_SSH_HOST)")
+    provision.add_argument("--trip-container-ssh-user", default=os.environ.get("TRIP_CONTAINER_SSH_USER"),
+                           help="the host user whose authorized_keys line forces trip-container-host.sh "
+                                "(TRIP_CONTAINER_SSH_USER)")
+    provision.add_argument("--trip-container-ssh-key", default=os.environ.get("TRIP_CONTAINER_SSH_KEY"),
+                           help="the private key for that user (TRIP_CONTAINER_SSH_KEY)")
+    provision.add_argument("--trip-container-ssh-known-hosts", default=os.environ.get("TRIP_CONTAINER_SSH_KNOWN_HOSTS"),
+                           help="a known_hosts file pinning the host; required, there is no trust-on-first-use "
+                                "(TRIP_CONTAINER_SSH_KNOWN_HOSTS)")
+    provision.add_argument("--trip-container-ip-pool", default=os.environ.get("TRIP_CONTAINER_IP_POOL"),
+                           help="JSON array of addresses inside the trip network's subnet, one per container, "
+                                "never the gateway Docker takes (TRIP_CONTAINER_IP_POOL)")
+    provision.add_argument("--trip-container-bridge-url", type=_container_bridge_url,
+                           default=os.environ.get("TRIP_CONTAINER_BRIDGE_URL") or "",
+                           help="http(s)://<host>[:<port>] of the shared bridge as a trip CONTAINER reaches it; "
+                                "exactly the host's own TRIP_CONTAINER_BRIDGE_URL (TRIP_CONTAINER_BRIDGE_URL)")
     provision.add_argument("--trip-routing", type=_choice_of("TRIP_ROUTING", TRIP_ROUTINGS),
                            default=os.environ.get("TRIP_ROUTING") or "host",
                            help="host (default) | wildcard — see above (TRIP_ROUTING)")
@@ -469,9 +552,15 @@ def main(argv: list[str] | None = None) -> int:
             # behavior exactly (a slug missing from --vmid-map fails loudly
             # instead of a real LXC/NPM/Cloudflare create happening).
             if args.enable_compute:
-                ip_pool = json.loads(_required_env("PROVISIONER_LXC_IP_POOL"))
-                if not isinstance(ip_pool, list) or not ip_pool:
+                # A vm-container worker needs none of Proxmox's variables or the LXC address pool (it places NEW
+                # trips on the control-plane host); they stay optional so it can still re-provision an LXC trip
+                # it finds with its own topology, and are required when LXCs are what new trips get.
+                lxc_placement = args.trip_placement == "lxc"
+                lxc_env = _required_env if lxc_placement else _optional_env
+                ip_pool = json.loads(lxc_env("PROVISIONER_LXC_IP_POOL") or "[]")
+                if not isinstance(ip_pool, list) or (lxc_placement and not ip_pool):
                     raise ValueError("PROVISIONER_LXC_IP_POOL must be a non-empty JSON array of IPv4 addresses")
+                container_extra = _container_adapter_arguments(args)
                 # The public-infrastructure variables are required only where a
                 # new trip creates public infrastructure: `host` routing. In
                 # `wildcard` they may all be unset - and a worker that does
@@ -487,10 +576,10 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 compute_adapter = LxcProvisionAdapter(
                     deploy_root=args.deploy_root,
-                    node=_required_env("PROXMOX_NODE"),
-                    template=_required_env("PROXMOX_LXC_TEMPLATE"),
-                    storage=_required_env("PROXMOX_STORAGE"),
-                    bridge=_required_env("PROXMOX_BRIDGE"),
+                    node=lxc_env("PROXMOX_NODE"),
+                    template=lxc_env("PROXMOX_LXC_TEMPLATE"),
+                    storage=lxc_env("PROXMOX_STORAGE"),
+                    bridge=lxc_env("PROXMOX_BRIDGE"),
                     ip_pool=ip_pool,
                     hostname_domain=_required_env("PROVISIONER_LXC_HOSTNAME_DOMAIN"),
                     tunnel_id=(_required_env if host_routing else _optional_env)("PROVISIONER_LXC_TUNNEL_ID"),
@@ -534,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
                     # .env gets HERMES_URL=<this> and its site is checked against the bridge from
                     # inside its own container.
                     shared_bridge_site_url=args.trip_mcp_shared_site_url,
+                    **container_extra,
                 )
             else:
                 compute_adapter = NullComputeAdapter()

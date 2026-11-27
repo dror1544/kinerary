@@ -12,7 +12,13 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEP="$REPO/control-plane/deployment"
-exec sudo env PYTHONUNBUFFERED=1 \
+# A vm-container trip keeps its .env and config on the document store, which the run reads from this host's own
+# mount of it (the same value compose gives the worker). Unset, the run says so when it meets such a trip.
+. "$DEP/vm-compose-files.sh"
+nfs_root="$(vm_compose_env_value KINERARY_NFS_ROOT /opt/kinerary-deploy/provisioning.env /opt/kinerary-deploy/vm.env 2>/dev/null || true)"
+extra=()
+[ -z "$nfs_root" ] || extra+=("KINERARY_NFS_ROOT=$nfs_root")
+exec sudo env PYTHONUNBUFFERED=1 ${extra[@]+"${extra[@]}"} \
   KINERARY_COMPOSE_PROJECT=kinerary-cp \
   KINERARY_RELAY_CONTAINER=kinerary-cp-relay-1 \
   KINERARY_RELAY_RESTART="$DEP/vm-relay-restart.sh" \
