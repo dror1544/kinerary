@@ -276,6 +276,19 @@ describe("the WhatsApp loop, end to end on the stand-in", { skip: SKIP }, () => 
     } finally { await done(); }
   });
 
+  test("a silent reply switches WhatsApp's typing indicator off (WhatsApp keeps it ~25 s otherwise; owner report 2026-11-27)", async () => {
+    const { relay, trip, gateway, done } = await scene();
+    try {
+      await bindGroup(pool, trip, NEW_GROUP, "Family trip");
+      const chat = alias.group(NEW_GROUP);
+      assert.equal((await gateway.act({ op: "typing", chat_id: chat })).success, true);
+      assert.equal((await gateway.act({ op: "send", chat_id: chat, content: SILENCE_SENTINEL })).success, true);
+      const typing = relay.fake.control.sent().filter((c) => c.kind === "typing" && c.chatId === NEW_GROUP);
+      assert.deepEqual(typing.map((c) => (c as { state?: string }).state), ["composing", "paused"], "composing, then paused when the companion says nothing");
+      assert.deepEqual(sends(relay), [], "still nothing is sent to the chat");
+    } finally { await done(); }
+  });
+
   test("AC-24: the silence verdict and the leak filter apply exactly as on Telegram; edit, typing and get_chat_info go through the bridge under the scope check", async () => {
     const { relay, trip, gateway, done } = await scene();
     try {

@@ -114,10 +114,10 @@ export class WhatsAppOutbound {
     return { ok: true };
   }
 
-  async typing(alias: string, tripId: string): Promise<DeliveryResult> {
+  async typing(alias: string, tripId: string, state: "composing" | "paused" = "composing"): Promise<DeliveryResult> {
     const address = await this.address(alias, tripId);
     if (!address) return { ok: false, error: "CHAT_NOT_IN_SCOPE" };
-    const typed = await this.deps.client.typing({ chatId: address });
+    const typed = await this.deps.client.typing({ chatId: address, ...(state === "paused" ? { state } : {}) });
     if (!typed.ok) return this.failure("typing", typed);
     this.deps.state.observe("connected", "outbound");
     return { ok: true };
