@@ -196,7 +196,12 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
   }
 
   async function onGroupsUpsert(groups) {
-    for (const g of groups ?? []) metadataCache.delete(normalizeId(g?.id));
+    for (const g of groups ?? []) {
+      metadataCache.delete(normalizeId(g?.id));
+      // The join carries the group's settings. The metadata a just-joined group answers with may not have the
+      // timer yet, so without this the introduction went out without it and showed the "(!) old version" marker.
+      if (g && "ephemeralDuration" in g) learnTimer(normalizeId(g.id), Number(g.ephemeralDuration) > 0 ? Number(g.ephemeralDuration) : 0);
+    }
     for (const event of await groupEventsFromUpsert(groups, { resolver, own, remember: rememberAdded })) {
       events.push(event);
     }
@@ -456,11 +461,16 @@ export function createBridge({ lib, sessionDir, log, timers, now = Date.now, epo
     }
     const options = {};
     let seconds = chatTimers.get(chatId);
+    let timerSource = seconds === undefined ? "none" : "learned";
     if (seconds === undefined && kind === "group") {
       const { md } = await groupMetadata(chatId);
       const d = Number(md?.ephemeralDuration ?? 0);
       seconds = Number.isFinite(d) && d > 0 ? d : 0;
+      timerSource = md ? ("ephemeralDuration" in md ? "metadata" : "metadata_without_timer") : "metadata_failed";
     }
+    // Where a group send's disappearing-message timer came from (no id, no value): a wrong one shows as the
+    // "(!) old version" marker on the message, so the source is what tells a bad guess from a missing field.
+    if (kind === "group") log("group_send_timer", { source: timerSource, on: seconds > 0 });
     if (seconds > 0) options.ephemeralExpiration = seconds;
     let quoted = false;
     if (typeof body.replyTo === "string") {

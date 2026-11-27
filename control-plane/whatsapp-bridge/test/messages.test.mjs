@@ -266,6 +266,21 @@ test("a group with no message seen yet takes its timer from the group's metadata
   assert.equal(sock.sent.at(-1).options.ephemeralExpiration, undefined);
 });
 
+test("joining a group learns its timer from the join itself (owner report 2026-11-27: the introduction carried the (!) marker)", async () => {
+  const { bridge, sock, logs } = await startBridge();
+  const ownEntry = { lid: OWN.lid, phone: OWN.phone };
+  // The metadata a just-joined group answers with may not carry the timer yet; the join event does.
+  sock.groups.set(NEW_GROUP, group(NEW_GROUP, [ALICE, OWN]));
+  await sock.emit("groups.upsert", [{ ...group(NEW_GROUP, [ALICE, ownEntry]), author: ALICE.lid, ephemeralDuration: 7776000 }]);
+  await bridge.send({ chatId: NEW_GROUP, text: "introduction" });
+  assert.equal(sock.sent.at(-1).options.ephemeralExpiration, 7776000);
+  const line = (logs ?? []).map((l) => (typeof l === "string" ? l : JSON.stringify(l))).find((l) => l.includes("group_send_timer"));
+  if (logs) {
+    assert.ok(line && line.includes("learned"), "a group send says where its timer came from");
+    assert.ok(!line.includes(NEW_GROUP.split("@")[0]), "no group id in the log");
+  }
+});
+
 test("an ephemeral wrapper is peeled", async () => {
   const { bridge, sock } = await startBridge();
   const msg = privateText();
