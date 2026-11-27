@@ -74,6 +74,47 @@ class TopologyValidationTests(unittest.TestCase):
 
         self.assertEqual("https://tokyo-2026.example.test", topology.lxc.public_origin)
 
+    def test_a_topology_file_with_no_placement_loads_as_lxc(self) -> None:
+        # AC-1: the shipped example predates placement and must keep meaning an LXC.
+        environment = {
+            "ONBOARDING_NAME": "fixture-onboarding", "PROXMOX_NODE": "node",
+            "LXC_NAME": "app", "PROXMOX_LXC_TEMPLATE": "template",
+            "PROXMOX_STORAGE": "storage", "PROXMOX_BRIDGE": "bridge",
+            "PROXMOX_GATEWAY": "192.0.2.1", "PROXMOX_NAMESERVER": "192.0.2.2",
+            "NFS_HOST_DIR": "/mnt/nfs/app", "NFS_MOUNT_PATH": "/nfs/app",
+            "PUBLIC_HOSTNAME": "site.example.invalid",
+            "CLOUDFLARE_TUNNEL_ID": "00000000-0000-0000-0000-000000000000",
+            "CLOUDFLARE_TUNNEL_SERVICE": "http://app:8080",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            topology = load_topology_file("provisioning/topology.example.yaml")
+        self.assertEqual("lxc", topology.placement)
+        self.assertIsNone(topology.container)
+
+    def test_placement_must_be_a_known_value_and_vm_container_has_its_own_sections(self) -> None:
+        base = {"version": 1, "name": "demo"}
+        with self.assertRaisesRegex(ProvisioningError, "placement must be one of lxc, vm-container"):
+            load_topology({**base, "placement": "docker"})
+        # vm-container: the container section is required, and proxmox is not read as a stand-in for it
+        with self.assertRaisesRegex(ProvisioningError, "container"):
+            load_topology({**base, "placement": "vm-container", "routing": "wildcard"})
+        with self.assertRaisesRegex(ProvisioningError, "proxmox is not allowed"):
+            load_topology({**base, "placement": "vm-container", "routing": "wildcard", "proxmox": {}})
+
+    def test_environment_references_work_in_a_container_section_too(self) -> None:
+        raw = {
+            "version": 1, "name": "demo", "placement": "vm-container", "routing": "wildcard",
+            "container": {
+                "name": "trip-demo", "ipv4": "198.51.100.10", "forward_port": 8080,
+                "public_hostname": "${DEMO_HOST}", "nfs_host_dir": "/srv/trip_x", "nfs_mount_path": "/trip",
+                "image": "trip-site:x",
+            },
+        }
+        with patch.dict("os.environ", {"DEMO_HOST": "demo.example.invalid"}, clear=True):
+            self.assertEqual("demo.example.invalid", load_topology(raw).public_host)
+        with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(ProvisioningError, "DEMO_HOST"):
+            load_topology(raw)
+
 
 if __name__ == "__main__":
     unittest.main()

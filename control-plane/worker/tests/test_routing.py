@@ -22,7 +22,7 @@ import yaml
 from control_plane_worker.__main__ import build_parser, main
 from control_plane_worker.compute import LxcProvisionAdapter
 from control_plane_worker.mcp_bridge import ShellMcpBridgeAdapter, mcp_port_for_vmid
-from control_plane_worker.provisioner import ShellDeployAdapter, TripRoute, topology_route
+from control_plane_worker.provisioner import ShellDeployAdapter, TripRoute, topology_public_hostname, topology_route
 from provisioning.engine import Provisioner
 from provisioning.models import ProvisioningError
 
@@ -327,6 +327,96 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(2, code, "host mode without its variables must still refuse to start")
 
 
+_SHARED_BRIDGE = {"TRIP_MCP_BRIDGE": "shared", "TRIP_MCP_SHARED_SITE_URL": "http://192.0.2.77:3999"}
+
+
+class PlacementStartupTests(unittest.TestCase):
+    """TRIP_PLACEMENT (spec x-trip-vm-container-placement.md, AC-2). Every vm-container start still
+    exits non-zero in this change, so each test asserts WHICH refusal it is, never only the exit code."""
+
+    NOT_YET = "not available yet"
+
+    def test_placement_defaults_to_lxc_and_an_empty_variable_means_the_default(self) -> None:
+        for env in ({}, {"TRIP_PLACEMENT": ""}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual("lxc", build_parser().parse_args(["provision"]).trip_placement)
+
+    def test_the_two_values_and_the_flag_are_accepted(self) -> None:
+        for value in ("lxc", "vm-container"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"TRIP_PLACEMENT": value}, clear=True):
+                self.assertEqual(value, build_parser().parse_args(["provision"]).trip_placement)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            args = build_parser().parse_args(["provision", "--trip-placement", "vm-container"])
+        self.assertEqual("vm-container", args.trip_placement)
+
+    def test_an_unknown_value_refuses_to_start_naming_the_variable(self) -> None:
+        for bad in ("docker", "VM-CONTAINER", "vm_container", " lxc", "lxc ", "1", "container"):
+            with self.subTest(value=bad), mock.patch.dict(os.environ, {"TRIP_PLACEMENT": bad}, clear=True), \
+                    redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as raised:
+                    build_parser().parse_args(["provision"])
+                self.assertEqual(2, raised.exception.code)
+                self.assertIn("TRIP_PLACEMENT", err.getvalue())
+
+    def test_an_unknown_value_refuses_even_with_compute_off(self) -> None:
+        code, text, adapter, _b = _run_main(
+            {**_REQUIRED_BASE, "PROVISIONER_COMPUTE_ENABLED": "0", "TRIP_PLACEMENT": "oops"})
+        self.assertEqual(2, code)
+        self.assertIn("TRIP_PLACEMENT", text)
+        self.assertNotIn(self.NOT_YET, text)
+        self.assertEqual({}, adapter)
+
+    def test_unset_and_lxc_start_as_they_always_did_and_say_which_placement(self) -> None:
+        for env in ({}, {"TRIP_PLACEMENT": ""}, {"TRIP_PLACEMENT": "lxc"}):
+            with self.subTest(env=env):
+                code, text, kwargs, _b = _run_main({**_REQUIRED_BASE, **_HOST_ONLY, **env})
+                self.assertEqual(0, code, text)
+                self.assertIn("trip placement: lxc", text, "the placement is said at every start")
+                self.assertNotIn("placement", kwargs, "the adapter is not told: nothing builds a vm-container trip")
+
+    def test_vm_container_with_the_wrong_routing_names_routing_and_not_the_bridge(self) -> None:
+        code, text, adapter, _b = _run_main({**_REQUIRED_BASE, **_HOST_ONLY, **_SHARED_BRIDGE,
+                                             "TRIP_PLACEMENT": "vm-container"})
+        self.assertEqual(2, code)
+        self.assertIn("TRIP_ROUTING=wildcard", text)
+        self.assertNotIn("TRIP_MCP_BRIDGE", text)
+        self.assertNotIn(self.NOT_YET, text)
+        self.assertEqual({}, adapter)
+
+    def test_vm_container_with_the_wrong_bridge_names_the_bridge_and_not_routing(self) -> None:
+        code, text, adapter, _b = _run_main({**_REQUIRED_BASE, "TRIP_ROUTING": "wildcard",
+                                             "TRIP_PLACEMENT": "vm-container"})
+        self.assertEqual(2, code)
+        self.assertIn("TRIP_MCP_BRIDGE=shared", text)
+        self.assertNotIn("TRIP_ROUTING", text)
+        self.assertNotIn(self.NOT_YET, text)
+        self.assertEqual({}, adapter)
+
+    def test_vm_container_with_neither_names_both_settings(self) -> None:
+        code, text, _a, _b = _run_main({**_REQUIRED_BASE, **_HOST_ONLY, "TRIP_PLACEMENT": "vm-container"})
+        self.assertEqual(2, code)
+        self.assertIn("TRIP_ROUTING=wildcard", text)
+        self.assertIn("TRIP_MCP_BRIDGE=shared", text)
+        self.assertNotIn(self.NOT_YET, text)
+
+    def test_a_valid_combination_is_still_refused_as_not_available_yet(self) -> None:
+        env = {**_REQUIRED_BASE, "TRIP_ROUTING": "wildcard", **_SHARED_BRIDGE, "TRIP_PLACEMENT": "vm-container"}
+        code, text, adapter, bridge = _run_main(env)
+        self.assertEqual(2, code)
+        self.assertIn(self.NOT_YET, text)
+        self.assertIn("TRIP_PLACEMENT=vm-container", text)
+        self.assertNotIn("TRIP_ROUTING", text, "the combination is right; the message must not blame it")
+        self.assertNotIn("TRIP_MCP_BRIDGE", text)
+        self.assertEqual({}, adapter, "nothing was built")
+        self.assertEqual({}, bridge)
+
+    def test_the_same_valid_combination_starts_with_placement_lxc(self) -> None:
+        # The refusal is the placement's, not the combination's.
+        env = {**_REQUIRED_BASE, "TRIP_ROUTING": "wildcard", **_SHARED_BRIDGE, "TRIP_PLACEMENT": "lxc"}
+        code, text, _a, _b = _run_main(env)
+        self.assertEqual(0, code, text)
+
+
 class McpBridgeModeTests(unittest.TestCase):
     def test_default_is_per_trip_and_empty_means_default(self) -> None:
         for env in ({}, {"TRIP_MCP_BRIDGE": ""}):
@@ -496,6 +586,82 @@ class PrivateUrlAndRouteTests(unittest.TestCase):
     def test_the_hostname_is_recorded_lower_case(self) -> None:
         raw = yaml.safe_load(LEGACY_TOPOLOGY.replace("tokyo-2026.example.invalid", "Tokyo-2026.Example.Invalid"))
         self.assertEqual("tokyo-2026.example.invalid", topology_route(raw).public_host)
+
+
+VM_CONTAINER_TOPOLOGY = """\
+version: 1
+name: tokyo-2026
+placement: vm-container
+routing: wildcard
+container:
+  name: trip-tokyo-2026
+  ipv4: 198.51.100.10
+  forward_port: 8080
+  public_hostname: tokyo-2026.example.invalid
+  nfs_host_dir: /srv/trips/trip_9f2c11aa4d
+  nfs_mount_path: /trip
+  image: trip-site:sha256-0123456789ab
+"""
+
+
+class VmContainerRouteTests(unittest.TestCase):
+    """PR1 of the vm-container placement: the readers that feed the gateway understand `container:`."""
+
+    def _deploy(self, text: str):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        trip = Path(tmp.name, "trips", "tokyo-2026")
+        trip.mkdir(parents=True)
+        (trip / "topology.yaml").write_text(text)
+        return ShellDeployAdapter(deploy_root=tmp.name, vmid_map={}), str(trip)
+
+    def test_the_route_comes_from_the_container_section_and_is_wildcard(self) -> None:
+        deploy, _trip = self._deploy(VM_CONTAINER_TOPOLOGY)
+        self.assertEqual(TripRoute("tokyo-2026.example.invalid", "http://198.51.100.10:8080", "wildcard"),
+                         deploy.route_for("tokyo-2026"))
+
+    def test_the_private_url_comes_from_the_container_section(self) -> None:
+        deploy, trip = self._deploy(VM_CONTAINER_TOPOLOGY)
+        self.assertEqual("https://tokyo-2026.example.invalid", deploy._private_url(trip))
+
+    def test_a_vm_container_trip_that_gives_no_route_fails_loudly_whatever_its_routing_line(self) -> None:
+        for what, text in (
+            ("no address", VM_CONTAINER_TOPOLOGY.replace("  ipv4: 198.51.100.10\n", "")),
+            ("no port", VM_CONTAINER_TOPOLOGY.replace("  forward_port: 8080\n", "")),
+            ("host routing", VM_CONTAINER_TOPOLOGY.replace("routing: wildcard", "routing: host")),
+            ("no routing line", VM_CONTAINER_TOPOLOGY.replace("routing: wildcard\n", "")),
+        ):
+            with self.subTest(what):
+                deploy, _trip = self._deploy(text)
+                self.assertIsNone(topology_route(yaml.safe_load(text)))
+                with self.assertRaisesRegex(ValueError, "wildcard-routed"):
+                    deploy.route_for("tokyo-2026")
+
+    def test_a_section_of_the_other_placement_is_never_a_fallback(self) -> None:
+        # An LXC file that grew a container section, and a vm-container file that kept an npm one,
+        # each read only the section its placement names.
+        lxc_with_container = LEGACY_TOPOLOGY + "container:\n  ipv4: 198.51.100.10\n  forward_port: 9999\n" \
+            "  public_hostname: other.example.invalid\n"
+        self.assertEqual("http://192.0.2.210:8080", topology_route(yaml.safe_load(lxc_with_container)).upstream_url)
+        vm_with_npm = VM_CONTAINER_TOPOLOGY.replace("  public_hostname: tokyo-2026.example.invalid\n", "") \
+            + "npm:\n  hostname: tokyo-2026.example.invalid\n  forward_port: 8080\n"
+        self.assertIsNone(topology_route(yaml.safe_load(vm_with_npm)))
+
+    def test_an_unknown_placement_describes_no_route(self) -> None:
+        for value in ("docker", "VM-CONTAINER", ""):
+            with self.subTest(value=value):
+                raw = yaml.safe_load(VM_CONTAINER_TOPOLOGY)
+                raw["placement"] = value
+                self.assertIsNone(topology_route(raw))
+                self.assertIsNone(topology_public_hostname(raw))
+        raw = yaml.safe_load(LEGACY_TOPOLOGY)
+        raw["placement"] = "docker"
+        self.assertIsNone(topology_route(raw), "an LXC file with an unknown placement is not guessed at either")
+
+    def test_an_lxc_topology_with_an_explicit_lxc_placement_routes_as_before(self) -> None:
+        raw = yaml.safe_load(LEGACY_TOPOLOGY)
+        raw["placement"] = "lxc"
+        self.assertEqual(TripRoute("tokyo-2026.example.invalid", "http://192.0.2.210:8080", "host"), topology_route(raw))
 
 
 if __name__ == "__main__":

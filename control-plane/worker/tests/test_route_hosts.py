@@ -19,7 +19,7 @@ import psycopg
 import psycopg.errors
 from psycopg.rows import dict_row
 
-from control_plane_worker.provisioner import ProvisionerWorker, RouteHostError, TripRoute
+from control_plane_worker.provisioner import ProvisionerWorker, RouteHostError, TripRoute, topology_route
 
 from tests.support.test_database import test_database_url
 from tests.test_provisioner import (
@@ -105,6 +105,18 @@ class RouteRecordedOnSuccess(unittest.TestCase):
         row = self._route_row()
         self.assertEqual(("ready", "tokyo-2026.example.invalid", "http://192.0.2.210:8080"),
                          (row["state"], row["public_host"], row["upstream_url"]))
+
+    def test_a_vm_container_trip_records_its_hostname_and_its_container_address(self) -> None:
+        # The route a vm-container topology.yaml describes lands in runtime_routes exactly as a
+        # wildcard LXC's does: hostname AND upstream, ready_private in the same transaction.
+        import yaml
+
+        route = topology_route(yaml.safe_load(VmContainerTopologyRoutes.TOPOLOGY))
+        self._run(route)
+        row = self._route_row()
+        self.assertEqual(("ready", "tokyo-2026.example.invalid", "http://198.51.100.10:8080"),
+                         (row["state"], row["public_host"], row["upstream_url"]))
+        self.assertEqual("ready_private", self._trip_state())
 
     def test_the_route_and_the_ready_state_are_one_transaction(self) -> None:
         # Both columns and ready_private land together, or neither does: a
@@ -519,6 +531,23 @@ class SchemaWithoutTheColumns(unittest.TestCase):
         self._worker()._register_runtime_route(_Conn(), cur, "trip_x", None)
         self.assertEqual(1, len(cur.statements))
         self.assertNotIn("public_host", cur.statements[0])
+
+
+class VmContainerTopologyRoutes(unittest.TestCase):
+    """DB-free: what the worker hands the gateway for a `placement: vm-container` topology.yaml."""
+
+    TOPOLOGY = (
+        "version: 1\nname: tokyo-2026\nplacement: vm-container\nrouting: wildcard\ncontainer:\n"
+        "  name: trip-tokyo-2026\n  ipv4: 198.51.100.10\n  forward_port: 8080\n"
+        "  public_hostname: Tokyo-2026.Example.Invalid\n  nfs_host_dir: /srv/trips/trip_9f2c11aa4d\n"
+        "  nfs_mount_path: /trip\n  image: trip-site:sha256-0123456789ab\n"
+    )
+
+    def test_the_route_is_the_containers_address_under_the_gateway(self) -> None:
+        import yaml
+
+        route = topology_route(yaml.safe_load(self.TOPOLOGY))
+        self.assertEqual(TripRoute("tokyo-2026.example.invalid", "http://198.51.100.10:8080", "wildcard"), route)
 
 
 if __name__ == "__main__":
