@@ -13,7 +13,8 @@
  *     unless the deployment's `photo_library.allowed_private_hosts` names the host. The metadata address, unspecified
  *     and multicast are refused even then: no home library lives there;
  *   - a redirect (any 3xx) is an error, never followed;
- *   - one deadline for the whole exchange (a trickling server cannot keep it open), and a cap on the bytes read,
+ *   - one deadline for the whole exchange, the name lookup included (a resolver that never answers or a trickling server
+ *     cannot keep it open), and a cap on the bytes read,
  *     counted as they arrive rather than trusted from `content-length`.
  *
  * Errors carry a code and a fixed sentence, never the address, a header or the server's own text: the caller's
@@ -22,7 +23,7 @@
  * The private ranges are written as octets, not dotted strings, on purpose: they are the generic ranges every
  * deployment has, and preflight's hard-rule-6 check looks for dotted literals of two of them in code.
  */
-import { lookup as dnsLookup } from "node:dns/promises";
+import { Resolver as DnsResolver } from "node:dns/promises";
 import { request as httpRequest, type IncomingHttpHeaders, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { LookupFunction } from "node:net";
@@ -64,10 +65,29 @@ export interface GuardOptions {
 export const DEFAULT_TIMEOUT_MS = 5_000;
 export const DEFAULT_MAX_BYTES = 1024 * 1024;
 
-const systemResolver: Resolver = async (hostname) => {
-  const answers = await dnsLookup(hostname, { all: true, verbatim: true });
-  return answers.map((answer) => ({ address: answer.address, family: answer.family === 6 ? 6 : 4 }));
-};
+/**
+ * The production resolver: c-ares (`dns.Resolver`), with its own per-try timeout and a bounded number of tries, and
+ * cancelled when the call's deadline passes. Not `dns.lookup`: getaddrinfo cannot be cancelled and runs in the libuv
+ * thread pool every file read and crypto call shares, so a few hung lookups would stall the whole API. c-ares does not
+ * follow the system's full name-service configuration (getaddrinfo's), so a name only some other source knows may not
+ * resolve here: the request then reads `unreachable`.
+ */
+export function systemResolver(timeoutMs: number, servers?: readonly string[]): { resolve: Resolver; cancel: () => void } {
+  const resolver = new DnsResolver({ timeout: Math.max(100, Math.floor(timeoutMs / 2)), tries: 2 });
+  // Tests only: point it at a stand-in name server. Production uses the system's configured servers.
+  if (servers) resolver.setServers([...servers]);
+  return {
+    cancel: () => resolver.cancel(),
+    resolve: async (hostname) => {
+      const [v4, v6] = await Promise.allSettled([resolver.resolve4(hostname), resolver.resolve6(hostname)]);
+      if (v4.status === "rejected" && v6.status === "rejected") throw new Error("lookup failed");
+      return [
+        ...(v4.status === "fulfilled" ? v4.value.map((address) => ({ address, family: 4 as const })) : []),
+        ...(v6.status === "fulfilled" ? v6.value.map((address) => ({ address, family: 6 as const })) : []),
+      ];
+    },
+  };
+}
 
 // ── address classification ────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -209,7 +229,7 @@ export function libraryAddressString(url: URL): string {
  * Resolves the URL's host and checks every address it gets. Returns the address to connect to (the first one; all of
  * them passed). A literal IP host is checked as it is and never resolved.
  */
-export async function vetHost(url: URL, options: GuardOptions): Promise<{ address: string; family: 4 | 6 }> {
+export async function vetHost(url: URL, options: GuardOptions & { resolve: Resolver }): Promise<{ address: string; family: 4 | 6 }> {
   const host = bareHost(url.hostname);
   const allowed = (options.allowedPrivateHosts ?? []).map(bareHost).includes(host);
   let answers: Array<{ address: string; family: 4 | 6 }>;
@@ -217,7 +237,7 @@ export async function vetHost(url: URL, options: GuardOptions): Promise<{ addres
     answers = [{ address: host, family: ipv4Bytes(host) ? 4 : 6 }];
   } else {
     try {
-      answers = await (options.resolve ?? systemResolver)(host);
+      answers = await options.resolve(host);
     } catch {
       throw new PhotoLibraryGuardError("unreachable");
     }
@@ -249,9 +269,25 @@ export async function guardedFetch(
 ): Promise<GuardedResponse> {
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new PhotoLibraryGuardError("invalid_address");
   if (url.username || url.password) throw new PhotoLibraryGuardError("invalid_address");
-  const target = await vetHost(url, options);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+  // ONE deadline, armed before the name is looked up: the lookup, the connect and the response all spend from it.
+  const expiresAt = Date.now() + timeoutMs;
+  const system = options.resolve ? null : systemResolver(timeoutMs);
+  let lookupTimer: NodeJS.Timeout | undefined;
+  const lookupExpired = new Promise<never>((_resolve, reject) => {
+    lookupTimer = setTimeout(() => { system?.cancel(); reject(new PhotoLibraryGuardError("timeout")); }, timeoutMs);
+  });
+  const vetting = vetHost(url, { ...options, resolve: options.resolve ?? system!.resolve });
+  vetting.catch(() => {}); // a lookup that loses the race may still settle later; that is not an unhandled rejection
+  let target: { address: string; family: 4 | 6 };
+  try {
+    target = await Promise.race([vetting, lookupExpired]);
+  } finally {
+    clearTimeout(lookupTimer);
+  }
+  const remaining = expiresAt - Date.now();
+  if (remaining <= 0) throw new PhotoLibraryGuardError("timeout");
   // The connection goes to the address checked above, whatever the system resolver would say now.
   const pinned: LookupFunction = (_hostname, lookupOptions, callback) => {
     if ((lookupOptions as { all?: boolean } | undefined)?.all) {
@@ -293,7 +329,7 @@ export async function guardedFetch(
       reject(new PhotoLibraryGuardError("invalid_address"));
       return;
     }
-    const deadline = setTimeout(() => finish(new PhotoLibraryGuardError("timeout")), timeoutMs);
+    const deadline = setTimeout(() => finish(new PhotoLibraryGuardError("timeout")), remaining);
     request.on("error", () => finish(new PhotoLibraryGuardError("unreachable")));
     request.on("response", (incoming) => {
       response = incoming;
