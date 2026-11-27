@@ -7,11 +7,23 @@ import secrets
 import shlex
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 import yaml
 
 from .models import CloudflareSpec, LxcSpec, ProxySpec
+
+# The trip site's nginx `server` block, ONE file for both ways a site runs: written into an LXC by the bootstrap
+# below, and copied into the trip-site image by control-plane/deployment/trip-site.Dockerfile. It sits at the
+# same app root (/opt/kinerary) in both, so the file is literal - no placeholders - and the two cannot drift.
+# Edit it there; tests/provisioning/test_adapters.py pins the LXC bootstrap output byte for byte.
+TRIP_SITE_NGINX_CONF = Path(__file__).with_name("trip-site-nginx.conf")
+
+
+def trip_site_nginx_conf() -> str:
+    """The shared site config without its final newline: the bootstrap's heredoc supplies that one."""
+    return TRIP_SITE_NGINX_CONF.read_text(encoding="utf-8").removesuffix("\n")
 
 
 class SshTransport(Protocol):
@@ -424,6 +436,7 @@ class ProxmoxLxcAdapter:
             f"  printf 'HERMES_URL=%s\\n' {shlex.quote(self._hermes_url)} >> {app_dir}/.env\n"
             if self._hermes_url else ""
         )
+        nginx_site = trip_site_nginx_conf()
         script = f"""#!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -496,122 +509,7 @@ WantedBy=multi-user.target
 UNITEOF
 
 cat > /etc/nginx/sites-available/kinerary <<'NGINXEOF'
-server {{
-  listen 8080;
-  server_name _;
-  root {app_dir}/site;
-  index index.html;
-
-  add_header X-Content-Type-Options nosniff;
-  add_header X-Frame-Options DENY;
-  add_header X-XSS-Protection "1; mode=block";
-
-  location ~ ^/api/trivia/(events|public-events) {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_http_version 1.1;
-    proxy_set_header Connection '';
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_buffering off;
-    proxy_cache off;
-    proxy_read_timeout 86400s;
-  }}
-
-  location ^~ /api/ {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_read_timeout 120s;
-    client_max_body_size 500m;
-  }}
-
-  # An organizer's own Claude or ChatGPT (server/trip-mcp). Express answers
-  # 404 on all of these unless the trip set TRIP_MCP_ENABLED, so routing them
-  # on every trip exposes nothing; without these blocks they are static 404s
-  # and the feature cannot be switched on without editing nginx by hand.
-  location = /mcp {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_http_version 1.1;
-    proxy_set_header Connection '';
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_buffering off;
-    proxy_read_timeout 300s;
-    client_max_body_size 5m;
-  }}
-
-  # The connector's upload pages (/mcp/upload-confirmation/<id>,
-  # /mcp/upload-logo, /mcp/upload-photos): plain pages the site serves, which
-  # `= /mcp` above does not match. The uploads themselves go to /api/.
-  location ^~ /mcp/upload- {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-  }}
-
-  location ^~ /oauth/ {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    # Registration and token requests are a few hundred bytes.
-    client_max_body_size 64k;
-  }}
-
-  location ^~ /.well-known/oauth- {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-  }}
-
-  location /photo/ {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-  }}
-
-  location ~* \\.(html)$ {{
-    add_header Cache-Control "no-cache, must-revalidate";
-    try_files $uri =404;
-  }}
-
-  # The classic app's own script and stylesheet are NOT content-hashed, and a
-  # trip's hostname outlives the trip: a slug comes back, a container is
-  # rebuilt, and the browser is holding the last trip's app.js. With no
-  # Cache-Control at all it may serve that from cache without asking. On
-  # 2026-09-12 a deployed fix was invisible to the organizer for exactly this
-  # reason — the page revalidated, the script it loads did not.
-  location ~* ^/[^/]+\\.(js|css)$ {{
-    add_header Cache-Control "no-cache, must-revalidate";
-    try_files $uri =404;
-  }}
-
-  # The modern bundle IS content-hashed, so a changed file is a changed name and
-  # the old one can be kept forever.
-  location ^~ /modern/assets/ {{
-    add_header Cache-Control "public, max-age=31536000, immutable";
-    try_files $uri =404;
-  }}
-
-  location /avatars/ {{
-    return 404;
-  }}
-
-  location ^~ /confirmations/ {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-  }}
-
-  location ~* \\.(md|txt|rtf|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|pkpass)$ {{
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-  }}
-
-  location / {{
-    try_files $uri $uri/ =404;
-  }}
-}}
+{nginx_site}
 NGINXEOF
 rm -f /etc/nginx/sites-enabled/default
 ln -sfn /etc/nginx/sites-available/kinerary /etc/nginx/sites-enabled/kinerary

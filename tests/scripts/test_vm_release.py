@@ -359,6 +359,110 @@ class Pruning(unittest.TestCase):
         self.assertEqual(vr.images_to_prune(tags, {"aa61f6e", ""}), ["kinerary-cp/agent-runtime:3264c4a", "kinerary-cp/api:3264c4a"])
 
 
+DIGEST_A = "a" * 64
+DIGEST_B = "b" * 64
+DIGEST_C = "c" * 64
+
+
+class TripSiteImages(unittest.TestCase):
+    """`trip-site:<release digest>` (spec x-trip-vm-container-placement, "Image identity"): built from a
+    sealed release tree, and never pruned while a trip's current or previous release names it."""
+
+    def test_the_tag_is_the_hex_of_the_release_digest_and_nothing_else_is_accepted(self):
+        self.assertEqual(vr.trip_site_tag(f"sha256:{DIGEST_A}"), f"trip-site:{DIGEST_A}")
+        self.assertEqual(vr.trip_site_tag(DIGEST_A), f"trip-site:{DIGEST_A}")
+        for bad in ("", "latest", "sha256:abc", "sha256:" + "A" * 64, DIGEST_A + "0", f"x/{DIGEST_A}", f"{DIGEST_A}\n-v /:/h"):
+            with self.assertRaises(vr.Refused, msg=bad):
+                vr.trip_site_tag(bad)
+
+    def test_build_argv_names_the_dockerfile_the_tool_context_and_the_release_tree(self):
+        argv = vr.trip_site_build_argv(f"sha256:{DIGEST_A}", Path("/srv/kinerary"), Path("/var/tmp/release-tree"))
+        self.assertEqual(argv[:2], ["docker", "build"])
+        self.assertEqual(argv[argv.index("-f") + 1], "/srv/kinerary/control-plane/deployment/trip-site.Dockerfile")
+        self.assertEqual(argv[argv.index("--build-context") + 1], "tool=/srv/kinerary")
+        self.assertEqual(argv[argv.index("-t") + 1], f"trip-site:{DIGEST_A}")
+        self.assertEqual(argv[-1], "/var/tmp/release-tree", "the release tree is the build context")
+
+    def test_without_a_protected_set_no_trip_site_image_is_ever_pruned(self):
+        tags = [f"trip-site:{DIGEST_A}", f"trip-site:{DIGEST_B}", "kinerary-cp/api:aaaaaaa"]
+        self.assertEqual(vr.images_to_prune(tags, {"bbbbbbb"}), ["kinerary-cp/api:aaaaaaa"])
+        self.assertEqual(vr.images_to_prune(tags, {"bbbbbbb"}, trip_site_protected=None), ["kinerary-cp/api:aaaaaaa"])
+
+    def test_a_protected_set_keeps_what_a_trips_current_or_previous_release_names(self):
+        tags = [f"trip-site:{DIGEST_A}", f"trip-site:{DIGEST_B}", f"trip-site:{DIGEST_C}"]
+        protected = {f"sha256:{DIGEST_A}", DIGEST_B}   # either spelling of a digest protects its tag
+        self.assertEqual(vr.images_to_prune(tags, set(), trip_site_protected=protected), [f"trip-site:{DIGEST_C}"])
+
+    def test_an_empty_protected_set_means_no_trip_names_any_not_unknown(self):
+        self.assertEqual(vr.images_to_prune([f"trip-site:{DIGEST_A}"], set(), trip_site_protected=set()), [f"trip-site:{DIGEST_A}"])
+
+    def test_tags_that_are_not_ours_are_never_pruned(self):
+        tags = ["trip-site:pr2-localtest", "trip-site:latest", "trip-site", f"other/trip-site:{DIGEST_A}"]
+        self.assertEqual(vr.images_to_prune(tags, set(), trip_site_protected=set()), [])
+
+    def test_the_protected_digests_come_from_every_trips_current_and_previous_release(self):
+        cp = vr.ControlPlane(vr.Report(io.StringIO(), color=False))
+        seen = []
+
+        def fake_psql(sql, check=True, db=vr.DB_NAME):
+            seen.append(sql)
+            return f"sha256:{DIGEST_A}\n\n{DIGEST_B}\n"
+        cp.psql = fake_psql
+        self.assertEqual(cp.trip_site_protected_digests(), {f"sha256:{DIGEST_A}", DIGEST_B})
+        self.assertIn("current_release_id", seen[0])
+        self.assertIn("previous_release_id", seen[0])
+
+    def test_a_digest_that_cannot_be_read_stops_the_pruning_instead_of_pruning_everything(self):
+        cp = vr.ControlPlane(vr.Report(io.StringIO(), color=False))
+
+        def broken(sql, check=True, db=vr.DB_NAME):
+            raise vr.Refused("psql: connection refused")
+        cp.psql = broken
+        with self.assertRaises(vr.Refused):
+            cp.trip_site_protected_digests()
+
+    def _prune_run(self, protected):
+        """cmd_prune against a stub control plane that lists two trip-site images; returns the `docker image rm` argvs."""
+        tags = f"kinerary-cp/api:aaaaaaa trip-site:{DIGEST_A} trip-site:{DIGEST_B}"
+        removed = []
+        cp = vr.ControlPlane(vr.Report(io.StringIO(), color=False))
+        cp.snapshot_list = lambda: []
+        cp.backup_dirs = lambda: []
+        cp.vm_env = lambda: {"KINERARY_REV": "aaaaaaa"}
+        cp.git_argv = lambda *a: ["git", *a]
+        cp.sh.text = lambda argv, **kw: tags if argv[:2] == ["docker", "images"] else ""
+        cp.sh.act = lambda argv, **kw: removed.append(list(argv)) or None
+
+        def psql(sql, check=True, db=vr.DB_NAME):
+            if "pg_database" in sql:
+                return ""
+            return protected(sql)
+        cp.psql = psql
+        with mock.patch.object(vr, "read_history", return_value=[]):
+            vr.cmd_prune(cp)
+        return [a[3] for a in removed if a[:3] == ["docker", "image", "rm"]]
+
+    def test_prune_removes_only_the_trip_site_images_no_trip_names(self):
+        self.assertEqual(self._prune_run(lambda sql: f"sha256:{DIGEST_A}\n"), [f"trip-site:{DIGEST_B}"])
+
+    def test_prune_removes_no_trip_site_image_when_the_trips_cannot_be_read(self):
+        def unreadable(sql):
+            raise vr.Refused("psql: connection refused")
+        self.assertEqual(self._prune_run(unreadable), [])
+
+    def test_build_skips_an_image_that_exists_and_builds_a_missing_one_from_the_tree(self):
+        out = io.StringIO()
+        cp = vr.ControlPlane(vr.Report(out, color=False))
+        ran = []
+        cp.image_exists = lambda tag: tag == f"trip-site:{DIGEST_A}"
+        cp.sh.act = lambda argv, **kw: ran.append(list(argv))
+        cp.build_trip_site_image(DIGEST_A, Path("/tree"))
+        self.assertEqual(ran, [])
+        cp.build_trip_site_image(f"sha256:{DIGEST_B}", Path("/tree"))
+        self.assertEqual(len(ran), 1)
+        self.assertEqual(ran[0][ran[0].index("-t") + 1], f"trip-site:{DIGEST_B}")
+
+
 class History(unittest.TestCase):
     def test_round_trip_and_the_way_back(self):
         path = Path(tempfile.mkdtemp()) / "history.tsv"
