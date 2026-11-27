@@ -18,10 +18,17 @@ On the Proxmox VM the deploy root is root-only:
 The container is the vmid in the trip's topology.yaml, and it must still carry
 the hostname that topology gives it. Anything else is refused: a VMID Proxmox
 has since handed to another container is not this trip's to change.
+
+A `placement: vm-container` trip is a Docker container on the control-plane host with the
+restart policy `unless-stopped` (scripts/trip-container-host.sh): it comes back after a
+reboot unless it was stopped. So here `--off` is the host's `stop` and `--on` its `start`,
+with no `pct` and no Proxmox. The difference to an LXC is that `--off` stops the site NOW, not
+only at the next boot (the output says so): that is what holds it down across a reboot.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import re
 import shlex
@@ -33,6 +40,29 @@ HOME = Path.home()
 DEPLOY_ROOT = Path(os.environ.get("KINERARY_DEPLOY_ROOT") or HOME / "kinerary-deploy")
 SLUG = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 STARTUP = "order=3"
+
+
+class Refused(Exception):
+    """The request, or this host's setup for it, cannot be vouched for."""
+
+
+def _client():
+    """scripts/trip_container_client.py, loaded by path: this file may be run, or imported, from anywhere."""
+    if "trip_container_client" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("trip_container_client", Path(__file__).with_name("trip_container_client.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["trip_container_client"] = module
+        spec.loader.exec_module(module)
+    return sys.modules["trip_container_client"]
+
+
+def container_adapter():
+    """The worker's client of this host's trip-container forced command, or a refusal naming what is unset."""
+    load_provisioning_env()
+    try:
+        return _client().adapter(os.environ)
+    except _client().ClientConfigError as exc:
+        raise Refused(str(exc)) from None
 
 
 def load_provisioning_env() -> None:
@@ -97,6 +127,49 @@ def describe(config: dict[str, str]) -> str:
     return f"starts on boot: {'yes' if onboot else 'no'}  (startup: {config.get('startup', '-')})"
 
 
+def container_main(slug: str, text: str, on: bool, off: bool) -> int:
+    """A vm-container trip: show, `start` (--on) or `stop` (--off), through the host's forced command."""
+    client = _client()
+    try:
+        info = client.container_info(client.parse_topology_text(text), slug)
+    except client.ClientConfigError as exc:
+        print(f"refused: the topology does not describe {slug} ({exc})", file=sys.stderr)
+        return 2
+    try:
+        container = container_adapter()
+    except Refused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    errors = client.worker_module().TripContainerError
+
+    def state() -> str:
+        answer = container.check(info.trip_id, slug)
+        if answer.get("running") is None:
+            return f"{info.name}  the trip-container host has no container for it ({str(answer.get('reason') or '')[:100]})"
+        return (f"{info.name}  running: {'yes' if answer.get('running') else 'no'}  "
+                f"healthy: {'yes' if answer.get('healthy') else 'no'}  (restart policy unless-stopped: it comes back after a "
+                "reboot unless it was stopped)")
+
+    try:
+        before = state()
+        print(before)
+        if "no container for it" in before:
+            return 1
+        if not (on or off):
+            return 0
+        if off:
+            container.stop(info.trip_id, slug)
+            print("  stopped now (an LXC's --off only changes the next boot); it stays down after a reboot until --on")
+        else:
+            container.start(info.trip_id, slug)
+        after = state()
+        print(after)
+        return 0 if (f"running: {'yes' if on else 'no'}" in after) else 1
+    except errors as exc:
+        print(f"failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--trip", required=True, help="the trip's slug — its directory under <deploy root>/trips")
@@ -112,7 +185,10 @@ def main(argv: list[str] | None = None) -> int:
     if not topology.is_file():
         print(f"refused: no {topology}", file=sys.stderr)
         return 2
-    vmid, name = parse_topology(topology.read_text())
+    text = topology.read_text()
+    if _client().placement_of_text(text) == _client().PLACEMENT_VM_CONTAINER:
+        return container_main(args.trip, text, args.on, args.off)
+    vmid, name = parse_topology(text)
     load_provisioning_env()
 
     config = parse_pct_config(proxmox(f"pct config {shlex.quote(vmid)}"))

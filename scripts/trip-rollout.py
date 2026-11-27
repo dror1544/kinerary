@@ -61,6 +61,20 @@ For each trip, steps run in order and stop at the first failure:
              doubtful read would silently switch features off on a live trip. The site reads the
              file once at boot, so this is what makes a switch change reach it.
 
+A `placement: vm-container` trip (docs/specs/sprint-9/x-trip-vm-container-placement.md) takes the same steps
+through the trip-container host's forced command and the document store instead of the deployment's commands:
+
+  site      the host's `deploy` verb with the release's image (`trip-site:<release digest>`, built beforehand with
+            `kinerary-cp-release trip-image`; an image the host lacks fails the step before anything changes, naming
+            that command). The old container is set aside and put back if the new one does not start; the answer's
+            previous image is printed, topology.yaml's `container.image` is updated, and the trip's recorded previous
+            release (the control plane's record) is the way back: a rollout to it deploys that image again
+  bridge    nothing to do: one shared bridge serves every container trip (skipped, and said so)
+  companion the same, with the trip's config read from the store
+  switches  stop the container, merge ONLY `features` into `trip/trip.config.json` on the store, start it (in a
+            `finally`), read the file back and check the container's health. The site's own /api/config is NOT
+            asked (a container trip has no per-trip mcp/.env to hold a site key): the output says so
+
 A release built before releases carried mcp/ and profile-templates/ is valid for step 1
 and refused for steps 2 and 3 with a message saying so: its seal does not cover them.
 Steps run only when named: the default is `site,bridge`, so a deployment that has not yet
@@ -279,6 +293,23 @@ def require_features_config(cfg: "Config") -> None:
         raise Refused("KINERARY_TRIP_FEATURES_CMD must not be empty")
 
 
+def any_lxc_trip(cfg: "Config", slugs: list) -> bool:
+    """Whether any named trip needs the deployment's own LXC commands. A `vm-container` trip's switches are merged through the
+    trip-container host and the document store, so a deployment that never configured KINERARY_TRIP_FEATURES_CMD can still
+    roll switches to it. A trip whose topology cannot be read here counts as an LXC trip: the requirement stays, and the
+    refusal it gives is the one it always gave."""
+    for slug in slugs:
+        if not isinstance(slug, str) or not SLUG.match(slug):
+            return True
+        try:
+            text = (cfg.deploy_root / "trips" / slug / "topology.yaml").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return True
+        if not re.search(r"^placement:\s*['\"]?vm-container['\"]?\s*$", text, re.M):
+            return True
+    return not slugs
+
+
 def require_companion_config(cfg: "Config") -> None:
     missing = [(n, why) for n, why in COMPANION_ENV if not cfg.environ.get(n)]
     if missing:
@@ -481,6 +512,15 @@ class Trip:
     site_host: str
     site_port: int
     container: str
+    # `placement: vm-container` (docs/specs/sprint-9/x-trip-vm-container-placement.md): the site is a Docker container
+    # on this host, driven through the trip-container host's forced command, and its files are a directory on the
+    # document store. `vmid` is empty (there is no Proxmox container) and `info` is the validated `container:` section.
+    placement: str = "lxc"
+    info: Optional[object] = None
+
+    @property
+    def is_container(self) -> bool:
+        return self.placement == "vm-container"
 
     @property
     def current(self) -> Optional[str]:
@@ -528,6 +568,8 @@ def resolve_trip(cfg: Config, db: Db, slug: str) -> Trip:
     if not topology_path.is_file():
         raise Refused(f"{slug}: no topology under the deployment root")
     topo = parse_topology(topology_path.read_text(encoding="utf-8", errors="replace"))
+    if topo.get("placement") == "vm-container":
+        return resolve_container_trip(cfg, slug, row, trip_dir, topo)
     proxmox = topo.get("proxmox") or {}
     lxc = proxmox.get("lxc") or {}
     vmid = str(proxmox.get("vmid") or "")
@@ -547,6 +589,58 @@ def resolve_trip(cfg: Config, db: Db, slug: str) -> Trip:
         raise Refused(f"{slug}: container {vmid} is not the one its topology names; refusing to deploy to it")
     return Trip(row=row, slug=slug, trip_dir=trip_dir, vmid=vmid, site_host=host, site_port=int(port),
                 container=container)
+
+
+def _client():
+    """scripts/trip_container_client.py, loaded by path: the worker's own client of the trip-container host's forced
+    command, shared with the other lifecycle scripts."""
+    if "trip_container_client" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("trip_container_client", Path(__file__).with_name("trip_container_client.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["trip_container_client"] = module
+        spec.loader.exec_module(module)
+    return sys.modules["trip_container_client"]
+
+
+def container_env(cfg: Config) -> dict:
+    """The deployment's own environment plus vm.env/provisioning.env under the deployment root as defaults (the settings
+    of the trip-container host are vm.env's; a wrapper that sets only the rollout's own need not repeat them)."""
+    environ = dict(cfg.environ)
+    _client().load_env_defaults(cfg.deploy_root, environ)
+    return environ
+
+
+def container_adapter(cfg: Config):
+    """The worker's `DockerSiteAdapter` over this host's forced command. A refusal, naming every unset variable, when this
+    host is not set up for it: a `plan` refuses for the same reason an `execute` would."""
+    try:
+        return _client().adapter(container_env(cfg), repo=REPO)
+    except _client().ClientConfigError as exc:
+        raise Refused(str(exc))
+
+
+def container_store(cfg: Config, trip_id: str):
+    """The trip's directory on the document store, as this host mounts it (KINERARY_NFS_ROOT)."""
+    try:
+        return _client().store(container_env(cfg), trip_id, repo=REPO)
+    except _client().ClientConfigError as exc:
+        raise Refused(str(exc))
+
+
+def resolve_container_trip(cfg: Config, slug: str, row: dict, trip_dir: Path, topo: dict) -> Trip:
+    """A `vm-container` trip: its `container:` section validated for THIS slug, its directory the one the control plane
+    knows the trip by, and this host able to reach the trip-container host. There is no Proxmox container to compare a
+    hostname with."""
+    client = _client()
+    try:
+        info = client.container_info(topo, slug)
+    except client.ClientConfigError as exc:
+        raise Refused(f"{slug}: {exc}")
+    if info.trip_id != row["id"]:
+        raise Refused(f"{slug}: its topology names another trip's directory ({info.trip_id}), not this trip's; refusing to deploy to it")
+    container_adapter(cfg)       # unset settings are refused now, by name, not half-way through an execute
+    return Trip(row=row, slug=slug, trip_dir=trip_dir, vmid="", site_host=info.ipv4, site_port=info.forward_port,
+                container=info.name, placement="vm-container", info=info)
 
 
 ROOT_FLAGS = {"mcp": "has_bridge", "profile-templates": "has_companion"}
@@ -643,7 +737,7 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
         raise Refused(f"--overwrite-edited-companion names {sorted(overwrite - set(slugs))[0]!r}, which is not a trip in this plan")
     if "companion" in steps:
         require_companion_config(cfg)
-    if "switches" in steps:
+    if "switches" in steps and any_lxc_trip(cfg, slugs):
         require_features_config(cfg)
     release = get_release(db, args.release)
 
@@ -692,6 +786,10 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
             note = "rollback: this is the trip's recorded previous release" \
                 if trip.row.get("previous_release_id") == release["id"] else ""
         say(f"  {slug}: runs {runs}  ->  {release['id']}")
+        if trip.is_container:
+            say("      vm-container trip: the site step is `deploy` of the release's trip-site image on the trip-container host "
+                "(build it first with `sudo kinerary-cp-release trip-image`), the bridge step has nothing to do (one shared "
+                "bridge), and switches are merged into the trip's directory on the document store")
         if slug in overwrite:
             say("      a companion edited in place WILL BE OVERWRITTEN, after its files are copied aside")
         if note:
@@ -1020,7 +1118,153 @@ class Executor:
 
     # ---- steps
 
+    # ---- the vm-container placement: the same steps, through the trip-container host and the document store
+
+    def container_parts(self, step: str, trip: Trip) -> tuple:
+        """(the worker's module, its adapter for this host, the trip's directory on the store): or the step fails with the
+        reason, never a traceback."""
+        try:
+            return _client().worker_module(), container_adapter(self.cfg), container_store(self.cfg, trip.info.trip_id)
+        except Refused as exc:
+            raise StepFailed(step, str(exc))
+
+    @staticmethod
+    def _failure(exc: Exception) -> str:
+        code = getattr(exc, "safe_error_code", type(exc).__name__)
+        return f"{code}: {exc}"
+
+    def record_container_image(self, trip: Trip, image: str) -> None:
+        """topology.yaml says which image the container runs now, as the worker records it after its own deploy. Only the
+        one `image:` line changes, in place and atomically; a topology that has no such line is a loud failure (the
+        container already runs the new image: the record must not quietly disagree)."""
+        path = trip.trip_dir / "topology.yaml"
+        text = path.read_text(encoding="utf-8")
+        pattern = re.compile(r"^(\s+image:\s*)(['\"]?)trip-site:[0-9a-f]{64}\2[ \t]*$", re.M)
+        new, count = pattern.subn(lambda m: f"{m.group(1)}{m.group(2)}trip-site:{image}{m.group(2)}", text)
+        if count != 1:
+            raise StepFailed("site", f"the container runs the new image, but {path} has {count} `image:` lines to update "
+                                     "instead of one; fix the record by hand")
+        if new != text:
+            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(new, encoding="utf-8")
+            os.chmod(tmp, path.stat().st_mode & 0o777)
+            os.replace(tmp, path)
+
+    def container_healthy(self, adapter, trip: Trip, wait: int) -> bool:
+        """The host's own `check` (/api/health asked from inside the container) until it says healthy, or `wait` runs out."""
+        deadline = time.time() + wait
+        while True:
+            try:
+                if adapter.check(trip.info.trip_id, trip.slug).get("healthy") is True:
+                    return True
+            except Exception:       # noqa: BLE001 - not answering yet is "not healthy yet", and the deadline decides
+                pass
+            if time.time() >= deadline:
+                return False
+            time.sleep(min(2, max(0.1, deadline - time.time())))
+
+    def step_site_container(self, trip: Trip, rollout: dict) -> None:
+        worker, adapter, store = self.container_parts("site", trip)
+        try:
+            image = worker.image_digest(self.release["artifact_digest"])
+        except worker.TripContainerError as exc:
+            raise StepFailed("site", self._failure(exc))
+        try:
+            before = hashlib.sha256(store.read_trip_file("trip.config.json") or b"").hexdigest()
+        except worker.TripContainerError as exc:
+            raise StepFailed("site", self._failure(exc))
+        try:
+            answer = adapter.deploy(trip.info.trip_id, trip.slug, ip=trip.info.ipv4, image=image)
+        except worker.TripContainerError as exc:
+            # The host refuses an image it lacks before it touches anything (TRIP_IMAGE_MISSING names the command that builds it).
+            raise StepFailed("site", f"the trip-container host did not deploy it, and nothing was changed on the trip ({self._failure(exc)})"
+                             if isinstance(exc, worker.TripContainerRefused) else self._failure(exc))
+        self.record_container_image(trip, image)
+        previous = answer.get("previous_image")
+        say(f"      container recreated on trip-site:{image[:12]}...; previous image {previous or 'none (first deploy)'}: "
+            "the way back is the trip's recorded previous release (roll out to it)")
+        try:
+            after = hashlib.sha256(store.read_trip_file("trip.config.json") or b"").hexdigest()
+        except worker.TripContainerError as exc:
+            raise StepFailed("site", self._failure(exc))
+        if after != before:
+            raise StepFailed("site", "the trip's trip.config.json changed during the deploy; a rollout changes no trip config")
+        if not self.container_healthy(adapter, trip, self.cfg.site_wait):
+            raise StepFailed("site", f"the container's own /api/health did not answer ok within {self.cfg.site_wait}s")
+        moved = self.db.run(MOVE_RECORD_SQL, trip_id=trip.row["id"], from_release=rollout["from"] or "",
+                            to_release=self.release["id"])
+        if moved != "1":
+            raise StepFailed("site", "the site is deployed but the trip's recorded release moved meanwhile, so it was not updated")
+
+    def step_switches_container(self, trip: Trip, block: dict, payload: str, expected: str) -> None:
+        """The same contract as the command a deployment gives an LXC trip: STOP the site, merge ONLY `features` into the
+        trip's live config, START it (a running site rewrites the file from memory when a participant is written). The
+        config is `trip/trip.config.json` on the document store, written the worker's way (beside the target, handed to the
+        container's uid, renamed over it). The start is in a `finally`: the site is never left down by this step."""
+        worker, adapter, store = self.container_parts("switches", trip)
+        slug, trip_id = trip.slug, trip.info.trip_id
+
+        def rest_digest(config: dict) -> str:
+            rest = {k: v for k, v in config.items() if k != "features"}
+            return digest_of(json.dumps(rest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        try:
+            raw = store.read_trip_file("trip.config.json")
+            running = adapter.check(trip_id, slug).get("running") is True
+        except worker.TripContainerError as exc:
+            raise StepFailed("switches", self._failure(exc))
+        if raw is None:
+            raise StepFailed("switches", "the trip has no trip.config.json on the document store; nothing was written")
+        try:
+            config = json.loads(raw)
+        except ValueError:
+            config = None
+        if not isinstance(config, dict):
+            raise StepFailed("switches", "the trip's trip.config.json on the document store is not a JSON object; nothing was written")
+        if not running:
+            raise StepFailed("switches", "the trip's container is not running (held down on purpose?): start it "
+                                         f"(`trip-autostart.py --trip {slug} --on`) and plan again; nothing was written")
+        rest_before = rest_digest(config)
+        new = (json.dumps({**config, "features": block}, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        stopped, error, start_error, written = False, None, None, None
+        try:
+            adapter.stop(trip_id, slug)
+            stopped = True
+            store.write_trip_files({"trip.config.json": new})
+            written = store.read_trip_file("trip.config.json")
+        except worker.TripContainerError as exc:
+            error = exc
+        finally:
+            if stopped:
+                try:
+                    adapter.start(trip_id, slug)
+                except worker.TripContainerError as exc:
+                    start_error = exc
+        if error is not None:
+            tail = f"; AND the container could not be started again ({self._failure(start_error)}): it is DOWN" if start_error else ""
+            raise StepFailed("switches", f"the features block was not written ({self._failure(error)}){tail}")
+        if start_error is not None:
+            raise StepFailed("switches", f"the features block was written, but the container could not be started again "
+                                         f"({self._failure(start_error)}): it is DOWN")
+        try:
+            after = json.loads(written or b"")
+        except ValueError:
+            after = None
+        if not isinstance(after, dict):
+            raise StepFailed("switches", "what was read back from the store is not the trip's config")
+        if digest_of(json.dumps(after.get("features"), sort_keys=True, separators=(",", ":")).encode("utf-8")) != expected:
+            raise StepFailed("switches", "the store holds a different block from the one that was written")
+        if rest_digest(after) != rest_before:
+            raise StepFailed("switches", "something other than `features` changed in the trip's config; "
+                                         "a rollout writes the features block and nothing else")
+        if not self.container_healthy(adapter, trip, self.cfg.site_wait):
+            raise StepFailed("switches", f"the container's own /api/health did not answer ok within {self.cfg.site_wait}s after the restart")
+        say(f"      features written: {', '.join(block) if block else 'none (every switch is off for this trip)'}")
+        say("      readback SKIPPED: a vm-container trip has no per-trip mcp/.env, so the site's own /api/config was not asked; "
+            "the file was read back from the document store and the container's health was checked")
+
     def step_site(self, trip: Trip, rollout: dict) -> None:
+        if trip.is_container:
+            return self.step_site_container(trip, rollout)
         tree = self.materialized("site")
         config_path = trip.trip_dir / "trip.config.json"
         before = file_digest(config_path)
@@ -1043,6 +1287,9 @@ class Executor:
             raise StepFailed("site", "the site is deployed but the trip's recorded release moved meanwhile, so it was not updated")
 
     def step_bridge(self, trip: Trip, rollout: dict) -> None:
+        if trip.is_container:
+            raise StepSkipped("a vm-container trip has no per-trip bridge: the one shared bridge serves it, as its own "
+                              "service, and `kinerary-cp-release verify` asks it per trip")
         port = BRIDGE_PORT_BASE + int(trip.vmid)
         if not (BRIDGE_PORT_RANGE[0] <= port <= BRIDGE_PORT_RANGE[1]):
             raise StepFailed("bridge", "the trip's container id gives no usable bridge port")
@@ -1081,8 +1328,16 @@ class Executor:
         record of its confirmed intake: through the SAME `build_companion_handoff`. None when the trip has no
         companion (its config names no assistant, or no organizer that resolves to a participant)."""
         try:
-            config = json.loads((trip.trip_dir / "trip.config.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            if trip.is_container:
+                # The live config is on the document store, not beside the trip in the deployment root.
+                _worker, _adapter, store = self.container_parts("companion", trip)
+                raw = store.read_trip_file("trip.config.json")
+                if raw is None:
+                    raise OSError("no trip.config.json on the document store")
+                config = json.loads(raw)
+            else:
+                config = json.loads((trip.trip_dir / "trip.config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, _client().worker_module().TripContainerError):
             raise StepFailed("companion", "the trip's trip.config.json cannot be read, so its companion cannot be rendered")
         if not isinstance(config, dict):
             raise StepFailed("companion", "the trip's trip.config.json is not an object")
@@ -1209,6 +1464,8 @@ class Executor:
         block = feature_block.build_features_block(answers)
         payload = json.dumps(block, sort_keys=True, separators=(",", ":"))
         expected = digest_of(payload.encode("utf-8"))
+        if trip.is_container:
+            return self.step_switches_container(trip, block, payload, expected)
 
         config_path = trip.trip_dir / "trip.config.json"
         local_before = file_digest(config_path)
@@ -1362,7 +1619,7 @@ def cmd_execute(cfg: Config, db: Db, args) -> int:
     steps = tuple(s for s in ALL_STEPS if s in steps)
     if "companion" in steps:
         require_companion_config(cfg)
-    if "switches" in steps:
+    if "switches" in steps and any_lxc_trip(cfg, [t["slug"] for t in plan["trips"] if isinstance(t, dict) and isinstance(t.get("slug"), str)]):
         require_features_config(cfg)
 
     release = get_release(db, plan["release"]["id"])

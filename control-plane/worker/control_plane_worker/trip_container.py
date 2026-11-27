@@ -108,11 +108,19 @@ def image_missing_message(digest: str) -> str:
 
 def ssh_transport(
     host: str, user: str, key_path: str, known_hosts: str, *, port: int = 22, timeout: int = SSH_TIMEOUT_SECONDS,
+    connect_host: "str | None" = None,
 ) -> Transport:
     """Send a payload to the host's forced command: (exit status, stdout). The payload goes on stdin; the
     command line is the fixed one every forced-command request uses (`companion_profile.forced_command_argv`).
-    stderr is not read: the host's own log lines are for the host's log."""
-    argv = forced_command_argv(host, user, key_path, port, known_hosts)
+    stderr is not read: the host's own log lines are for the host's log.
+
+    `connect_host` is for a caller that runs ON the trip-container host and reaches it by another name than the
+    worker does (the lifecycle scripts: loopback): ssh connects there and `HostKeyAlias=<host>` checks the host key
+    against the pin written for `host`, so the same known_hosts file serves both and the pin is never loosened.
+    Without it the argv is exactly what it was."""
+    argv = forced_command_argv(connect_host or host, user, key_path, port, known_hosts)
+    if connect_host and connect_host != host:
+        argv[-1:-1] = ["-o", f"HostKeyAlias={host}"]      # before user@host, which is always the last word
 
     def send(payload: bytes) -> "tuple[int, bytes]":
         try:

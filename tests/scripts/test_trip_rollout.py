@@ -66,6 +66,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -2455,6 +2456,263 @@ class SwitchesStep(DatabaseCase):
         self.assertEqual(1, code)
         self.assertIn("REFUSED", out)
         self.assertEqual([], self.rig.log("features.log"))
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trip_container_fixtures as fx  # noqa: E402
+
+
+class VmContainerRollout(DatabaseCase):
+    """AC-9 (docs/specs/sprint-9/x-trip-vm-container-placement.md): a `vm-container` trip is rolled out through the
+    trip-container host's forced command and the document store: the container is recreated on the release's image, the
+    previous image is the way back, and a switch change is merged into `trip/` on the store. The stand-in host is the
+    worker's FakeTripHost (a contract-level stand-in, kept honest by test_trip_container_worker_contract.py); no Docker,
+    no ssh and no Proxmox. The deployment's own deploy, bridge and hostname commands are fakes that FAIL if they run."""
+
+    def setUp(self):
+        super().setUp()
+        self.sql.run("DELETE FROM control_plane.feature_switch_settings")
+        self.addCleanup(self.sql.run, "DELETE FROM control_plane.feature_switch_settings")
+        self.hex1, self.hex2 = self.rig.digest1.split(":", 1)[1], self.rig.digest2.split(":", 1)[1]
+        self.nfs = self.rig.dir / "nfs"
+        self.nfs.mkdir()
+        self.host = fx.FakeTripHost(self.nfs, images={self.hex1, self.hex2}, bridge_url=fx.BRIDGE_URL)
+        self.adapter = fx.client.adapter(fx.CLIENT_ENV, transport=self.host)
+        env = {"KINERARY_NFS_ROOT": str(self.nfs)}
+        for patcher in (mock.patch.object(rt, "container_adapter", lambda cfg: self.adapter),
+                        mock.patch.object(rt, "container_store", lambda cfg, trip_id: fx.client.store(env, trip_id))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # the deployment's LXC commands must never run for a container trip
+        boom = self.rig.dir / "boom.py"
+        boom.write_text("import sys\nsys.stderr.write('an LXC command ran for a container trip')\nsys.exit(99)\n")
+        self.boom = shlex.join([PYTHON, str(boom)])
+        self.cmds = {"KINERARY_TRIP_DEPLOY_CMD": self.boom, "KINERARY_BRIDGE_RESTART_CMD": self.boom,
+                     "KINERARY_TRIP_FEATURES_CMD": self.boom}
+
+    def container_trip(self, name="a", *, current="r1", state="active", running=True):
+        slug = f"ro-{self.rig.tag}-{name}"
+        trip_id = "trip_" + secrets.token_hex(16)
+        tdir = self.rig.root / "trips" / slug
+        tdir.mkdir(parents=True)
+        image = self.hex1 if current == "r1" else self.hex2
+        (tdir / "topology.yaml").write_text(fx.container_topology_text(slug=slug, trip_id=trip_id, image=image))
+        self.sql.run(
+            """INSERT INTO control_plane.trips(id, slug, lifecycle_state, current_release_id)
+               VALUES (:'id', :'slug', :'state', :'cur')""",
+            id=trip_id, slug=slug, state=state, cur={"r1": self.rig.r1, "r2": self.rig.r2}[current])
+        self.sql.run(
+            """INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data)
+               VALUES (:'id', :'trip', 1, 'intake:fixture', :'digest', now(), 1, '{}'::jsonb)""",
+            id="intk_" + secrets.token_hex(8), trip=trip_id, digest="sha256:" + secrets.token_hex(32))
+        self.adapter.ensure(trip_id, slug, ip="10.250.0.10", image=image, seed_password="seedpassword1")
+        config = {"slug": slug, "participants": [{"username": "ana"}, {"username": "added-at-runtime", "pin": "4321"}],
+                  "features": {"left_over_from_before": True}}
+        (self.nfs / trip_id / "trip" / "trip.config.json").write_text(json.dumps(config))
+        self.host.containers[slug]["running"] = running
+        self.host.events.clear()
+        self.host.requests.clear()
+        self.trip_ids = getattr(self, "trip_ids", {})
+        self.trip_ids[slug] = trip_id
+        return slug
+
+    def store_config(self, slug):
+        return json.loads((self.nfs / self.trip_ids[slug] / "trip" / "trip.config.json").read_text())
+
+    def topology_image(self, slug):
+        text = (self.rig.root / "trips" / slug / "topology.yaml").read_text()
+        return re.search(r"image: (trip-site:[0-9a-f]{64})", text).group(1)
+
+    def go(self, slug, steps="site", release=None, name="plan.json", env=None):
+        code, out, err, path, digest = self.rig.plan(release or self.rig.r2, [slug], steps, name)
+        self.assertEqual(0, code, out + err)
+        return self.rig.run(["execute", "--plan-file", str(path), "--plan-digest", digest], env or self.rig.env(**self.cmds)) + (path, digest)
+
+    def verbs(self):
+        return [r["verb"] for r in self.host.requests]
+
+    # -- the site step
+
+    def test_the_container_is_recreated_on_the_releases_image_and_the_record_moves(self):
+        slug = self.container_trip()
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(0, code, out + err)
+        (deploy,) = [r for r in self.host.requests if r["verb"] == "deploy"]
+        self.assertEqual({"image": self.hex2, "ip": "10.250.0.10", "slug": slug}, {k: deploy[k] for k in ("image", "ip", "slug")})
+        self.assertEqual(self.hex2, self.host.containers[slug]["image"])
+        state = self.rig.trip_state(slug)
+        self.assertEqual((self.rig.r2, self.rig.r1), (state["current_release_id"], state["previous_release_id"]),
+                         "the previous release is the way back")
+        self.assertIn(f"previous image trip-site:{self.hex1}", out)
+        self.assertEqual(f"trip-site:{self.hex2}", self.topology_image(slug), "topology.yaml records what the container runs")
+        self.assertEqual(["ok"], [r["result"] for r in self.rig.rollouts(slug)])
+        self.assertEqual({"left_over_from_before": True}, self.store_config(slug)["features"], "the config is untouched")
+
+    def test_no_lxc_command_runs_and_no_secret_or_path_is_printed(self):
+        slug = self.container_trip()
+        code, out, err, _, _ = self.go(slug, steps="site,bridge")
+        self.assertEqual(0, code, out + err)
+        self.assertNotIn("an LXC command ran", out + err)
+        self.assertIn("bridge skipped: a vm-container trip has no per-trip bridge", out)
+        self.assertNotIn("seedpassword1", out + err)
+
+    def test_rolling_back_deploys_the_previous_image_again(self):
+        slug = self.container_trip()
+        self.assertEqual(0, self.go(slug, name="up.json")[0])
+        code, out, err, _, _ = self.go(slug, release=self.rig.r1, name="down.json")
+        self.assertEqual(0, code, out + err)
+        self.assertEqual(self.hex1, self.host.containers[slug]["image"])
+        self.assertEqual(f"trip-site:{self.hex1}", self.topology_image(slug))
+        self.assertEqual(self.rig.r1, self.rig.trip_state(slug)["current_release_id"])
+
+    def test_an_image_the_host_lacks_fails_the_step_naming_the_command_that_builds_it_and_changes_nothing(self):
+        slug = self.container_trip()
+        self.host.images.discard(self.hex2)
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.assertIn("FAILED at step site", out)
+        self.assertIn("TRIP_IMAGE_MISSING", out)
+        self.assertIn("kinerary-cp-release trip-image", out)
+        self.assertEqual(self.hex1, self.host.containers[slug]["image"], "the container still runs what it ran")
+        state = self.rig.trip_state(slug)
+        self.assertEqual((self.rig.r1, None), (state["current_release_id"], state["previous_release_id"]))
+        self.assertEqual(f"trip-site:{self.hex1}", self.topology_image(slug))
+        self.assertEqual(["failed"], [r["result"] for r in self.rig.rollouts(slug)])
+
+    def test_a_container_that_does_not_come_up_healthy_fails_the_step_and_moves_nothing(self):
+        slug = self.container_trip()
+        self.host.unhealthy_checks = 10_000
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.assertIn("did not answer ok", out)
+        state = self.rig.trip_state(slug)
+        self.assertEqual((self.rig.r1, None), (state["current_release_id"], state["previous_release_id"]))
+
+    def test_a_host_that_cannot_be_reached_fails_the_step_without_a_traceback(self):
+        slug = self.container_trip()
+        self.host.ssh_failure = True
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.assertIn("FAILED at step site", out)
+        self.assertNotIn("Traceback", out + err)
+
+    def test_a_topology_that_names_another_trips_directory_is_refused(self):
+        slug = self.container_trip()
+        path = self.rig.root / "trips" / slug / "topology.yaml"
+        path.write_text(path.read_text().replace(self.trip_ids[slug], "trip_ffffffffffffffffffffffffffffffff"))
+        code, out, err, _, _ = self.rig.plan(self.rig.r2, [slug], "site")
+        self.assertEqual(1, code)
+        self.assertIn("another trip's directory", out)
+
+    def test_a_host_that_is_not_set_up_is_refused_at_the_plan_naming_what_is_unset(self):
+        slug = self.container_trip()
+        with mock.patch.object(rt, "container_adapter", side_effect=rt.Refused("unset:\n  TRIP_CONTAINER_SSH_USER  - the user")):
+            code, out, err, _, _ = self.rig.plan(self.rig.r2, [slug], "site")
+        self.assertEqual(1, code)
+        self.assertIn("TRIP_CONTAINER_SSH_USER", out)
+
+    # -- the switches step
+
+    def test_a_switch_is_merged_into_the_stores_config_between_a_stop_and_a_start_and_nothing_else_moves(self):
+        slug = self.container_trip()
+        self.rig.set_switch(slug, "delivery_probe", True)
+        before = self.store_config(slug)
+        code, out, err, _, _ = self.go(slug, steps="switches")
+        self.assertEqual(0, code, out + err)
+        after = self.store_config(slug)
+        self.assertEqual({"delivery_probe": True}, after["features"], "the old block was replaced, not merged")
+        self.assertEqual({k: v for k, v in before.items() if k != "features"}, {k: v for k, v in after.items() if k != "features"},
+                         "every other key, the participant added at runtime included, is as it was")
+        verbs = [v for v in self.verbs() if v in ("stop", "start")]
+        self.assertEqual(["stop", "start"], verbs)
+        self.assertLess(self.verbs().index("stop"), self.verbs().index("start"))
+        self.assertTrue(self.host.containers[slug]["running"])
+        self.assertIn("readback SKIPPED", out, "the one check this step cannot make is said, not silent")
+        self.assertEqual(self.rig.r1, self.rig.trip_state(slug)["current_release_id"], "the switches step moves no release")
+
+    def test_the_container_is_started_again_when_the_write_fails(self):
+        slug = self.container_trip()
+        self.rig.set_switch(slug, "delivery_probe", True)
+        with mock.patch.object(fx.client.worker_module().TripStore, "write_trip_files",
+                               side_effect=fx.client.worker_module().TripStoreError("the store is read-only")):
+            code, out, err, _, _ = self.go(slug, steps="switches")
+        self.assertEqual(1, code)
+        self.assertIn("FAILED at step switches", out)
+        self.assertIn("not written", out)
+        self.assertTrue(self.host.containers[slug]["running"], "the step never leaves the site down")
+        self.assertEqual({"left_over_from_before": True}, self.store_config(slug)["features"])
+
+    def test_a_container_that_cannot_be_started_again_is_said_to_be_down(self):
+        slug = self.container_trip()
+        self.host.refuse_with["start"] = "the store is gone"
+        code, out, err, _, _ = self.go(slug, steps="switches")
+        self.assertEqual(1, code)
+        self.assertIn("DOWN", out)
+
+    def test_a_trip_held_down_on_purpose_is_not_started_by_a_switch_change(self):
+        slug = self.container_trip(running=False)
+        code, out, err, _, _ = self.go(slug, steps="switches")
+        self.assertEqual(1, code)
+        self.assertIn("not running", out)
+        self.assertEqual(["check"], self.verbs())
+        self.assertEqual({"left_over_from_before": True}, self.store_config(slug)["features"])
+
+    def test_a_config_that_is_not_json_on_the_store_fails_the_step_and_changes_nothing(self):
+        slug = self.container_trip()
+        (self.nfs / self.trip_ids[slug] / "trip" / "trip.config.json").write_text("{not json")
+        code, out, err, _, _ = self.go(slug, steps="switches")
+        self.assertEqual(1, code)
+        self.assertIn("not a JSON object", out)
+        self.assertNotIn("stop", self.verbs())
+
+    def test_a_deployment_that_never_configured_the_lxc_features_command_can_still_roll_switches_to_a_container_trip(self):
+        slug = self.container_trip()
+        self.rig.set_switch(slug, "delivery_probe", True)
+        env = self.rig.env(**self.cmds)
+        del env["KINERARY_TRIP_FEATURES_CMD"]
+        code, out, err, _, _ = self.go(slug, steps="switches", env=env)
+        self.assertEqual(0, code, out + err)
+        self.assertEqual({"delivery_probe": True}, self.store_config(slug)["features"])
+
+    def test_the_lxc_features_command_is_still_required_for_an_lxc_trip_in_the_same_plan(self):
+        slug, lxc = self.container_trip(), self.rig.trip("lxc")
+        env = self.rig.env(**self.cmds)
+        del env["KINERARY_TRIP_FEATURES_CMD"]
+        code, out, err = self.rig.run(["plan", "--release", self.rig.r2, "--trip", f"{slug},{lxc}", "--steps", "switches",
+                                       "--plan-file", str(self.rig.dir / "mixed.json")], env)
+        self.assertNotEqual(0, code)
+        self.assertIn("KINERARY_TRIP_FEATURES_CMD", err)
+
+    def test_the_companion_step_reads_a_container_trips_config_from_the_store_and_skips_a_trip_with_no_companion(self):
+        slug = self.container_trip()
+        code, out, err, _, _ = self.go(slug, steps="companion")
+        self.assertEqual(0, code, out + err)
+        self.assertIn("companion skipped: this trip has no companion", out)
+
+    def test_a_companion_step_with_no_config_on_the_store_fails_naming_what_could_not_be_read(self):
+        slug = self.container_trip()
+        (self.nfs / self.trip_ids[slug] / "trip" / "trip.config.json").unlink()
+        code, out, err, _, _ = self.go(slug, steps="companion")
+        self.assertEqual(1, code)
+        self.assertIn("trip.config.json cannot be read", out)
+
+    def test_every_switch_off_writes_an_empty_block(self):
+        slug = self.container_trip()
+        code, out, err, _, _ = self.go(slug, steps="switches")
+        self.assertEqual(0, code, out + err)
+        self.assertEqual({}, self.store_config(slug)["features"])
+        self.assertIn("every switch is off", out)
+
+    # -- the LXC path is the one it always was
+
+    def test_an_lxc_trip_in_the_same_run_still_goes_through_the_deployments_commands(self):
+        slug = self.rig.trip("lxc")
+        code, out, err, path, digest = self.rig.plan(self.rig.r2, [slug], "site")
+        self.assertEqual(0, code, out + err)
+        code, out, err = self.rig.execute(path, digest)
+        self.assertEqual(0, code, out + err)
+        self.assertEqual(1, len(self.rig.log("deploy.log")))
+        self.assertEqual([], self.host.requests, "no container request for an lxc trip")
 
 
 if __name__ == "__main__":

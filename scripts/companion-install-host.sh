@@ -1503,9 +1503,26 @@ import re, sys, yaml
 topo = yaml.safe_load(open(sys.argv[1])) or {}
 slug = sys.argv[2]
 shared = sys.argv[3] == "shared"
-lxc = ((topo.get("proxmox") or {}).get("lxc") or {})
-if topo.get("name") != slug or lxc.get("name") != f"trip-{slug}":
-    print(f"topology does not describe {slug}", file=sys.stderr); raise SystemExit(2)
+placement = topo.get("placement") or "lxc"
+if placement not in ("lxc", "vm-container"):
+    print(f"topology for {slug} records a placement this script does not know", file=sys.stderr); raise SystemExit(2)
+if placement == "vm-container":
+    # A site that is one Docker container on the control-plane host (docs/specs/sprint-9/
+    # x-trip-vm-container-placement.md): no proxmox section, so no vmid and no per-trip bridge port. It exists
+    # only on the shared bridge. The site's address is the container section's, under the same ASCII validation
+    # below, and the name rule is the one the worker writes (compute.py: `trip-<slug>`, not cut at 63).
+    if not shared:
+        print(f"{slug} is a vm-container trip: it is served by the shared trip-mcp bridge only, and this host has "
+              "shared mode off (KINERARY_SHARED_BRIDGE_ROUTES_DIR and KINERARY_SHARED_BRIDGE_URL)", file=sys.stderr)
+        raise SystemExit(2)
+    container = topo.get("container") or {}
+    if not isinstance(container, dict) or topo.get("name") != slug or container.get("name") != f"trip-{slug}":
+        print(f"topology does not describe {slug}", file=sys.stderr); raise SystemExit(2)
+    lxc = container
+else:
+    lxc = ((topo.get("proxmox") or {}).get("lxc") or {})
+    if topo.get("name") != slug or lxc.get("name") != f"trip-{slug}":
+        print(f"topology does not describe {slug}", file=sys.stderr); raise SystemExit(2)
 vmid = str((topo.get("proxmox") or {}).get("vmid") or "")
 ipv4 = str(lxc.get("ipv4") or "")
 fport = str((topo.get("npm") or {}).get("forward_port") or "")

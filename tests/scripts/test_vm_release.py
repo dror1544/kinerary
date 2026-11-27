@@ -2177,6 +2177,133 @@ class StandaloneVerify(unittest.TestCase):
             self.assertEqual(vr.cmd_gate(["verify"]), 0)
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trip_container_fixtures as fx  # noqa: E402
+
+
+class ContainerVerifyCP(FleetCP):
+    """FleetCP with a stand-in trip-container host behind `trip_container_client()`."""
+
+    def __init__(self, shell, adapter=None, **kwargs):
+        super().__init__(shell, **kwargs)
+        self.adapter = adapter
+        self.client_requests = 0
+
+    def trip_container_client(self):
+        self.client_requests += 1
+        if self.adapter is None:
+            raise vr.Refused("this host is not set up to reach the trip-container host; unset:\n  TRIP_CONTAINER_SSH_USER")
+        return self.adapter
+
+
+class VmContainerVerify(FleetWorld):
+    """AC-12 (docs/specs/sprint-9/x-trip-vm-container-placement.md): `verify` lists each vm-container trip and asks the
+    host's `check` verb whether it serves, so an upgrade or a rollback that left one down is seen. Found live on
+    2026-11-27: the verify had nothing to say about a container trip at all."""
+
+    def trip(self, slug="gatecity2026", **kwargs):
+        directory = self.deploy / "trips" / slug
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "topology.yaml").write_text(fx.container_topology_text(slug=slug, **kwargs))
+
+    def stand(self, slug="gatecity2026"):
+        self.store = self.tmp / "nfs"
+        self.store.mkdir(exist_ok=True)
+        host, adapter = fx.host_with_trip(self.store, slug)
+        return host, adapter
+
+    def checks(self, cp):
+        findings = vr.Findings()
+        cp.container_checks(findings)
+        return findings
+
+    def test_each_container_trip_is_listed_and_asked_through_the_check_verb(self):
+        self.trip("gatecity2026")
+        self.trip("alsace2026", trip_id="trip_abcdefabcdefabcdefabcdefabcdefab")
+        host, adapter = self.stand("gatecity2026")
+        fx.client.worker_module()
+        adapter.ensure("trip_abcdefabcdefabcdefabcdefabcdefab", "alsace2026", ip="10.250.0.11", image=fx.DIGEST_A,
+                       seed_password="seedpassword1")
+        host.events.clear(); host.requests.clear()
+        found = self.checks(ContainerVerifyCP(FakeShell(), adapter))
+        ids = {c.id: c for c in found.checks}
+        self.assertEqual({"container:gatecity2026", "container:alsace2026"}, set(ids))
+        self.assertTrue(all(c.ok for c in ids.values()), found.items)
+        self.assertEqual({"check"}, {r["verb"] for r in host.requests})
+        self.assertEqual({fx.TRIP_ID, "trip_abcdefabcdefabcdefabcdefabcdefab"}, {r["trip_id"] for r in host.requests})
+
+    def test_a_container_that_runs_but_does_not_answer_health_fails_the_verify_and_names_the_trip(self):
+        self.trip()
+        host, adapter = self.stand()
+        host.unhealthy_checks = 5
+        (check,) = self.checks(ContainerVerifyCP(FakeShell(), adapter)).checks
+        self.assertFalse(check.ok)
+        self.assertEqual("UNHEALTHY", check.code)
+        self.assertIn("gatecity2026", check.text)
+
+    def test_a_trip_whose_container_is_gone_fails(self):
+        self.trip()
+        host, adapter = self.stand()
+        host.containers.clear()
+        (check,) = self.checks(ContainerVerifyCP(FakeShell(), adapter)).checks
+        self.assertEqual(("container:gatecity2026", False, "NOT_PRESENT"), (check.id, check.ok, check.code))
+
+    def test_a_trip_held_down_on_purpose_is_listed_and_does_not_fail_an_upgrade(self):
+        # trip-autostart --off stops the container; verify failing for it would block every upgrade after.
+        self.trip()
+        host, adapter = self.stand()
+        host.containers["gatecity2026"]["running"] = False
+        found = self.checks(ContainerVerifyCP(FakeShell(), adapter))
+        self.assertEqual([], [c for c in found.checks if not c.ok])
+        self.assertTrue(any("gatecity2026" in item and "stopped" in item for item in found.items if isinstance(item, str)), found.items)
+
+    def test_a_host_that_cannot_be_asked_is_a_failed_check_not_a_traceback(self):
+        self.trip()
+        host, adapter = self.stand()
+        host.ssh_failure = True
+        (check,) = self.checks(ContainerVerifyCP(FakeShell(), adapter)).checks
+        self.assertEqual(("container:gatecity2026", False, "HOST_UNREACHABLE"), (check.id, check.ok, check.code))
+
+    def test_a_host_that_is_not_set_up_is_one_failed_check_naming_what_is_unset(self):
+        self.trip()
+        found = self.checks(ContainerVerifyCP(FakeShell(), None))
+        (check,) = found.checks
+        self.assertEqual(("container:client", False, "NOT_CONFIGURED"), (check.id, check.ok, check.code))
+        self.assertIn("TRIP_CONTAINER_SSH_USER", check.text)
+
+    def test_with_no_container_trip_nothing_is_asked_and_nothing_is_required(self):
+        (self.deploy / "trips" / "lxc-trip").mkdir()
+        (self.deploy / "trips" / "lxc-trip" / "topology.yaml").write_text("version: 1\nname: lxc-trip\nproxmox:\n  vmid: '5'\n")
+        cp = ContainerVerifyCP(FakeShell(), None)
+        found = self.checks(cp)
+        self.assertEqual([], found.items)
+        self.assertEqual(0, cp.client_requests)
+
+    def test_a_topology_that_does_not_describe_its_own_directory_is_a_failed_check(self):
+        self.trip()
+        other = self.deploy / "trips" / "gatecity2026" / "topology.yaml"
+        other.write_text(other.read_text().replace("name: trip-gatecity2026", "name: trip-elsewhere"))
+        host, adapter = self.stand()
+        (check,) = self.checks(ContainerVerifyCP(FakeShell(), adapter)).checks
+        self.assertEqual(("container:gatecity2026", False, "BAD_TOPOLOGY"), (check.id, check.ok, check.code))
+        self.assertEqual([], host.requests)
+
+    def test_a_rollback_to_a_checkout_without_the_client_still_notices_the_container_trip(self):
+        # REPO here has no scripts/trip_container_client.py, as a checkout from before this feature would not.
+        self.trip()
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("trip_container_client", None)
+            (check,) = self.checks(ContainerVerifyCP(FakeShell(), None)).checks
+        self.assertEqual(("container:client", False, "NOT_CONFIGURED"), (check.id, check.ok, check.code))
+        self.assertIn("gatecity2026", check.text)
+
+    def test_collect_checks_includes_the_container_trips(self):
+        self.trip()
+        host, adapter = self.stand()
+        cp = ContainerVerifyCP(FakeShell(), adapter)
+        self.assertIn("container:gatecity2026", [c.id for c in cp.collect_checks().checks])
+
+
 class SourceInvariants(unittest.TestCase):
     def test_no_gateway_profile_is_named_in_the_check_code(self):
         source = TOOL.read_text()
