@@ -285,6 +285,32 @@ class SharedFileSet(unittest.TestCase):
         self.assertIn("status=1", proc.stdout)
         self.assertIn("cannot read", proc.stderr)
 
+    @unittest.skipUnless(BASH, "no bash")
+    def test_a_root_only_env_file_is_found_through_sudo_not_reported_absent(self):
+        # On the VM the env files live under a root-only directory: as the `debian` user `[ -e file ]` is false,
+        # so the helper used to skip every file and report every flag off, silently (a relay recreated without its
+        # WhatsApp secrets; vm-e2e.sh passing no KINERARY_NFS_ROOT). The existence check must go through sudo too.
+        secret_dir = Path(tempfile.mkdtemp(dir=_tmp))
+        env = secret_dir / "vm.env"
+        env.write_text("WHATSAPP_BRIDGE_ENABLED=1\n")
+        fake_bin = Path(tempfile.mkdtemp(dir=_tmp))
+        # A stand-in for sudo: "root" can see into the directory; the caller cannot (it is chmod 000 below).
+        (fake_bin / "sudo").write_text(f'#!/bin/sh\nchmod 700 "{secret_dir}"; "$@"; rc=$?; chmod 000 "{secret_dir}"; exit $rc\n')
+        (fake_bin / "sudo").chmod(0o755)
+        (self.dir / vr.WHATSAPP_OVERLAY).write_text("services: {}\n")
+        secret_dir.chmod(0o000)
+        try:
+            if os.access(env, os.F_OK):
+                self.skipTest("this user sees through a mode-000 directory (root)")
+            script = f'. "{HELPER}"; vm_compose_files_init "{self.dir}" "{env}" || exit 7; printf "%s\\n" "${{VM_COMPOSE_FILES[@]}}"'
+            proc = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
+                                  env={k: v for k, v in {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}.items()
+                                       if k != "VM_COMPOSE_READ"})
+        finally:
+            secret_dir.chmod(0o700)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn(vr.WHATSAPP_OVERLAY, [Path(a).name for a in proc.stdout.split()])
+
     def test_every_script_that_calls_compose_on_the_stack_takes_its_files_from_the_helper(self):
         # The silent failure this prevents: a relay recreated from compose.vm.yml alone has no WhatsApp secrets.
         offenders = []
