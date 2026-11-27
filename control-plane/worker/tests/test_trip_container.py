@@ -191,6 +191,35 @@ class SshTransportTests(unittest.TestCase):
         self.assertIn("UserKnownHostsFile=/keys/known_hosts", joined)
         self.assertIn("StrictHostKeyChecking=yes", joined)
 
+    def test_a_caller_on_the_host_connects_to_loopback_and_checks_the_pin_written_for_the_hosts_own_name(self) -> None:
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout=b'{"ok":true}\n', stderr=b"")
+
+        with mock.patch("subprocess.run", fake_run):
+            ssh_transport("cp.example.test", "tripctl", "/keys/k", "/keys/known_hosts", connect_host="127.0.0.1")(b"{}")
+        argv = seen["argv"]
+        self.assertEqual("tripctl@127.0.0.1", argv[-1], "still no remote command, and the connection goes to loopback")
+        self.assertIn("HostKeyAlias=cp.example.test", argv)
+        self.assertLess(argv.index("HostKeyAlias=cp.example.test"), len(argv) - 1)
+        self.assertIn("StrictHostKeyChecking=yes", argv, "the pin is not loosened")
+        self.assertIn("UserKnownHostsFile=/keys/known_hosts", argv)
+
+    def test_without_a_connect_host_the_argv_is_what_it_always_was(self) -> None:
+        from control_plane_worker.companion_profile import forced_command_argv
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout=b'{"ok":true}\n', stderr=b"")
+
+        with mock.patch("subprocess.run", fake_run):
+            ssh_transport("h", "u", "/k", "/kh")(b"{}")
+        self.assertEqual(forced_command_argv("h", "u", "/k", 22, "/kh"), seen["argv"])
+        self.assertFalse(any("HostKeyAlias" in word for word in seen["argv"]))
+
     def test_a_timeout_is_unreachable_and_longer_than_the_hosts_own_ceiling(self) -> None:
         def slow(argv, **kwargs):
             self.assertGreater(kwargs["timeout"], 600)

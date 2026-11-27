@@ -158,6 +158,24 @@ class TeardownIsRunAgainAfterAFailure(unittest.TestCase):
     def test_a_clean_teardown_runs_once_with_no_pause(self) -> None:
         self.assertEqual(self.run_with([0]), (0, 1, []))
 
+    def test_a_vm_container_trip_is_torn_down_through_the_same_script_by_its_id_and_nothing_pct(self) -> None:
+        # teardown-trip.py dispatches on the topology's placement itself (AC-8); the harness must not add a second path
+        # (a hand-run `pct` or a renamed topology, which is what had to be done by hand on 2026-11-27).
+        calls: list[list[str]] = []
+
+        def fake_run(argv, *a, **kw):
+            calls.append(list(argv))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.dict(os.environ, {"KINERARY_TEARDOWN": ""}, clear=False), \
+                mock.patch.object(self.mod.subprocess, "run", fake_run):
+            code = self.mod.stage_teardown({"trip_id": "trip_deadbeef", "placement": "vm-container", "vmid": None})
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(calls))
+        self.assertTrue(calls[0][1].endswith("teardown-trip.py"))
+        self.assertEqual(["--trip", "trip_deadbeef", "--execute"], calls[0][-3:])
+        self.assertFalse(any("pct" in word for call in calls for word in call))
+
 
 if __name__ == "__main__":
     unittest.main()

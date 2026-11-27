@@ -9,10 +9,14 @@ now belongs to some other container.
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trip_container_fixtures as fx  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "trip-autostart.py"
 spec = importlib.util.spec_from_file_location("trip_autostart", SCRIPT)
@@ -103,3 +107,89 @@ class Main(unittest.TestCase):
     def test_input_that_is_not_a_slug_is_refused_before_any_call(self):
         with mock.patch.object(autostart, "proxmox", side_effect=AssertionError("called")):
             self.assertEqual(autostart.main(["--trip", "../etc"]), 2)
+
+
+class VmContainer(unittest.TestCase):
+    """`placement: vm-container`: the restart policy is `unless-stopped`, so `--off` is a `stop` (it stays down through a
+    reboot) and `--on` a `start`. No `pct`, no Proxmox."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        root = Path(self.dir.name)
+        (root / "trips" / "japan-2026").mkdir(parents=True)
+        (root / "trips" / "japan-2026" / "topology.yaml").write_text(fx.container_topology_text())
+        self.store = root / "nfs"
+        self.store.mkdir()
+        self.host, self.adapter = fx.host_with_trip(self.store, "japan-2026")
+        for patcher in (mock.patch.object(autostart, "DEPLOY_ROOT", root),
+                        mock.patch.object(autostart, "load_provisioning_env", lambda: None),
+                        mock.patch.object(autostart, "container_adapter", lambda: self.adapter),
+                        mock.patch.object(autostart, "proxmox", side_effect=AssertionError("a container trip never reaches Proxmox"))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_main(self, *args):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = autostart.main(["--trip", "japan-2026", *args])
+        return code, out.getvalue()
+
+    def verbs(self):
+        return [r["verb"] for r in self.host.requests]
+
+    def test_show_asks_the_host_and_changes_nothing(self):
+        code, text = self.run_main()
+        self.assertEqual(0, code, text)
+        self.assertEqual(["check"], self.verbs())
+        self.assertIn("trip-japan-2026", text)
+        self.assertIn("running: yes", text)
+        self.assertTrue(self.host.containers["japan-2026"]["running"])
+
+    def test_off_stops_the_container_and_says_it_is_stopped_now_and_stays_down_after_a_reboot(self):
+        code, text = self.run_main("--off")
+        self.assertEqual(0, code, text)
+        self.assertEqual(["check", "stop", "check"], self.verbs())
+        self.assertFalse(self.host.containers["japan-2026"]["running"])
+        self.assertIn("stopped now", text)
+        self.assertIn("reboot", text)
+
+    def test_on_starts_it_again(self):
+        self.host.containers["japan-2026"]["running"] = False
+        code, text = self.run_main("--on")
+        self.assertEqual(0, code, text)
+        self.assertEqual("start", self.verbs()[1])
+        self.assertTrue(self.host.containers["japan-2026"]["running"])
+
+    def test_off_on_a_container_already_stopped_is_a_success(self):
+        self.host.containers["japan-2026"]["running"] = False
+        code, text = self.run_main("--off")
+        self.assertEqual(0, code, text)
+
+    def test_a_container_the_host_does_not_have_is_a_failure_that_says_so(self):
+        self.host.containers.clear()
+        code, text = self.run_main("--off")
+        self.assertEqual(1, code, text)
+        self.assertIn("no container", text)
+        self.assertNotIn("stop", self.verbs())
+
+    def test_a_host_that_refuses_the_change_is_a_failure(self):
+        self.host.refuse_with["stop"] = "the container labels are not this trips"
+        code, text = self.run_main("--off")
+        self.assertEqual(1, code, text)
+        self.assertTrue(self.host.containers["japan-2026"]["running"])
+
+    def test_a_topology_that_does_not_describe_this_trip_is_refused_before_any_request(self):
+        path = Path(self.dir.name) / "trips" / "japan-2026" / "topology.yaml"
+        path.write_text(path.read_text().replace("name: trip-japan-2026", "name: trip-someone-else"))
+        code, text = self.run_main("--off")
+        self.assertEqual(2, code, text)
+        self.assertEqual([], self.host.requests)
+
+    def test_a_host_not_set_up_for_the_client_is_refused_by_name(self):
+        with mock.patch.object(autostart, "container_adapter", side_effect=autostart.Refused("unset: TRIP_CONTAINER_SSH_USER")):
+            code, text = self.run_main("--off")
+        self.assertEqual(2, code, text)
+        self.assertIn("TRIP_CONTAINER_SSH_USER", text)

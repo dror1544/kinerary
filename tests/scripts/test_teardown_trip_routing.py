@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import sys
 import tempfile
@@ -25,6 +26,9 @@ from pathlib import Path
 from unittest import mock
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trip_container_fixtures as fx  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "teardown-trip.py"
 spec = importlib.util.spec_from_file_location("teardown_trip_routing", SCRIPT)
@@ -52,6 +56,10 @@ def wildcard_topology() -> dict:
     raw["proxmox"]["lxc"]["forward_port"] = 8080
     raw["proxmox"]["lxc"]["public_hostname"] = "japan-2026.example.invalid"
     return raw
+
+
+def _forbidden(*_a, **_k):
+    raise AssertionError("a vm-container trip builds no Proxmox, NPM or Cloudflare provisioner")
 
 
 class _Infra:
@@ -100,19 +108,34 @@ class _Infra:
 
 
 def run_teardown(raw_topology, *, execute=True, keep=False, shared_dir=None, route_file=None, write_symlink=False,
-                 npm_state=None):
-    """main() with every side effect replaced. Returns what happened."""
+                 npm_state=None, trip=None, container=None, extra_env=None, vm_env=None, document_store=None,
+                 real_adapter=False):
+    """main() with every side effect replaced. Returns what happened.
+
+    `container`: a callable taking the temp directory and returning the trip-container client for a vm-container trip
+    (the stand-in host). `vm_env`: text for <deploy root>/vm.env. `document_store`: a callable taking the temp directory
+    and returning the DOCUMENT_STORE_DIR/<trip id> path the script should find."""
     log: list[str] = []
     sql: list[str] = []
     infra = _Infra(wildcard="npm" not in raw_topology, npm_state=npm_state)
     out = io.StringIO()
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
+        adapter = container(tmp) if container is not None else None
+        if adapter is not None:
+            send = adapter._send
+
+            def logged(payload, send=send):
+                log.append("host:" + json.loads(payload)["verb"])
+                return send(payload)
+            adapter._send = logged
+        if vm_env is not None:
+            (tmp / "vm.env").write_text(vm_env)
         (tmp / "profiles").mkdir()
         trip_dir = tmp / "trips" / "japan-2026"
         trip_dir.mkdir(parents=True)
         (trip_dir / "topology.yaml").write_text(yaml.safe_dump(raw_topology, sort_keys=False))
-        env = {}
+        env = dict(extra_env or {})
         if shared_dir is not None:
             routes = tmp / "routes"
             routes.mkdir()
@@ -133,22 +156,23 @@ def run_teardown(raw_topology, *, execute=True, keep=False, shared_dir=None, rou
 
         patches = [
             mock.patch.object(teardown, "reexec_with_yaml", lambda: None),
-            mock.patch.object(teardown, "resolve", lambda target: dict(TRIP)),
+            mock.patch.object(teardown, "resolve", lambda target: dict(trip or TRIP)),
             mock.patch.object(teardown, "DEPLOY_ROOT", tmp),
             mock.patch.object(teardown, "PROFILES", tmp / "profiles"),
             mock.patch.object(teardown, "bridge", lambda d: None),
             mock.patch.object(teardown, "LAUNCH_AGENTS", tmp / "no-launch-agents"),
-            mock.patch.object(teardown, "document_store", lambda t: None),
+            mock.patch.object(teardown, "document_store", lambda t: document_store(tmp) if document_store else None),
             mock.patch.object(teardown, "kept_originals", lambda s: 0),
             mock.patch.object(teardown, "interviewer_allows", lambda p: False),
             mock.patch.object(teardown, "gateway_installed", lambda p: False),
             mock.patch.object(teardown, "gateway_loaded", lambda p: False),
             mock.patch.object(teardown, "table_exists", lambda t: False),
-            mock.patch.object(teardown, "build_provisioner", lambda topo=None: infra.prov),
+            mock.patch.object(teardown, "build_provisioner", _forbidden if raw_topology.get("placement") == "vm-container" else (lambda topo=None: infra.prov)),
+            *([mock.patch.object(teardown, "container_adapter", lambda: adapter)] if not real_adapter else []),
             mock.patch.object(teardown, "backup", record("backup")),
             mock.patch.object(teardown, "pin_gateway_off", record("pin", "no-table")),
             mock.patch.object(teardown, "confirm_gateway_down", record("confirm-down", True)),
-            mock.patch.object(teardown, "psql", lambda s: sql.append(s) or "0"),
+            mock.patch.object(teardown, "psql", lambda s: (sql.append(s), log.append("sql"))[0] or "0"),
             mock.patch.object(teardown, "site_answers", lambda host, port, seconds=90: True),
             mock.patch.object(teardown, "hermes", lambda: "hermes"),
             mock.patch.object(teardown.subprocess, "run", lambda *a, **k: mock.Mock(returncode=0, stdout="", stderr="")),
@@ -169,7 +193,7 @@ def run_teardown(raw_topology, *, execute=True, keep=False, shared_dir=None, rou
             with contextlib.redirect_stdout(out):
                 code = teardown.main()
         files = sorted(p.name for p in (tmp / "routes").iterdir()) if shared_dir is not None else []
-    return types.SimpleNamespace(code=code, text=out.getvalue(), infra=infra.log, sql=sql, routes_left=files)
+    return types.SimpleNamespace(code=code, text=out.getvalue(), infra=infra.log, sql=sql, routes_left=files, log=log)
 
 
 class WildcardTrip(unittest.TestCase):
@@ -357,6 +381,150 @@ class ReferenceTopologyForWildcard(unittest.TestCase):
         self.assertEqual("ref-japan-2026.example.invalid", out["proxmox"]["lxc"]["public_hostname"])
         self.assertEqual(8080, out["proxmox"]["lxc"]["forward_port"])
         self.assertNotIn("npm", out)
+
+
+# ── placement: vm-container (docs/specs/sprint-9/x-trip-vm-container-placement.md, AC-8) ────────────────
+
+CONTAINER_TRIP = dict(TRIP, id=fx.TRIP_ID)
+
+
+def container_topology(**over) -> dict:
+    return fx.container_topology("japan-2026", **over)
+
+
+class _Stand:
+    """A stand-in trip-container host with the trip up on it."""
+
+    def __init__(self, present=True, refuse=None):
+        self.present, self.refuse = present, refuse
+        self.host = self.adapter = self.store = None
+
+    def __call__(self, tmp: Path):
+        self.store = tmp / "nfs"
+        self.store.mkdir()
+        self.host, self.adapter = fx.host_with_trip(self.store, "japan-2026")
+        if not self.present:
+            self.host.containers.clear()
+        if self.refuse:
+            self.host.refuse_with["remove"] = self.refuse
+        return self.adapter
+
+
+def run_container(raw=None, *, stand=None, env=None, **kwargs):
+    stand = stand or _Stand()
+    kwargs["extra_env"] = {}
+
+    def container(tmp):
+        adapter = stand(tmp)
+        kwargs["extra_env"].update({"KINERARY_NFS_ROOT": str(tmp / "nfs"), **fx.CLIENT_ENV, **(env or {})})
+        return adapter
+
+    result = run_teardown(raw or container_topology(), trip=CONTAINER_TRIP, container=container, **kwargs)
+    result.stand = stand
+    return result
+
+
+class VmContainerTrip(unittest.TestCase):
+    def test_the_plan_says_what_will_be_removed_and_touches_nothing(self):
+        result = run_container(execute=False)
+        self.assertEqual(0, result.code, result.text)
+        self.assertIn("container: remove trip-japan-2026 via the trip-container host (store kept)", result.text)
+        self.assertNotIn("LXC", result.text)
+        self.assertEqual([], result.stand.host.requests, "a dry run sends the host nothing")
+        self.assertNotIn("sql", result.log)
+
+    def test_execute_removes_the_container_keeps_the_store_and_calls_no_proxmox_npm_or_dns(self):
+        result = run_container()
+        self.assertEqual(0, result.code, result.text)
+        self.assertEqual(["remove"], [r["verb"] for r in result.stand.host.requests])
+        self.assertEqual({"trip_id": fx.TRIP_ID, "slug": "japan-2026"},
+                         {k: result.stand.host.requests[0][k] for k in ("trip_id", "slug")})
+        self.assertNotIn("japan-2026", result.stand.host.containers)
+        # the script looked at the directory after the removal and found it (the temp tree is gone by now)
+        self.assertRegex(result.text, rf"store\s+\S*{fx.TRIP_ID} kept")
+        self.assertEqual([], result.infra, "no Proxmox, NPM or Cloudflare call (build_provisioner raises if reached)")
+        self.assertIn("container  trip-japan-2026 removed", result.text)
+        self.assertIn("store kept", result.text)
+
+    def test_the_container_goes_after_the_pin_and_before_the_database_is_retired(self):
+        result = run_container()
+        self.assertEqual(0, result.code, result.text)
+        self.assertLess(result.log.index("backup"), result.log.index("pin"))
+        self.assertLess(result.log.index("pin"), result.log.index("host:remove"))
+        self.assertLess(result.log.index("host:remove"), result.log.index("sql"))
+
+    def test_a_container_that_is_already_gone_is_a_success_because_teardown_is_run_again(self):
+        result = run_container(stand=_Stand(present=False))
+        self.assertEqual(0, result.code, result.text)
+        self.assertIn("already gone", result.text)
+
+    def test_a_host_that_refuses_the_removal_is_a_failed_step_and_the_run_says_something_remains(self):
+        result = run_container(stand=_Stand(refuse="the container labels are not this trips"))
+        self.assertEqual(1, result.code, result.text)
+        self.assertIn("something remains", result.text)
+        self.assertIn("labels", result.text)
+
+    def test_keep_container_is_refused_clearly_before_anything_is_done(self):
+        result = run_container(keep=True)
+        self.assertEqual(2, result.code, result.text)
+        self.assertIn("--keep-container", result.text)
+        self.assertIn("vm-container", result.text)
+        self.assertNotIn("backup", result.log)
+        self.assertEqual([], result.stand.host.requests)
+
+    def test_the_shared_bridge_route_is_removed_when_the_variable_is_only_in_vm_env(self):
+        # load_provisioning_env() is otherwise reached only through build_provisioner, which a vm-container trip never
+        # calls: without an explicit load the route file would be silently kept (AC-8).
+        with tempfile.TemporaryDirectory() as routes_parent:
+            routes = Path(routes_parent) / "routes"
+            routes.mkdir()
+            (routes / "japan-2026.json").write_text('{"schema_version": 1}')
+            result = run_container(vm_env=f"KINERARY_SHARED_BRIDGE_ROUTES_DIR={routes}\n")
+            self.assertEqual(0, result.code, result.text)
+            self.assertFalse((routes / "japan-2026.json").exists(), "the route file must be gone")
+            self.assertIn("removed shared-bridge route japan-2026.json", result.text)
+
+    def test_an_unset_client_variable_is_refused_by_name_even_for_the_plan_and_nothing_is_done(self):
+        for execute in (False, True):
+            with self.subTest(execute=execute):
+                result = run_teardown(container_topology(), execute=execute, trip=CONTAINER_TRIP, real_adapter=True,
+                                      extra_env={"KINERARY_NFS_ROOT": "/srv/nfs"})
+                self.assertEqual(2, result.code, result.text)
+                for name, _ in fx.client.CLIENT_ENV:
+                    self.assertIn(name, result.text)
+                self.assertNotIn("backup", result.log)
+                self.assertNotIn("sql", result.log)
+
+    def test_a_topology_that_names_another_trips_directory_is_refused_before_backup(self):
+        raw = container_topology(trip_id="trip_ffffffffffffffffffffffffffffffff")
+        result = run_container(raw)
+        self.assertEqual(2, result.code, result.text)
+        self.assertIn("does not describe", result.text)
+        self.assertEqual([], result.stand.host.requests)
+        self.assertNotIn("backup", result.log)
+
+    def test_a_topology_for_another_container_name_is_refused(self):
+        raw = container_topology()
+        raw["container"]["name"] = "trip-someone-else"
+        result = run_container(raw)
+        self.assertEqual(2, result.code, result.text)
+        self.assertEqual([], result.stand.host.requests)
+
+    def test_a_document_store_that_is_the_trips_own_directory_is_refused_so_the_documents_step_cannot_delete_it(self):
+        result = run_container(document_store=lambda tmp: tmp / "nfs" / fx.TRIP_ID)
+        self.assertEqual(2, result.code, result.text)
+        self.assertIn("document store", result.text)
+        self.assertEqual([], result.stand.host.requests)
+        self.assertNotIn("backup", result.log)
+
+    def test_a_missing_store_root_is_said_and_not_silently_skipped(self):
+        result = run_container(env={"KINERARY_NFS_ROOT": ""})
+        self.assertIn("KINERARY_NFS_ROOT", result.text)
+
+    def test_the_lxc_plan_is_unchanged(self):
+        result = run_teardown(wildcard_topology(), execute=False)
+        self.assertIn("LXC for japan-2026", result.text)
+        self.assertNotIn("trip-container host", result.text)
 
 
 if __name__ == "__main__":

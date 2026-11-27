@@ -2691,12 +2691,87 @@ class ControlPlane:
             text = f"trip {slug}: shared trip-mcp bridge on :{port} is not healthy for it ({code})"
         f.check(f"bridge:{slug}", code == "ok", code, text)
 
+    def trip_container_client(self):
+        """The worker's client of the trip-container host's forced command (scripts/trip_container_client.py, one
+        implementation shared with the lifecycle scripts), over this host's own loopback and the pinned key. The settings
+        are vm.env's. Refused, naming every unset one, when the host is not set up for it."""
+        module = trip_container_client_module()
+        try:
+            return module.adapter(self.vm_env(), repo=REPO)
+        except module.ClientConfigError as error:
+            raise Refused(str(error))
+
+    def container_checks(self, f: Findings) -> None:
+        """Every `placement: vm-container` trip under the deploy root, asked through the host's `check` verb (AC-12 of
+        docs/specs/sprint-9/x-trip-vm-container-placement.md). Listed by topology, not by chat binding: a trip with no
+        companion yet still has a container that must serve. Nothing is asked, and nothing is required of vm.env, while
+        no such trip exists.
+
+        A container that is STOPPED is a note, not a failure: `trip-autostart.py --off` holds a trip down on purpose, and
+        failing for it would block every upgrade after. One that is absent, or runs and does not answer /api/health, or
+        whose host cannot be asked, fails."""
+        trips: List[Tuple[str, str]] = []
+        try:
+            directories = sorted(p for p in (DEPLOY_ROOT / "trips").iterdir() if p.is_dir())
+        except OSError:
+            return
+        for directory in directories:
+            try:
+                text = (directory / "topology.yaml").read_text(errors="replace")
+            except OSError:
+                continue
+            # A top-level line, as the client reads it; spelled here too because a ROLLBACK to a version that predates
+            # the client must still notice that such a trip exists, rather than fail the whole verify with a missing file.
+            if re.search(r"^placement:\s*['\"]?vm-container['\"]?\s*$", text, re.M):
+                trips.append((directory.name, text))
+        if not trips:
+            return
+        try:
+            module = trip_container_client_module()
+        except Refused as error:
+            f.check("container:client", False, "NOT_CONFIGURED",
+                    f"vm-container trips exist ({', '.join(slug for slug, _ in trips)}) and this version cannot ask about them: {error}")
+            return
+        try:
+            client = self.trip_container_client()
+        except Refused as error:
+            names = ", ".join(slug for slug, _ in trips)
+            f.check("container:client", False, "NOT_CONFIGURED",
+                    f"vm-container trips exist ({names}) and this host cannot ask about them: {error}")
+            return
+        for slug, text in trips:
+            check_id = f"container:{slug}"
+            try:
+                info = module.container_info(module.parse_topology_text(text), slug)
+            except module.ClientConfigError as error:
+                f.check(check_id, False, "BAD_TOPOLOGY", f"trip {slug}: its topology is not a vm-container trip's ({error})")
+                continue
+            try:
+                answer = client.check(info.trip_id, slug)
+            except Exception as error:  # noqa: BLE001 - one trip's host error must not hide the others
+                unreachable = getattr(error, "safe_error_code", "") == "TRIP_CONTAINER_UNREACHABLE"
+                f.check(check_id, False, "HOST_UNREACHABLE" if unreachable else "HOST_ERROR",
+                        f"trip {slug}: the trip-container host could not be asked ({type(error).__name__}: {str(error)[:160]})")
+                continue
+            if answer.get("ok") is True and answer.get("healthy") is True:
+                f.check(check_id, True, "ok", f"trip {slug}: its container serves /api/health")
+            elif answer.get("running") is False:
+                f.note(f"trip {slug}: its container is stopped (held down; `trip-autostart.py --trip {slug} --on` starts it) "
+                       "- not counted as a failure")
+            elif answer.get("running") is True:
+                f.check(check_id, False, "UNHEALTHY",
+                        f"trip {slug}: its container runs and /api/health does not answer 200 (status {answer.get('status')})")
+            else:
+                f.check(check_id, False, "NOT_PRESENT",
+                        f"trip {slug}: the trip-container host has no container for it ({str(answer.get('reason') or 'no reason given')[:120]})")
+
     def collect_checks(self) -> Findings:
         f = Findings()
         events = self.relay_log()
         self.core_checks(f, events)
         self.gateway_checks(f)
         self.companion_checks(f, events)
+        self.container_checks(f)
         return f
 
     def take_baseline(self, action: str) -> Optional[Path]:
@@ -3558,6 +3633,23 @@ def cmd_prune(cp: ControlPlane) -> int:
         if now - path.stat().st_mtime > 7 * 86400:
             cp.sh.act(["rm", "-f", str(path)], describe=f"remove old request {path.name}")
     return 1 if r.failures else 0
+
+
+def trip_container_client_module():
+    """scripts/trip_container_client.py of THIS checkout, loaded by path: the one client of the trip-container host
+    (the worker's own, over ssh to this host's loopback), shared with the lifecycle scripts. Standard library only; this
+    tool is installed outside the checkout and must not grow a second copy of it."""
+    import importlib.util
+    if "trip_container_client" in sys.modules:
+        return sys.modules["trip_container_client"]
+    path = REPO / "scripts" / "trip_container_client.py"
+    if not path.is_file():
+        raise Refused(f"{path} is not in this checkout: cannot ask the trip-container host")
+    spec = importlib.util.spec_from_file_location("trip_container_client", path)
+    module = importlib.util.module_from_spec(spec)          # type: ignore[arg-type]
+    sys.modules["trip_container_client"] = module
+    spec.loader.exec_module(module)                         # type: ignore[union-attr]
+    return module
 
 
 def release_source_module():
