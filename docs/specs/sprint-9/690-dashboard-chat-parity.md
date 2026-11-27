@@ -34,7 +34,7 @@ owner already links their own Telegram, cannot add the companion to a group, sho
 
 On the trip page's Telegram card and in the trip card's Telegram menu, for the trip's OWNER with a full (password or Google) session:
 
-1. **Add the companion to a Telegram group in one click.** A link `https://t.me/<bot>?startgroup=<code>&admin=pin_messages+invite_users`
+1. **Add the companion to a Telegram group in one click.** A link `https://t.me/<bot>?startgroup=<code>&admin=change_info+pin_messages+invite_users`
    (the builder the greeting and `/group` already use, `groupAddUrl`) is ready before the click, minted by the same one-click rules as
    `one-click-link.tsx`. Telegram asks which group, adds the bot with the admin rights it needs and posts `/start@<bot> <code>` there
    from the person who added it. That redemption binds the group.
@@ -101,7 +101,7 @@ A co-organizer, a member, another owner and a Telegram-minted session see none o
 Routes (all under policy `account` in `portal-scope.ts`; none uses `authRequired`):
 
 - AC-1 Given the owner (active `owner` membership with dashboard access) on a full session, a `POST /v1/trips/:id/telegram-group-link`
-  answers 201 with `{ link, expiresAt }`: `link` is `https://t.me/<bot>?startgroup=KWA-XXXXXXXX&admin=pin_messages+invite_users`, `expiresAt` is
+  answers 201 with `{ link, expiresAt }`: `link` is `https://t.me/<bot>?startgroup=KWA-XXXXXXXX&admin=change_info+pin_messages+invite_users`, `expiresAt` is
   `telegramLinkTtlSeconds` ahead (default 900), the response is `no-store`, one `chat_binding_codes` row exists (`telegram`, `group`, the owner as issuer,
   state `issued`, digest only), and the trip's `KIN-` token is untouched.
 - AC-2 Given a member, a co-organizer (`organizer` membership), another account that owns another trip, a user with no membership, a
