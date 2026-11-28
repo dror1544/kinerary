@@ -577,7 +577,7 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-async function bootServer(photoLibrary: Record<string, unknown> | undefined): Promise<{ origin: string; stop: () => Promise<void> }> {
+async function bootServer(photoLibrary: unknown): Promise<{ origin: string; stop: () => Promise<void>; stderr: () => string }> {
   const port = await freePort(), workerPort = await freePort();
   const directory = await mkdtemp(join(tmpdir(), "kinerary-photo-boot-"));
   const profilePath = join(directory, "architecture.json");
@@ -592,7 +592,7 @@ async function bootServer(photoLibrary: Record<string, unknown> | undefined): Pr
       runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
       runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
     },
-    ...(photoLibrary ? { photo_library: photoLibrary } : {}),
+    ...(photoLibrary !== undefined ? { photo_library: photoLibrary } : {}),
   }), "utf8");
   const child: ChildProcess = spawn(process.execPath, ["--import", "tsx", fileURLToPath(new URL("../src/server.ts", import.meta.url))], {
     cwd: fileURLToPath(new URL("../", import.meta.url)),
@@ -611,7 +611,7 @@ async function bootServer(photoLibrary: Record<string, unknown> | undefined): Pr
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     if (exited !== null) { await stop(); throw new Error(`server exited (${exited}) before listening:\n${stderr}`); }
-    try { if ((await fetch(`${origin}/healthz`, { signal: AbortSignal.timeout(500) })).ok) return { origin, stop }; } catch { /* not yet */ }
+    try { if ((await fetch(`${origin}/healthz`, { signal: AbortSignal.timeout(500) })).ok) return { origin, stop, stderr: () => stderr }; } catch { /* not yet */ }
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
   await stop();
@@ -628,11 +628,73 @@ test("photoLibraryPortalSettings: absent block or absent key reference is absent
     { credentialKeySecretRef: KEY_REF, allowedPrivateHosts: [] });
   assert.deepEqual(photoLibraryPortalSettings(validateArchitectureProfile({ ...base, photo_library: { credential_key_secret_ref: KEY_REF, allowed_private_hosts: ["Immich.Home.TEST", "::1"] } }))?.allowedPrivateHosts,
     ["immich.home.test", "::1"]);
-  for (const bad of ["http://immich.home.test", "immich.home.test:2283", "10.0.0.0/8", "*.home.test", "immich home"]) {
-    assert.throws(() => validateArchitectureProfile({ ...base, photo_library: { credential_key_secret_ref: KEY_REF, allowed_private_hosts: [bad] } }), bad);
+  // A valid block says nothing at boot.
+  const quiet: string[] = [];
+  photoLibraryPortalSettings(validateArchitectureProfile({ ...base, photo_library: { credential_key_secret_ref: KEY_REF } }), (line) => { quiet.push(line); });
+  assert.deepEqual(quiet, []);
+});
+
+/**
+ * A PRESENT `photo_library` BLOCK THE SCHEMA REFUSES TURNS THE PHOTO LIBRARY OFF, NOT THE CONTROL PLANE (Dror, regression plan
+ * decision 5, 2026-11-27; the shape of `relay.whatsapp`'s set-aside). The profile loads, `photo_library` is absent,
+ * `photo_library_invalid` names the field and the rule (never a value), the portal settings are absent (so the routes answer
+ * 503), and ONE boot line says so. An invalid block is never partly kept: nothing it names is opened.
+ */
+const profileBase = { version: 1, environment: "test", public_api: { bind_host: "127.0.0.1", port: 4310 },
+  worker: { queue: "postgres", health_bind_host: "127.0.0.1", health_port: 4311 }, database: { connection_secret_ref: "env://X" },
+  adapters: { compute: "fake", ingress: "fake", agent_runtime: "fake", messaging: "fake", secrets: "fake" }, test_resources: { enabled: false },
+  web: { public_origin: "https://portal.example.test", runtime_origin: "https://runtime.example.test", runtime_exchange_key_secret_ref: "env://EXCHANGE",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot" } };
+const manyHosts = Array.from({ length: 65 }, (_, i) => `immich${i}.home.test`);
+const BAD_BLOCKS: Array<[label: string, block: unknown, field: string, reason: string, values: string[]]> = [
+  ["null", null, "photo_library", "is missing or of the wrong type", []],
+  ["a string", "env://PHOTO_KEY", "photo_library", "is missing or of the wrong type", ["env://PHOTO_KEY"]],
+  ["an array", [KEY_REF], "photo_library", "is missing or of the wrong type", [KEY_REF]],
+  ["an unknown key", { credential_key_secret_ref: KEY_REF, allowed_hosts: ["10.0.0.0/8"] }, "photo_library", "has a key the schema does not know", ["10.0.0.0/8", KEY_REF]],
+  ["a plain value for the reference", { credential_key_secret_ref: "plain-secret-value" }, "photo_library.credential_key_secret_ref", "is invalid", ["plain-secret-value"]],
+  ["a traversing file reference", { credential_key_secret_ref: "file://../../etc/shadow" }, "photo_library.credential_key_secret_ref", "is invalid", ["etc/shadow"]],
+  ["a number for the reference", { credential_key_secret_ref: 42 }, "photo_library.credential_key_secret_ref", "is missing or of the wrong type", []],
+  ["a CIDR block in the allow-list", { credential_key_secret_ref: KEY_REF, allowed_private_hosts: ["immich.home.test", "10.0.0.0/8"] }, "photo_library.allowed_private_hosts.1", "is invalid", ["10.0.0.0/8", KEY_REF]],
+  ["a wildcard", { credential_key_secret_ref: KEY_REF, allowed_private_hosts: ["*.home.test"] }, "photo_library.allowed_private_hosts.0", "is invalid", ["*.home.test"]],
+  ["a URL", { credential_key_secret_ref: KEY_REF, allowed_private_hosts: ["http://immich.home.test"] }, "photo_library.allowed_private_hosts.0", "is invalid", ["immich.home.test"]],
+  ["a host with a port", { credential_key_secret_ref: KEY_REF, allowed_private_hosts: ["immich.home.test:2283"] }, "photo_library.allowed_private_hosts.0", "is invalid", ["immich.home.test"]],
+  ["a string, not a list", { credential_key_secret_ref: KEY_REF, allowed_private_hosts: "immich.home.test" }, "photo_library.allowed_private_hosts", "is missing or of the wrong type", ["immich.home.test"]],
+  ["more than 64 hosts", { credential_key_secret_ref: KEY_REF, allowed_private_hosts: manyHosts }, "photo_library.allowed_private_hosts", "is out of range", ["immich0.home.test"]],
+  ["an empty host", { credential_key_secret_ref: KEY_REF, allowed_private_hosts: [""] }, "photo_library.allowed_private_hosts.0", "is out of range", []],
+];
+
+test("a malformed photo_library block is set aside: the profile loads, the feature is off, one boot line names the field and the rule, never a value", () => {
+  for (const [label, block, field, reason, values] of BAD_BLOCKS) {
+    const parsed = validateArchitectureProfile({ ...profileBase, photo_library: block });
+    assert.equal(parsed.photo_library, undefined, `${label}: the block is dropped, not partly kept`);
+    assert.deepEqual(parsed.photo_library_invalid, { field, reason }, `${label}: field and rule named`);
+    assert.equal(parsed.web?.telegram_bot_username, "kinerary_bot", `${label}: the rest of the profile is intact`);
+    const lines: string[] = [];
+    assert.equal(photoLibraryPortalSettings(parsed, (line) => { lines.push(line); }), undefined, `${label}: no portal settings, so the routes answer 503`);
+    assert.equal(lines.length, 1, `${label}: exactly one line`);
+    const logged = JSON.parse(lines[0]!);
+    assert.deepEqual([logged.level, logged.event, logged.field, logged.reason], ["error", "photo_library.disabled", field, reason], label);
+    assert.match(logged.effect, /503 photo_library_not_configured/);
+    for (const value of values) assert.ok(!lines[0]!.includes(value), `${label}: the line never quotes ${value}`);
   }
-  assert.throws(() => validateArchitectureProfile({ ...base, photo_library: { credential_key_secret_ref: "plain-value" } }));
-  assert.throws(() => validateArchitectureProfile({ ...base, photo_library: { credential_key_secret_ref: KEY_REF, extra: true } }));
+});
+
+test("photo_library_invalid is the loader's output, never a profile key: a profile that carries it is refused", () => {
+  assert.throws(() => validateArchitectureProfile({ ...profileBase, photo_library_invalid: { field: "photo_library", reason: "is invalid" } }));
+  assert.throws(() => validateArchitectureProfile({ ...profileBase, photo_library: { credential_key_secret_ref: KEY_REF }, photo_library_invalid: { field: "x", reason: "y" } }));
+});
+
+test("routes built from a set-aside block answer 503 photo_library_not_configured, the same as no block", { skip }, async () => {
+  const parsed = validateArchitectureProfile({ ...profileBase, photo_library: { credential_key_secret_ref: KEY_REF, allowed_private_hosts: ["10.0.0.0/8"] } });
+  const app = buildApp(profile, { portal: portalDeps(photoLibraryPortalSettings(parsed, () => {})) });
+  try {
+    for (const [method, url] of [["GET", "/v1/photo-connections"], ["POST", "/v1/photo-connections/immich"]] as const) {
+      const response = await call(app, "alice", method, url, method === "POST" ? { serverUrl: immichUrl, apiKey: GOOD } : undefined);
+      assert.deepEqual([response.statusCode, response.json().error], [503, "photo_library_not_configured"], `${method} ${url}`);
+    }
+    assert.deepEqual(immichHits, []);
+    assert.deepEqual(await rowsOf(ids.alice), []);
+  } finally { await app.close(); }
 });
 
 test("the real server entrypoint wires photo_library: with the setting the route answers, without it 503 photo_library_not_configured", { skip }, async () => {
@@ -646,5 +708,16 @@ test("the real server entrypoint wires photo_library: with the setting the route
   try {
     const response = await fetch(`${unconfigured.origin}/v1/photo-connections`, { headers: { cookie: sessions.alice!.cookie } });
     assert.deepEqual([response.status, (await response.json()).error], [503, "photo_library_not_configured"]);
+    assert.doesNotMatch(unconfigured.stderr(), /photo_library\.disabled/, "no block is not a malformed block: nothing to say");
   } finally { await unconfigured.stop(); }
+  // A malformed block: the control plane still boots, the feature is off, and the boot log says so once, without the value.
+  const malformed = await bootServer({ credential_key_secret_ref: KEY_REF, allowed_private_hosts: ["10.0.0.0/8"] });
+  try {
+    const response = await fetch(`${malformed.origin}/v1/photo-connections`, { headers: { cookie: sessions.alice!.cookie } });
+    assert.deepEqual([response.status, (await response.json()).error], [503, "photo_library_not_configured"]);
+    const lines = malformed.stderr().split("\n").filter((line) => line.includes("photo_library.disabled"));
+    assert.equal(lines.length, 1, "exactly one boot line");
+    assert.equal(JSON.parse(lines[0]!).field, "photo_library.allowed_private_hosts.0");
+    assert.ok(!lines[0]!.includes("10.0.0.0/8") && !lines[0]!.includes(KEY_REF), "the line quotes no value");
+  } finally { await malformed.stop(); }
 });

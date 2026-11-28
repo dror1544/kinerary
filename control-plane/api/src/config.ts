@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { z } from "zod";
 import { GATEWAY_KEY_MODES } from "./relay/protocol.js";
+import { structuredLog } from "./redaction.js";
 
 const secretReference = z.string().regex(
   // vault:// carries a #field selector because a KV secret holds several
@@ -153,7 +154,44 @@ const photoLibraryAllowedHost = z.string().trim().min(1).max(253).transform((val
   "must be a hostname or an IP address, with no scheme, port, path or wildcard",
 );
 
-export const architectureProfileSchema = z.object({
+/** The `photo_library` block, checked on its own first (`setAsideInvalidPhotoLibrary`) and then again in the profile. */
+const photoLibraryBlockSchema = z.object({
+  credential_key_secret_ref: secretReference.optional(),
+  allowed_private_hosts: z.array(photoLibraryAllowedHost).max(64).optional(),
+}).strict();
+
+/**
+ * A PRESENT `photo_library` BLOCK THE SCHEMA REFUSES TURNS THE PHOTO LIBRARY OFF, NOT THE CONTROL PLANE (Dror, #699
+ * regression plan decision 5, 2026-11-27; the same shape as `setAsideInvalidWhatsapp`). A typo in an optional feature's
+ * block must not stop the API, and every trip with it. So the block is checked on its own: if it fails it is dropped WHOLE
+ * (never partly kept, so nothing an invalid allow-list names is ever opened) and replaced by `photo_library_invalid`, the
+ * first failing field and a fixed rule wording, never a value. `photoLibraryPortalSettings` then answers absent (the routes
+ * answer 503 `photo_library_not_configured`) and logs that one line. A `photo_library_invalid` the profile itself carries
+ * is renamed so the strict schema refuses it.
+ */
+function setAsideInvalidPhotoLibrary(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const profile: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
+  if ("photo_library_invalid" in profile) {
+    profile["photo_library_invalid (not a profile key)"] = profile.photo_library_invalid;
+    delete profile.photo_library_invalid;
+  }
+  if (!("photo_library" in profile) || profile.photo_library === undefined) return profile;
+  const parsed = photoLibraryBlockSchema.safeParse(profile.photo_library);
+  if (parsed.success) return profile;
+  const issue = parsed.error.issues[0];
+  const path = (issue?.path ?? []).filter((part) => typeof part === "string" || typeof part === "number");
+  const field = ["photo_library", ...path.map(String)].join(".");
+  const reason = issue?.code === "unrecognized_keys" ? "has a key the schema does not know"
+    : issue?.code === "invalid_type" ? "is missing or of the wrong type"
+    : issue?.code === "too_small" || issue?.code === "too_big" ? "is out of range"
+    : "is invalid";
+  delete profile.photo_library;
+  profile.photo_library_invalid = { field, reason };
+  return profile;
+}
+
+export const architectureProfileSchema = z.preprocess(setAsideInvalidPhotoLibrary, z.object({
   version: z.literal(1),
   environment: z.enum(["test", "development", "production"]),
   public_api: z.object({
@@ -311,16 +349,17 @@ export const architectureProfileSchema = z.object({
    * A photo library per user (#699, docs/specs/sprint-9/699-user-photo-library.md). The whole block is OPTIONAL, and so
    * is each field: without `credential_key_secret_ref` every `/v1/photo-connections` route answers 503
    * `photo_library_not_configured` and stores nothing (there is no key to seal a credential with, and no fallback).
+   * A block that is PRESENT BUT INVALID does not refuse the profile: it is set aside whole (`setAsideInvalidPhotoLibrary`),
+   * the feature is off exactly as if it were absent, and one boot line (`photo_library.disabled`) names the field and rule.
    *
    * `credential_key_secret_ref` names 32 random bytes, written base64 (photo-credentials.ts); it is resolved on each use.
    * `allowed_private_hosts` names the hosts, exactly as a user types them in a library address, that may resolve to a
    * private or loopback address (a deployment whose Immich is on its own network). Absent or empty, only public
    * addresses are reachable. The metadata address is never reachable, listed or not (photo-library-guard.ts).
    */
-  photo_library: z.object({
-    credential_key_secret_ref: secretReference.optional(),
-    allowed_private_hosts: z.array(photoLibraryAllowedHost).max(64).optional(),
-  }).strict().optional(),
+  photo_library: photoLibraryBlockSchema.optional(),
+  /** NOT A PROFILE KEY: the loader's note that a `photo_library` block was present and set aside. A profile that spells it is refused. */
+  photo_library_invalid: z.object({ field: z.string(), reason: z.string() }).strict().optional(),
   /**
    * The Trip Bot relay connector — the WebSocket server Hermes's gateway dials
    * OUT to, plus the shared bot token the connector polls.
@@ -493,7 +532,7 @@ export const architectureProfileSchema = z.object({
       if (!value.startsWith("https://")) ctx.addIssue({ code: "custom", path: ["web", key], message: "production web origins must use https" });
     }
   }
-});
+}));
 
 export type ArchitectureProfile = z.infer<typeof architectureProfileSchema>;
 
@@ -523,10 +562,22 @@ export function whatsappPortalSettings(profile: ArchitectureProfile): { number: 
 
 /**
  * What the portal needs of the profile's `photo_library` block (#699). ABSENT when the block or its key reference is
- * missing: every photo-connection route then answers 503 `photo_library_not_configured`. server.ts passes this as
- * `PortalDependencies.photoLibrary`.
+ * missing, or when the block was set aside as invalid: every photo-connection route then answers 503
+ * `photo_library_not_configured`. server.ts calls this once at boot and passes it as `PortalDependencies.photoLibrary`;
+ * for a set-aside block it writes the one `photo_library.disabled` line (field and rule, never a value) to `log`.
  */
-export function photoLibraryPortalSettings(profile: ArchitectureProfile): { credentialKeySecretRef: string; allowedPrivateHosts: readonly string[] } | undefined {
+export function photoLibraryPortalSettings(
+  profile: ArchitectureProfile,
+  log: (line: string) => void = (line) => { process.stderr.write(`${line}\n`); },
+): { credentialKeySecretRef: string; allowedPrivateHosts: readonly string[] } | undefined {
+  if (profile.photo_library_invalid) {
+    log(structuredLog("error", "photo_library.disabled", {
+      field: profile.photo_library_invalid.field,
+      reason: profile.photo_library_invalid.reason,
+      effect: "photo libraries are off on this control plane: every /v1/photo-connections route answers 503 photo_library_not_configured",
+    }));
+    return undefined;
+  }
   const block = profile.photo_library;
   if (!block?.credential_key_secret_ref) return undefined;
   return { credentialKeySecretRef: block.credential_key_secret_ref, allowedPrivateHosts: block.allowed_private_hosts ?? [] };
