@@ -69,12 +69,12 @@ describe("groupAddUrl", () => {
     // already in a permissions dialog — afterwards it is a separate
     // promote-to-admin errand that nobody does.
     const url = groupAddUrl("Kinerary_bot", "trip_abc");
-    assert.equal(url, "https://t.me/Kinerary_bot?startgroup=trip_abc&admin=pin_messages+invite_users");
+    assert.equal(url, "https://t.me/Kinerary_bot?startgroup=trip_abc&admin=change_info+pin_messages+invite_users");
   });
 
   test("a binding token fits the payload alphabet and rides in the link unchanged", () => {
     const url = groupAddUrl("Kinerary_bot", "KIN-ABCD2345");
-    assert.equal(url, "https://t.me/Kinerary_bot?startgroup=KIN-ABCD2345&admin=pin_messages+invite_users");
+    assert.equal(url, "https://t.me/Kinerary_bot?startgroup=KIN-ABCD2345&admin=change_info+pin_messages+invite_users");
   });
 
   test("without a bot username there is no link to give", () => {
@@ -85,7 +85,7 @@ describe("groupAddUrl", () => {
 
   test("a payload that is not link-safe is dropped rather than mangled", () => {
     const url = groupAddUrl("Kinerary_bot", "trip abc/../x");
-    assert.equal(url, "https://t.me/Kinerary_bot?startgroup=&admin=pin_messages+invite_users");
+    assert.equal(url, "https://t.me/Kinerary_bot?startgroup=&admin=change_info+pin_messages+invite_users");
   });
 });
 
@@ -119,7 +119,7 @@ describe("organizerIntroText", () => {
 
   test("offers the group-add link with admin rights", () => {
     const text = organizerIntroText({ ...BASE, tripSlug: "japan-2026" });
-    assert.match(text, /startgroup=japan-2026&admin=pin_messages\+invite_users/);
+    assert.match(text, /startgroup=japan-2026&admin=change_info\+pin_messages\+invite_users/);
   });
 
   test("omits the group line entirely when no bot username is known", () => {
@@ -372,7 +372,7 @@ describe("the group-binding token in the organizer's message", () => {
     const text = organizerIntroText(WITH_TOKEN);
     // The link binds by itself, so its payload is the group-binding token and
     // NOT the trip slug.
-    assert.match(text, /https:\/\/t\.me\/Kinerary_bot\?startgroup=KIN-ABCD2345&admin=pin_messages\+invite_users/);
+    assert.match(text, /https:\/\/t\.me\/Kinerary_bot\?startgroup=KIN-ABCD2345&admin=change_info\+pin_messages\+invite_users/);
     assert.doesNotMatch(text, /startgroup=japan-2026/);
     assert.match(text, /1\. Tap this link/);
     assert.match(text, /nothing to paste/i);

@@ -55,7 +55,7 @@ group *from the link itself* is not something a URL can do. So the honest
 wording is "tap this and pick the group — or make one first and pick it".
 
 **Admin rights at add-time** — the same deep link takes
-`&admin=pin_messages+invite_users`. This matters more than it looks: it is how
+`&admin=change_info+pin_messages+invite_users`. This matters more than it looks: it is how
 the bot ends up *able* to pin its own arrival message and read an invite link,
 without the organizer being walked through a promote-to-admin flow afterwards.
 Ask for the rights at the moment they are granted anyway.
@@ -171,7 +171,7 @@ supersedes rather than accumulates.
 
 **One link instead of a pasted line (2026-10-16).** The introduction's primary
 path is the add-to-group link with the token as its payload:
-`https://t.me/<bot>?startgroup=KIN-XXXXXXXX&admin=pin_messages+invite_users`.
+`https://t.me/<bot>?startgroup=KIN-XXXXXXXX&admin=change_info+pin_messages+invite_users`.
 The token (`KIN-` plus eight characters from `A-Z` without `I`/`O` and `2-9`;
 12 characters in all) is already a legal Telegram start payload (`A-Za-z0-9_-`,
 at most 64), so it rides unencoded. Telegram adds the bot to the

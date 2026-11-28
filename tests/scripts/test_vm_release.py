@@ -2177,6 +2177,133 @@ class StandaloneVerify(unittest.TestCase):
             self.assertEqual(vr.cmd_gate(["verify"]), 0)
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trip_container_fixtures as fx  # noqa: E402
+
+
+class ContainerVerifyCP(FleetCP):
+    """FleetCP with a stand-in trip-container host behind `trip_container_client()`."""
+
+    def __init__(self, shell, adapter=None, **kwargs):
+        super().__init__(shell, **kwargs)
+        self.adapter = adapter
+        self.client_requests = 0
+
+    def trip_container_client(self):
+        self.client_requests += 1
+        if self.adapter is None:
+            raise vr.Refused("this host is not set up to reach the trip-container host; unset:\n  TRIP_CONTAINER_SSH_USER")
+        return self.adapter
+
+
+class VmContainerVerify(FleetWorld):
+    """AC-12 (docs/specs/sprint-9/x-trip-vm-container-placement.md): `verify` lists each vm-container trip and asks the
+    host's `check` verb whether it serves, so an upgrade or a rollback that left one down is seen. Found live on
+    2026-11-27: the verify had nothing to say about a container trip at all."""
+
+    def trip(self, slug="gatecity2026", **kwargs):
+        directory = self.deploy / "trips" / slug
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "topology.yaml").write_text(fx.container_topology_text(slug=slug, **kwargs))
+
+    def stand(self, slug="gatecity2026"):
+        self.store = self.tmp / "nfs"
+        self.store.mkdir(exist_ok=True)
+        host, adapter = fx.host_with_trip(self.store, slug)
+        return host, adapter
+
+    def checks(self, cp):
+        findings = vr.Findings()
+        cp.container_checks(findings)
+        return findings
+
+    def test_each_container_trip_is_listed_and_asked_through_the_check_verb(self):
+        self.trip("gatecity2026")
+        self.trip("alsace2026", trip_id="trip_abcdefabcdefabcdefabcdefabcdefab")
+        host, adapter = self.stand("gatecity2026")
+        fx.client.worker_module()
+        adapter.ensure("trip_abcdefabcdefabcdefabcdefabcdefab", "alsace2026", ip="10.250.0.11", image=fx.DIGEST_A,
+                       seed_password="seedpassword1")
+        host.events.clear(); host.requests.clear()
+        found = self.checks(ContainerVerifyCP(FakeShell(), adapter))
+        ids = {c.id: c for c in found.checks}
+        self.assertEqual({"container:gatecity2026", "container:alsace2026"}, set(ids))
+        self.assertTrue(all(c.ok for c in ids.values()), found.items)
+        self.assertEqual({"check"}, {r["verb"] for r in host.requests})
+        self.assertEqual({fx.TRIP_ID, "trip_abcdefabcdefabcdefabcdefabcdefab"}, {r["trip_id"] for r in host.requests})
+
+    def test_a_container_that_runs_but_does_not_answer_health_fails_the_verify_and_names_the_trip(self):
+        self.trip()
+        host, adapter = self.stand()
+        host.unhealthy_checks = 5
+        (check,) = self.checks(ContainerVerifyCP(FakeShell(), adapter)).checks
+        self.assertFalse(check.ok)
+        self.assertEqual("UNHEALTHY", check.code)
+        self.assertIn("gatecity2026", check.text)
+
+    def test_a_trip_whose_container_is_gone_fails(self):
+        self.trip()
+        host, adapter = self.stand()
+        host.containers.clear()
+        (check,) = self.checks(ContainerVerifyCP(FakeShell(), adapter)).checks
+        self.assertEqual(("container:gatecity2026", False, "NOT_PRESENT"), (check.id, check.ok, check.code))
+
+    def test_a_trip_held_down_on_purpose_is_listed_and_does_not_fail_an_upgrade(self):
+        # trip-autostart --off stops the container; verify failing for it would block every upgrade after.
+        self.trip()
+        host, adapter = self.stand()
+        host.containers["gatecity2026"]["running"] = False
+        found = self.checks(ContainerVerifyCP(FakeShell(), adapter))
+        self.assertEqual([], [c for c in found.checks if not c.ok])
+        self.assertTrue(any("gatecity2026" in item and "stopped" in item for item in found.items if isinstance(item, str)), found.items)
+
+    def test_a_host_that_cannot_be_asked_is_a_failed_check_not_a_traceback(self):
+        self.trip()
+        host, adapter = self.stand()
+        host.ssh_failure = True
+        (check,) = self.checks(ContainerVerifyCP(FakeShell(), adapter)).checks
+        self.assertEqual(("container:gatecity2026", False, "HOST_UNREACHABLE"), (check.id, check.ok, check.code))
+
+    def test_a_host_that_is_not_set_up_is_one_failed_check_naming_what_is_unset(self):
+        self.trip()
+        found = self.checks(ContainerVerifyCP(FakeShell(), None))
+        (check,) = found.checks
+        self.assertEqual(("container:client", False, "NOT_CONFIGURED"), (check.id, check.ok, check.code))
+        self.assertIn("TRIP_CONTAINER_SSH_USER", check.text)
+
+    def test_with_no_container_trip_nothing_is_asked_and_nothing_is_required(self):
+        (self.deploy / "trips" / "lxc-trip").mkdir()
+        (self.deploy / "trips" / "lxc-trip" / "topology.yaml").write_text("version: 1\nname: lxc-trip\nproxmox:\n  vmid: '5'\n")
+        cp = ContainerVerifyCP(FakeShell(), None)
+        found = self.checks(cp)
+        self.assertEqual([], found.items)
+        self.assertEqual(0, cp.client_requests)
+
+    def test_a_topology_that_does_not_describe_its_own_directory_is_a_failed_check(self):
+        self.trip()
+        other = self.deploy / "trips" / "gatecity2026" / "topology.yaml"
+        other.write_text(other.read_text().replace("name: trip-gatecity2026", "name: trip-elsewhere"))
+        host, adapter = self.stand()
+        (check,) = self.checks(ContainerVerifyCP(FakeShell(), adapter)).checks
+        self.assertEqual(("container:gatecity2026", False, "BAD_TOPOLOGY"), (check.id, check.ok, check.code))
+        self.assertEqual([], host.requests)
+
+    def test_a_rollback_to_a_checkout_without_the_client_still_notices_the_container_trip(self):
+        # REPO here has no scripts/trip_container_client.py, as a checkout from before this feature would not.
+        self.trip()
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("trip_container_client", None)
+            (check,) = self.checks(ContainerVerifyCP(FakeShell(), None)).checks
+        self.assertEqual(("container:client", False, "NOT_CONFIGURED"), (check.id, check.ok, check.code))
+        self.assertIn("gatecity2026", check.text)
+
+    def test_collect_checks_includes_the_container_trips(self):
+        self.trip()
+        host, adapter = self.stand()
+        cp = ContainerVerifyCP(FakeShell(), adapter)
+        self.assertIn("container:gatecity2026", [c.id for c in cp.collect_checks().checks])
+
+
 class SourceInvariants(unittest.TestCase):
     def test_no_gateway_profile_is_named_in_the_check_code(self):
         source = TOOL.read_text()
@@ -2237,3 +2364,144 @@ class NetworkMountGuard(unittest.TestCase):
     def test_a_mount_below_the_documents_mount_is_not_the_documents_mount(self):
         self.assertEqual(vr.foreign_network_mounts("/srv/kinerary-nfs/other", "/srv/kinerary-nfs"),
                          ["/srv/kinerary-nfs/other"])
+
+
+class TripContainerBindGuard(unittest.TestCase):
+    """A vm-container trip's store is a bind of the documents mount under TRIP_CONTAINER_MOUNT_ROOT. It is the same
+    export seen through another door, so the network-mount guard tolerates it on the same terms as the documents mount
+    (found on the first full VM run, 2026-11-28: no upgrade could run while any container trip existed)."""
+
+    DOCS = "/srv/kinerary-nfs"
+    ROOT = "/run/kinerary-trip-mounts"
+    TRIP_A = "trip_0123456789abcdef0123456789abcdef"
+    TRIP_B = "trip_fedcba9876543210fedcba9876543210"
+
+    def bind(self, name: str) -> str:
+        return f"{self.ROOT}/{name}"
+
+    def test_a_trip_bind_one_level_under_the_configured_root_is_tolerated_with_the_documents_mount(self):
+        out = f"{self.DOCS}\n{self.bind(self.TRIP_A)}\n{self.bind(self.TRIP_B)}\n"
+        self.assertEqual(vr.foreign_network_mounts(out, self.DOCS, self.ROOT), [])
+
+    def test_a_trailing_slash_on_either_side_names_the_same_bind(self):
+        self.assertEqual(vr.foreign_network_mounts(self.bind(self.TRIP_A) + "/", self.DOCS, self.ROOT + "/"), [])
+
+    def test_without_the_root_configured_the_binds_are_refused_as_before(self):
+        out = f"{self.DOCS}\n{self.bind(self.TRIP_A)}\n"
+        self.assertEqual(vr.foreign_network_mounts(out, self.DOCS, None), [self.bind(self.TRIP_A)])
+
+    def test_without_a_documents_mount_configured_the_binds_are_refused_too(self):
+        self.assertEqual(vr.foreign_network_mounts(self.bind(self.TRIP_A), None, self.ROOT), [self.bind(self.TRIP_A)])
+        self.assertEqual(vr.foreign_network_mounts(self.bind(self.TRIP_A), "", self.ROOT), [self.bind(self.TRIP_A)])
+
+    def test_only_the_exact_shape_is_tolerated(self):
+        odd = [
+            f"{self.ROOT}/{self.TRIP_A}/deeper",       # a mount inside a trip's store
+            f"{self.ROOT}/backups",                    # not named like a trip id
+            f"{self.ROOT}/{self.TRIP_A}-old",          # a look-alike
+            f"{self.ROOT}",                            # the root itself is not a trip bind
+            f"/elsewhere/{self.TRIP_A}",               # another directory
+            f"{self.ROOT}x/{self.TRIP_A}",             # a sibling sharing the root's prefix
+            f"{self.ROOT}/../etc/{self.TRIP_A}",
+        ]
+        self.assertEqual(vr.foreign_network_mounts("\n".join(odd), self.DOCS, self.ROOT), odd)
+
+    def test_another_share_is_still_refused_beside_the_binds(self):
+        out = f"{self.DOCS}\n{self.bind(self.TRIP_A)}\n/mnt/backups\n"
+        self.assertEqual(vr.foreign_network_mounts(out, self.DOCS, self.ROOT), ["/mnt/backups"])
+
+
+class TripMountRootConfig(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="trip-host-conf-"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.conf = self.dir / "trip-container-host.conf"
+
+    def write(self, text: str, mode: int = 0o600) -> None:
+        self.conf.write_text(text)
+        os.chmod(self.conf, mode)
+
+    def test_it_reads_the_one_key_it_needs(self):
+        self.write("KINERARY_NFS_ROOT=/srv/x\nTRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\nTRIP_CONTAINER_UID=10001\n")
+        self.assertEqual(vr.trip_mount_root(self.conf), "/run/trip-mounts")
+
+    def test_no_file_means_no_tolerance(self):
+        self.assertIsNone(vr.trip_mount_root(self.dir / "absent.conf"))
+
+    def test_a_file_anyone_else_can_write_is_not_believed(self):
+        self.write("TRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\n", mode=0o666)
+        self.assertIsNone(vr.trip_mount_root(self.conf))
+
+    def test_a_directory_anyone_else_can_write_is_not_believed(self):
+        self.write("TRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\n")
+        os.chmod(self.dir, 0o777)
+        self.assertIsNone(vr.trip_mount_root(self.conf))
+
+    def test_a_file_owned_by_someone_else_is_not_believed(self):
+        self.write("TRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\n")
+        with mock.patch.object(vr.os, "geteuid", return_value=os.getuid() + 12345):
+            self.assertIsNone(vr.trip_mount_root(self.conf))
+
+    def test_a_link_is_not_followed(self):
+        self.write("TRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\n")
+        link = self.dir / "link.conf"
+        os.symlink(self.conf, link)
+        self.assertIsNone(vr.trip_mount_root(link))
+
+    def test_an_unusable_value_is_not_believed(self):
+        for text in ("TRIP_CONTAINER_MOUNT_ROOT=\n", "TRIP_CONTAINER_MOUNT_ROOT=relative/path\n",
+                     "TRIP_CONTAINER_MOUNT_ROOT=/\n", "TRIP_CONTAINER_MOUNT_ROOT=/a/../b\n",
+                     "TRIP_CONTAINER_MOUNT_ROOT=/a\nTRIP_CONTAINER_MOUNT_ROOT=/b\n", "# nothing\n"):
+            with self.subTest(text=text):
+                self.write(text)
+                self.assertIsNone(vr.trip_mount_root(self.conf))
+
+
+class GuardStorageWithTripBinds(unittest.TestCase):
+    """The guard itself, end to end with a stubbed findmnt: a container trip no longer blocks `upgrade`, and a
+    foreign mount still does."""
+
+    DOCS = "/srv/kinerary-nfs"
+    ROOT = "/run/kinerary-trip-mounts"
+    TRIP = "trip_0123456789abcdef0123456789abcdef"
+
+    def run_guard(self, netfs: str, conf_text: "str | None" = None):
+        tmp = Path(tempfile.mkdtemp(prefix="guard-storage-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        vm_env = tmp / "vm.env"
+        vm_env.write_text(f"KINERARY_NFS_ROOT={self.DOCS}\n")
+        conf = tmp / "trip-container-host.conf"
+        if conf_text is not None:
+            conf.write_text(conf_text)
+            os.chmod(conf, 0o600)
+        out = io.StringIO()
+        cp = vr.ControlPlane(vr.Report(out, color=False))
+
+        class Sh:
+            def text(self, argv, **kwargs):
+                if "-t" in argv:
+                    return netfs
+                return "ext4\n"
+
+        cp.sh = Sh()
+        with mock.patch.object(vr, "VM_ENV", vm_env), mock.patch.object(vr, "TRIP_HOST_CONF", conf), \
+                mock.patch.object(vr.shutil, "disk_usage", lambda _p: mock.Mock(free=10 ** 13)):
+            cp.guard_storage()
+        return cp.r.failures, out.getvalue()
+
+    def test_a_container_trips_bind_does_not_stop_the_guard(self):
+        failures, text = self.run_guard(f"{self.DOCS}\n{self.ROOT}/{self.TRIP}\n", f"TRIP_CONTAINER_MOUNT_ROOT={self.ROOT}\n")
+        self.assertEqual(0, failures, text)
+        self.assertIn("1 trip container bind", text)
+
+    def test_without_the_host_configuration_the_bind_still_stops_it(self):
+        failures, text = self.run_guard(f"{self.DOCS}\n{self.ROOT}/{self.TRIP}\n")
+        self.assertEqual(1, failures, text)
+        self.assertIn(f"{self.ROOT}/{self.TRIP}", text)
+        self.assertIn("TRIP_CONTAINER_MOUNT_ROOT could not be read", text, "the refusal says why, not just that")
+
+    def test_a_foreign_mount_beside_the_binds_still_stops_it(self):
+        failures, text = self.run_guard(f"{self.DOCS}\n{self.ROOT}/{self.TRIP}\n/mnt/other\n", f"TRIP_CONTAINER_MOUNT_ROOT={self.ROOT}\n")
+        self.assertEqual(1, failures, text)
+        self.assertIn("/mnt/other", text)
+        self.assertNotIn(f"({self.ROOT}", text)

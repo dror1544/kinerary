@@ -646,5 +646,80 @@ class SharedGatewayStart(gateway_verbs.GatewayActionSandbox):
         self.assertFalse(self.curl_argv.exists(), "per-trip mode must not ask the shared bridge anything")
 
 
+CONTAINER_TOPOLOGY = """\
+version: 1
+name: italy-2026
+placement: vm-container
+routing: wildcard
+container:
+  name: trip-italy-2026
+  ipv4: 10.250.0.10
+  forward_port: 8080
+  public_hostname: italy-2026.example.test
+  nfs_host_dir: /srv/nfs/trip_0123456789abcdef0123456789abcdef
+  nfs_mount_path: /trip-store
+  image: trip-site:{digest}
+""".format(digest="ab" * 32)
+
+
+class SharedContainerTopology(SharedSandbox):
+    """`placement: vm-container` (docs/specs/sprint-9/x-trip-vm-container-placement.md, AC-10): the trip has no
+    proxmox.lxc section; its site address is container.ipv4 and container.forward_port. Found live on 2026-11-27: the
+    companion was never installed for such a trip, so the bridge route and site_to_bridge were never recorded."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.trip / "topology.yaml").write_text(CONTAINER_TOPOLOGY)
+
+    def test_a_vm_container_trip_is_wired_to_its_container_address_and_port(self) -> None:
+        result = self.send(self.wire())
+        self.assertWired(result)
+        route = self.route()
+        self.assertEqual("http://10.250.0.10:8080", route["api_base_url"])
+        self.assertEqual(TRIP_KEY, route["trip_api_key"])
+        self.assertFalse(self.setup_calls.exists(), "the shared bridge has no per-trip process to set up")
+        self.assertEqual({"transport": "sse", "url": f"{SHARED_URL}/sse", "headers": {"X-API-Key": "${TRIP_MCP_TOKEN}"}},
+                         self.config()["mcp_servers"]["trip-mcp"])
+
+    def test_the_bridge_is_asked_whether_it_can_reach_the_container(self) -> None:
+        self.assertWired(self.send(self.wire()))
+        self.assertIn(f'url = "{SHARED_URL}/health"', self.curl_stdin.read_text())
+
+    def test_the_probe_answers_for_a_vm_container_trip(self) -> None:
+        self.assertWired(self.send(self.wire()))
+        result = self.send(self.probe())
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("HEALTH ok", result.stdout.strip().splitlines()[-1])
+
+    def test_the_per_trip_bridge_cannot_serve_a_vm_container_trip_and_says_so(self) -> None:
+        result = self.send(self.wire(), KINERARY_SHARED_BRIDGE_ROUTES_DIR=None, KINERARY_SHARED_BRIDGE_URL=None)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("shared", result.stderr)
+        self.assertFalse(self.setup_calls.exists())
+        self.assertEqual([], list(self.routes.iterdir()))
+
+    def test_a_topology_that_does_not_describe_the_trip_or_has_no_usable_address_is_refused(self) -> None:
+        for label, topo in {
+            "another trip": CONTAINER_TOPOLOGY.replace("name: italy-2026\nplacement", "name: other-trip\nplacement"),
+            "another container name": CONTAINER_TOPOLOGY.replace("name: trip-italy-2026", "name: trip-other"),
+            "a tab in the address": CONTAINER_TOPOLOGY.replace("10.250.0.10", "'10.250.0.10\\t8080'"),
+            "a name for an address": CONTAINER_TOPOLOGY.replace("10.250.0.10", "example.test"),
+            "a port out of range": CONTAINER_TOPOLOGY.replace("forward_port: 8080", "forward_port: 70000"),
+            "a non-ascii digit port": CONTAINER_TOPOLOGY.replace("forward_port: 8080", "forward_port: '٨٠٨٠'"),
+            "no container section": CONTAINER_TOPOLOGY.split("container:")[0],
+            "an unknown placement": CONTAINER_TOPOLOGY.replace("vm-container", "k3s"),
+        }.items():
+            with self.subTest(label):
+                (self.trip / "topology.yaml").write_text(topo)
+                result = self.send(self.wire())
+                self.assertNotEqual(0, result.returncode, result.stdout)
+                self.assertNothingWritten()
+
+    def test_an_lxc_topology_with_a_container_section_is_not_half_a_vm_container_one(self) -> None:
+        (self.trip / "topology.yaml").write_text(TOPOLOGY + "container:\n  name: trip-italy-2026\n  ipv4: 10.250.0.10\n  forward_port: 9999\n")
+        self.assertWired(self.send(self.wire()))
+        self.assertEqual("http://192.168.0.61:8080", self.route()["api_base_url"], "an lxc topology reads proxmox.lxc only")
+
+
 if __name__ == "__main__":
     unittest.main()

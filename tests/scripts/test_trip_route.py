@@ -171,6 +171,55 @@ class Set(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual("japan-2026.example.invalid", db.route["public_host"])
 
+    CONTAINER = {
+        "version": 1, "name": "japan-2026", "placement": "vm-container", "routing": "wildcard",
+        "container": {"name": "trip-japan-2026", "ipv4": "10.250.0.10", "forward_port": 8080,
+                      "public_hostname": "japan-2026.example.invalid",
+                      "nfs_host_dir": "/srv/nfs/trip_0123456789abcdef0123456789abcdef", "nfs_mount_path": "/trip-store",
+                      "image": "trip-site:" + "ab" * 32},
+    }
+
+    def test_a_vm_container_topology_is_read_from_its_container_section(self):
+        db = FakeDb()
+        code, _text = run(db, self.CONTAINER, ["--set", "--execute", "--live"])
+        self.assertEqual(0, code, _text)
+        self.assertEqual(("japan-2026.example.invalid", "http://10.250.0.10:8080"),
+                         (db.route["public_host"], db.route["upstream_url"]))
+
+    def test_a_vm_container_topology_is_shown_too(self):
+        code, text = run(FakeDb(), self.CONTAINER, [])
+        self.assertEqual(0, code, text)
+        self.assertIn("upstream_url=http://10.250.0.10:8080", text)
+
+    def test_a_vm_container_topology_with_no_usable_address_port_or_name_is_refused_before_any_write(self):
+        for label, mutate in {
+            "dhcp": lambda c: c.update(ipv4="dhcp"),
+            "a tab": lambda c: c.update(ipv4="10.250.0.10\t8080"),
+            "port 0": lambda c: c.update(forward_port=0),
+            "port out of range": lambda c: c.update(forward_port=70000),
+            "no port": lambda c: c.pop("forward_port"),
+            "another trip's container": lambda c: c.update(name="trip-other"),
+            "a hostname that is not a name": lambda c: c.update(public_hostname="Not A Host"),
+            "no container section": lambda c: c.clear(),
+        }.items():
+            with self.subTest(label):
+                raw = json.loads(json.dumps(self.CONTAINER))
+                mutate(raw["container"])
+                db = FakeDb()
+                code, text = run(db, raw, ["--set", "--execute", "--live"])
+                self.assertNotEqual(0, code, text)
+                self.assertEqual([], db.writes)
+
+    def test_a_vm_container_topology_never_borrows_an_lxc_or_proxy_value(self):
+        raw = json.loads(json.dumps(self.CONTAINER))
+        raw["container"].pop("forward_port")
+        raw["npm"] = {"forward_port": 9090}
+        raw["proxmox"] = {"lxc": {"forward_port": 9091}}
+        db = FakeDb()
+        code, _ = run(db, raw, ["--set", "--execute", "--live"])
+        self.assertNotEqual(0, code)
+        self.assertEqual([], db.writes)
+
     def test_the_port_falls_back_to_the_proxy_hosts_for_an_old_topology(self):
         db = FakeDb()
         code, _ = run(db, topology(proxmox__lxc__forward_port=None), ["--set", "--execute", "--live"])

@@ -8,7 +8,7 @@ import { formatDay } from "./dates";
 // Telegram groups from the dashboard (#690, docs/specs/sprint-9/690-dashboard-chat-parity.md): AC-14 to AC-16.
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 const TRIP = "trip_abcdefgh";
-const groupLink = "https://t.me/kinerary_bot?startgroup=KWA-ABCD2345&admin=pin_messages+invite_users";
+const groupLink = "https://t.me/kinerary_bot?startgroup=KWA-ABCD2345&admin=change_info+pin_messages+invite_users";
 const base = {
   id: TRIP, title: "Alsace", destination: "France", startDate: null, endDate: null, tripType: "family", lifecycleState: "ready_private",
   nextAction: "view_status", interview: null, provisioning: null, runtimeReady: false, invites: [], members: [],

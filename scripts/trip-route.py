@@ -20,6 +20,10 @@ ASCII-only pattern first (the same patterns as `read_trip_wiring` in
 companion-install-host.sh, for the same reason: `isdigit()` and `int()` accept
 non-ASCII digits, and these values end up in SQL and in a URL a gateway fetches).
 
+A `placement: vm-container` topology (docs/specs/sprint-9/x-trip-vm-container-placement.md) gives
+the same three values from its `container:` section (ipv4, forward_port, public_hostname), under
+the same patterns; nothing is borrowed from an lxc or npm section it does not have.
+
 Nothing changes without --execute. Moving a trip that people use is a deploy
 (CLAUDE.md hard rule 2): the plan prints the trip's lifecycle state, and the
 approval is yours to have before --execute. A trip at `ready_private` or later,
@@ -150,7 +154,16 @@ def topology_route(slug: str, deploy_root: Path | None = None) -> tuple[str, str
     proxmox = topo.get("proxmox") if isinstance(topo.get("proxmox"), dict) else {}
     lxc = proxmox.get("lxc") if isinstance(proxmox.get("lxc"), dict) else {}
     npm = topo.get("npm") if isinstance(topo.get("npm"), dict) else {}
-    if topo.get("name") != slug or lxc.get("name") != f"trip-{slug}"[:63]:
+    if topo.get("placement") == "vm-container":
+        # A site that is a Docker container on the control-plane host
+        # (docs/specs/sprint-9/x-trip-vm-container-placement.md): its address, port and hostname are the `container:`
+        # section's, and nothing is borrowed from an lxc or npm section it does not have. Its name is `trip-<slug>`,
+        # whole (compute.py writes it uncut).
+        container = topo.get("container") if isinstance(topo.get("container"), dict) else {}
+        if topo.get("name") != slug or container.get("name") != f"trip-{slug}":
+            raise Refused(f"{path} does not describe {slug}")
+        lxc, npm = container, {}
+    elif topo.get("name") != slug or lxc.get("name") != f"trip-{slug}"[:63]:
         raise Refused(f"{path} does not describe {slug}")
 
     hostname = str(lxc.get("public_hostname") or npm.get("hostname") or "")

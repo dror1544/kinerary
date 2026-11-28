@@ -522,7 +522,7 @@ test("the greeting reaches Telegram's sendMessage as HTML with the password and 
       // The query-string ampersand is escaped, and no other tag exists.
       // The link's payload is the binding token itself (the same one in the
       // line posted next), not the trip slug.
-      const linkToken = /startgroup=(KIN-[A-HJ-NP-Z2-9]{8})&amp;admin=pin_messages\+invite_users/.exec(text)?.[1];
+      const linkToken = /startgroup=(KIN-[A-HJ-NP-Z2-9]{8})&amp;admin=change_info\+pin_messages\+invite_users/.exec(text)?.[1];
       assert.ok(linkToken, text);
       assert.equal(String(posted[1]!.body.text), `/group ${linkToken}`);
       assert.deepEqual(

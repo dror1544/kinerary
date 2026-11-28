@@ -36,6 +36,14 @@ found a step that quietly undoes itself. This is that run's order, as a command:
                 auth and adapters are exactly provisioning's. A topology with
                 no `npm:` / `cloudflare:` section (wildcard routing) has no such
                 step; one that has the section gets it, whatever `routing` says
+                A `placement: vm-container` trip has none of that: its site is a Docker
+                container on the control-plane host, so this step is ONE request to the
+                host's forced command (`remove`, scripts/trip-container-host.sh) through the
+                worker's own client - the container goes, the bind and its mount point go,
+                and the trip's directory on the document store STAYS (as NFS stays for an
+                LXC). No Proxmox, NPM or Cloudflare call is made or needed. A container
+                already gone is a success: a teardown is run again after a partial failure.
+                --keep-container has nothing to keep there and is refused.
   6. database   revoke any still-live group-binding token FIRST (issue #175),
                 then close chat bindings (closed_reason 'trip_destroyed'),
                 clear the gateway route (runtime_routes: no public_host, no
@@ -74,6 +82,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import importlib.util
 import json
 import os
 import re
@@ -297,6 +306,31 @@ def load_provisioning_env() -> None:
             m = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", line.strip())
             if m:
                 os.environ.setdefault(m.group(1), m.group(2).strip().strip('"').strip("'"))
+
+
+def _client():
+    """scripts/trip_container_client.py, loaded by path: this file may be run, or imported, from anywhere."""
+    if "trip_container_client" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("trip_container_client", Path(__file__).with_name("trip_container_client.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["trip_container_client"] = module
+        spec.loader.exec_module(module)
+    return sys.modules["trip_container_client"]
+
+
+def container_adapter():
+    """The worker's client of this host's trip-container forced command. Refused, naming every unset variable, when the
+    host is not set up for it: the same refusal for a plan as for an execution, so a plan is never a promise the
+    execution cannot keep."""
+    load_provisioning_env()
+    try:
+        return _client().adapter(os.environ, repo=REPO)
+    except _client().ClientConfigError as exc:
+        raise Refused(str(exc)) from None
+
+
+def is_vm_container(topo) -> bool:
+    return topo is not None and topo.placement == "vm-container"
 
 
 # ── what is there ────────────────────────────────────────────────────────────
@@ -1027,7 +1061,7 @@ def main() -> int:
     mode = "EXECUTE" if args.execute else "dry run"
     print(f"\n{trip['id']}  {trip['slug']}  ({trip['lifecycle_state']})  profile={profile}  [{mode}]\n")
 
-    topo = prov = None
+    topo = prov = container = cinfo = None
     topo_vmid = ""
     if topology_path.is_file():
         import yaml
@@ -1035,18 +1069,52 @@ def main() -> int:
         from provisioning.models import load_topology
         raw = yaml.safe_load(topology_path.read_text())
         topo = load_topology(raw)
-        # Built for THIS topology: no NPM or Cloudflare adapter (or credential)
-        # for one that has no such section.
-        prov = build_provisioner(topo)
-        if topo.lxc.name != expected_lxc_name(orig) or not topo.public_host.startswith(f"{orig}."):
-            print(f"{RED}refused{RESET}: {topology_path} does not describe {orig} ({topo.lxc.name}, {topo.public_host})")
-            return 2
-        topo_vmid = str((raw.get("proxmox") or {}).get("vmid") or "")
+        if is_vm_container(topo):
+            # No Proxmox, NPM or Cloudflare: nothing here builds the provisioner (and its credentials). Everything that
+            # can be refused is refused NOW, before the backup, the pin or any stop: a keep that has nothing to keep, a host
+            # this machine cannot reach, a topology that is not this trip's.
+            if args.keep_container:
+                print(f"{RED}refused{RESET}: --keep-container does not apply to a vm-container trip ({orig}): its site is a "
+                      "Docker container with nothing to rename, and its directory on the document store is kept anyway. "
+                      "Run the teardown without it.")
+                return 2
+            load_provisioning_env()      # the bridge-route step below reads vm.env's KINERARY_SHARED_BRIDGE_ROUTES_DIR
+            try:
+                cinfo = _client().container_info(raw, orig)
+            except _client().ClientConfigError as exc:
+                print(f"{RED}refused{RESET}: {topology_path} does not describe {orig} ({exc})")
+                return 2
+            if cinfo.trip_id != trip["id"] or not topo.public_host.startswith(f"{orig}."):
+                print(f"{RED}refused{RESET}: {topology_path} does not describe {orig} (its directory is "
+                      f"{cinfo.trip_id}, its host {topo.public_host}); not this trip's container")
+                return 2
+            try:
+                container = container_adapter()
+            except Refused as exc:
+                print(f"{RED}refused{RESET}: {exc}")
+                return 2
+        else:
+            # Built for THIS topology: no NPM or Cloudflare adapter (or credential)
+            # for one that has no such section.
+            prov = build_provisioner(topo)
+            if topo.lxc.name != expected_lxc_name(orig) or not topo.public_host.startswith(f"{orig}."):
+                print(f"{RED}refused{RESET}: {topology_path} does not describe {orig} ({topo.lxc.name}, {topo.public_host})")
+                return 2
+            topo_vmid = str((raw.get("proxmox") or {}).get("vmid") or "")
 
     b = bridge(trip_dir)
     agents = bridge_launch_agents(trip_dir)
     shared_route = shared_bridge_route(orig)
     store = document_store(trip)
+    nfs_root = os.environ.get("KINERARY_NFS_ROOT", "").strip()
+    if cinfo is not None and store is not None and nfs_root:
+        # The documents step below removes the kept originals' directory with rmtree. For a vm-container trip the trip's
+        # own directory on the store is the one thing a teardown keeps: if the two are the same place, refuse now.
+        trip_store = Path(nfs_root) / cinfo.trip_id
+        if store.resolve() == trip_store.resolve() or trip_store.resolve() in store.resolve().parents:
+            print(f"{RED}refused{RESET}: the document store for kept originals ({store}) is, or is inside, the trip's own "
+                  f"directory ({trip_store}); removing the originals would remove the trip's data. Nothing was torn down.")
+            return 2
     originals = kept_originals(store)
     plan = [
         ("pin", table_exists("companion_gateways"),
@@ -1059,7 +1127,8 @@ def main() -> int:
             + ([f"stop trip-mcp pid {b[0]} on :{b[1]}"] if b else [])) or "no bridge"),
         ("bridge route", shared_route is not None, f"delete the shared trip-mcp bridge's route file {shared_route}"),
         ("infra", topo is not None,
-         (f"{public_steps(topo)} for {orig}; KEEP the container as {reference_name(orig)} "
+         (f"container: remove {cinfo.name} via the trip-container host (store kept)" if cinfo is not None else
+          f"{public_steps(topo)} for {orig}; KEEP the container as {reference_name(orig)} "
           f"on http://{site_address(topo)[0]}:{site_address(topo)[1]}/" if args.keep_container
           else f"{public_steps(topo)} + LXC for {orig}") if topo else "never provisioned"),
         ("database", trip["open_bindings"] > 0 or trip["live_group_tokens"] > 0
@@ -1075,7 +1144,10 @@ def main() -> int:
          else f"move {trip_dir} to retired-trips/"),
         ("profile", (PROFILES / profile).is_dir(), f"hermes profile delete {profile}"),
     ]
-    state = infra_state(prov, topo) if topo else None
+    state = infra_state(prov, topo) if topo and cinfo is None else None
+    if cinfo is not None:
+        say(DIM + "·" + RESET, "KINERARY_NFS_ROOT is not set here, so the trip's directory on the store is not checked after the removal"
+            if not nfs_root else f"the trip's directory {Path(nfs_root) / cinfo.trip_id} stays on the document store")
     for name, needed, what in plan:
         say(f"{YELLOW}→{RESET}" if needed else f"{DIM}·{RESET}", f"{name:<10} {what if needed else '(nothing to do)'}")
     if state:
@@ -1194,6 +1266,23 @@ def main() -> int:
             f"({(renamed or {}).get('status')}), data at {kept['nfs_host_dir']}, "
             f"site answers on http://{site_host}:{site_port}/ = {answers}")
         failed |= not ok
+    elif cinfo is not None:
+        try:
+            answer = container.remove(trip["id"], orig)
+        except _client().worker_module().TripContainerError as exc:
+            failed = True
+            say(f"{RED}✗{RESET}", f"container  {cinfo.name} was NOT removed: {exc}")
+        else:
+            say(f"{GREEN}✓{RESET}", f"container  {cinfo.name} removed via the trip-container host" if answer.get("removed")
+                else f"container  {cinfo.name} already gone (nothing to remove)")
+            if nfs_root:
+                kept_dir = Path(nfs_root) / cinfo.trip_id
+                if kept_dir.is_dir():
+                    say(f"{GREEN}✓{RESET}", f"store      {kept_dir} kept")
+                else:
+                    say(f"{DIM}·{RESET}", f"store      {kept_dir} is not there (nothing was kept)")
+            else:
+                say(f"{DIM}·{RESET}", "store      KINERARY_NFS_ROOT is not set here: not checked")
     elif topo:
         delete_public_names(prov, topo)
         prov.proxmox.delete(topo.lxc)
