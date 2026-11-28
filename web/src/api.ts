@@ -82,7 +82,19 @@ function csrfToken() {
 }
 
 export class ApiError extends Error {
-  constructor(public readonly code: string, message: string) { super(message); }
+  /**
+   * `detail`: the two extra fields an error body may name, each checked for shape (#699): which permission a key lacks,
+   * and which field was refused. Nothing else of the body is kept, so no server text reaches a page through it.
+   */
+  constructor(public readonly code: string, message: string, public readonly detail: { permission?: string; field?: string } = {}) { super(message); }
+}
+
+function errorDetail(payload: Record<string, unknown> | null): { permission?: string; field?: string } {
+  const detail: { permission?: string; field?: string } = {};
+  if (!payload || typeof payload !== "object") return detail;
+  if (typeof payload.permission === "string" && /^[A-Za-z]+(?:\.[A-Za-z]+){1,2}$/.test(payload.permission) && payload.permission.length <= 40) detail.permission = payload.permission;
+  if (typeof payload.field === "string" && /^[A-Za-z]{1,40}$/.test(payload.field)) detail.field = payload.field;
+  return detail;
 }
 
 export type InterviewLinkState = {
@@ -124,7 +136,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       TOKEN_INVALID: "This link has expired or was already used.",
       ACCOUNT_EXISTS: "You already have an account. Sign in, or reset your password.",
     };
-    throw new ApiError(typeof payload.error === "string" ? payload.error : "REQUEST_FAILED", messages[payload.error] || payload.message || payload.error || "The request could not be completed.");
+    throw new ApiError(typeof payload.error === "string" ? payload.error : "REQUEST_FAILED", messages[payload.error] || payload.message || payload.error || "The request could not be completed.", errorDetail(payload));
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
@@ -287,6 +299,41 @@ export const getWhatsAppConnections = (tripId: string) =>
   api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/whatsapp-connections`).then((value) => z.object({ connections: z.array(whatsappConnectionSchema) }).parse(value).connections);
 export const removeWhatsAppConnection = (tripId: string, bindingId: string) =>
   api<{ status: string }>(`/v1/trips/${encodeURIComponent(tripId)}/whatsapp-connections/${encodeURIComponent(bindingId)}`, { method: "DELETE" });
+
+/**
+ * The account's photo libraries (#699, docs/specs/sprint-9/699-user-photo-library.md). A connection is read back as its
+ * service, addresses, state and last check: the server never returns the credential, and the schema has no field for one,
+ * so nothing a response carries beside these reaches a page. The Immich key leaves only in the connect POST's body.
+ */
+export type PhotoConnection = {
+  id: string; service: "immich" | "google_photos"; serverUrl: string | null; publicUrl: string | null;
+  state: "active" | "needs_reconnect"; isDefault: boolean; lastCheckedAt: string | null; lastErrorCode: string | null;
+};
+const photoConnectionSchema: z.ZodType<PhotoConnection> = z.object({
+  id: z.string(), service: z.enum(["immich", "google_photos"]), serverUrl: z.string().nullable(), publicUrl: z.string().nullable(),
+  state: z.enum(["active", "needs_reconnect"]), isDefault: z.boolean(), lastCheckedAt: z.string().nullable(), lastErrorCode: z.string().nullable(),
+});
+const photoConnectionsSchema = z.object({ connections: z.array(photoConnectionSchema) });
+export type PhotoCheck = { ok: true } | { ok: false; error: string; permission?: string };
+const photoCheckSchema = z.union([
+  z.object({ ok: z.literal(true) }).transform((): PhotoCheck => ({ ok: true })),
+  z.object({ ok: z.literal(false), error: z.string(), permission: z.string().regex(/^[A-Za-z]+(?:\.[A-Za-z]+){1,2}$/).max(40).optional() })
+    .transform(({ error, permission }): PhotoCheck => ({ ok: false, error, ...(permission ? { permission } : {}) })),
+]);
+const photoConnectionPath = (id: string) => `/v1/photo-connections/${encodeURIComponent(id)}`;
+export const getPhotoConnections = () => api<unknown>("/v1/photo-connections").then((value) => photoConnectionsSchema.parse(value).connections);
+/** Connects Immich, or replaces the account's Immich connection in place (one per service): a 201 the first time, 200 after. */
+export const connectImmich = (input: { serverUrl: string; apiKey: string; publicUrl?: string }) =>
+  api<unknown>("/v1/photo-connections/immich", { method: "POST", body: JSON.stringify(input) })
+    .then((value) => z.object({ connection: photoConnectionSchema }).parse(value).connection);
+export const testPhotoConnection = (id: string) =>
+  api<unknown>(`${photoConnectionPath(id)}/test`, { method: "POST" })
+    .then((value) => z.object({ connection: photoConnectionSchema, check: photoCheckSchema }).parse(value));
+/** Answers the connection it made the default; the caller reads the list again for the rest. */
+export const setDefaultPhotoConnection = (id: string) =>
+  api<unknown>(`${photoConnectionPath(id)}/default`, { method: "PUT" }).then((value) => z.object({ connection: photoConnectionSchema }).parse(value).connection);
+export const disconnectPhotoConnection = (id: string) =>
+  api<unknown>(photoConnectionPath(id), { method: "DELETE" }).then((value) => photoConnectionsSchema.parse(value).connections);
 
 export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse(value));
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(z.union([tripSchema, memberTripSchema])) }).parse(value));
