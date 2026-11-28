@@ -20,6 +20,7 @@ host's own `reason` says, flattened and bounded, and the host never echoes a req
 from __future__ import annotations
 
 import errno
+import hashlib
 import ipaddress
 import json
 import os
@@ -408,6 +409,106 @@ class TripStore:
             except OSError:
                 pass
             raise
+
+    def publish_document(self, file_name: str, source_path: str, content_digest: str) -> str:
+        """One stored original into `documents/`, as a copy the container's uid can read. Returns "copy" or "existing".
+
+        Not a hard link, on purpose. A link shares the original's inode, so the original's owner and mode (the control
+        plane's user, 0640) come with it, and the container's uid (a fixed non-root one) cannot open the file; making it
+        readable with chmod or chown on the link would change the inbound original too. A copy is the container's own
+        file: written beside its name through the directory descriptors, handed to the owner of `trip/` (the
+        container's uid, as `write_trip_files` does), then renamed into place. The original is opened without
+        following a link, must be a plain file, and its bytes must match the digest the manifest recorded, or nothing
+        is published. A name already published with the same bytes, owned by the container and not shared with another
+        inode, is left alone; one with the same bytes but another owner or a second link (an earlier hard-linked
+        publish) is replaced by a copy, never chmodded in place. Different bytes under the name are refused."""
+        if not re.fullmatch(r"[a-f0-9]{64}\.[A-Za-z0-9]{1,12}", file_name):
+            raise ValueError(f"{file_name!r} is not a content-addressed document name")
+        trip_fd = self._open_trip()
+        try:
+            sub_fd = self._open_dir(trip_fd, "trip", "the trip's `trip/` directory is missing: ensure has not run for it")
+            try:
+                owner = os.fstat(sub_fd)
+            finally:
+                os.close(sub_fd)
+            docs_fd = self._open_dir(trip_fd, "documents", "the trip's `documents/` directory is missing: ensure has not run for it")
+            try:
+                return self._copy_document(docs_fd, file_name, source_path, content_digest, owner.st_uid, owner.st_gid)
+            finally:
+                os.close(docs_fd)
+        finally:
+            os.close(trip_fd)
+
+    @staticmethod
+    def _digest_fd(fd: int) -> str:
+        sha = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                return "sha256:" + sha.hexdigest()
+            sha.update(chunk)
+
+    @classmethod
+    def _copy_document(cls, dir_fd: int, name: str, source_path: str, digest: str, uid: int, gid: int) -> str:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            existing = os.open(name, flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            raise TripStoreError(f"{name} on the trip's store is not a plain file; not touching it") from None
+        if existing is not None:
+            try:
+                st = os.fstat(existing)
+                if not stat.S_ISREG(st.st_mode):
+                    raise TripStoreError(f"{name} on the trip's store is not a plain file; not touching it")
+                if cls._digest_fd(existing) != digest:
+                    raise ValueError(f"{name} already published with different content")
+                if (st.st_uid, st.st_gid) == (uid, gid) and st.st_nlink == 1 and st.st_mode & 0o040:
+                    return "existing"
+            finally:
+                os.close(existing)
+        try:
+            src = os.open(source_path, flags)
+        except OSError:
+            raise TripStoreError(f"the stored original for {name} could not be opened") from None
+        tmp = f".{name}.tmp-{os.urandom(6).hex()}"
+        try:
+            if not stat.S_ISREG(os.fstat(src).st_mode):
+                raise TripStoreError(f"the stored original for {name} is not a plain file")
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o640, dir_fd=dir_fd)
+            try:
+                try:
+                    os.fchmod(out, 0o640)
+                    os.fchown(out, uid, gid)
+                except OSError:
+                    raise TripStoreError(
+                        f"could not hand {name} to the container's user: the site could not read its own documents"
+                    ) from None
+                sha = hashlib.sha256()
+                while True:
+                    chunk = os.read(src, 1 << 20)
+                    if not chunk:
+                        break
+                    sha.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(out, view):]
+                if "sha256:" + sha.hexdigest() != digest:
+                    raise ValueError(f"{name}: stored original does not match its digest")
+                os.fsync(out)
+            finally:
+                os.close(out)
+            os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            return "copy"
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(src)
 
     def read_trip_file(self, name: str, limit: int = 4_000_000) -> "bytes | None":
         """A plain file in `trip/`, or None when it is absent. Never follows a link, never blocks on a FIFO."""

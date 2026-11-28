@@ -2035,7 +2035,14 @@ function pushPhotoToImmich({ filePath, originalName, mime, size, id, phase, now 
   (async () => {
     try {
       const form = new FormData();
-      form.append('assetData', fs.createReadStream(filePath), {
+      const source = fs.createReadStream(filePath);
+      const cancel = new AbortController();
+      // The background push must never take the process down: an unreadable upload ends this push, not the site.
+      source.on('error', (error) => {
+        console.error(`Immich push: cannot read ${path.basename(filePath)} (${error.code || 'error'})`);
+        cancel.abort();
+      });
+      form.append('assetData', source, {
         filename: originalName,
         contentType: mime,
         knownLength: size,
@@ -2049,6 +2056,7 @@ function pushPhotoToImmich({ filePath, originalName, mime, size, id, phase, now 
         method: 'POST',
         headers: { 'x-api-key': IMMICH_KEY, ...form.getHeaders() },
         body: form,
+        signal: cancel.signal,
       });
       const data = await r.json();
       if (data.id) {
@@ -3209,7 +3217,20 @@ function protectedDocumentResponse(res, filePath, disposition = 'attachment') {
   res.setHeader('Content-Disposition', `${disposition}; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`);
   res.setHeader('Cache-Control', 'private, no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  return fs.createReadStream(filePath).pipe(res);
+  // A file that stat()s as a file can still fail to open (a mode the site's uid cannot read, a store that went away) or fail
+  // part-way. An unhandled 'error' event on a stream exits the whole process, so every request on the trip answered 502 until
+  // the container restarted (first vm-container run, 2026-11-28). Answer the one request; never put the path or errno in it.
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', (error) => {
+    console.error(`document read failed (${error.code || 'error'}): ${filePath}`);
+    if (res.headersSent) return res.destroy();
+    for (const header of ['Content-Type', 'Content-Disposition', 'Cache-Control', 'X-Content-Type-Options']) res.removeHeader(header);
+    return error.code === 'ENOENT'
+      ? res.status(404).json({ error: 'not found' })
+      : res.status(500).json({ error: 'could not read the document' });
+  });
+  res.on('close', () => stream.destroy());
+  return stream.pipe(res);
 }
 
 // Where a trip's source documents are, in the order they are looked for.

@@ -73,6 +73,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
+from stat import S_ISREG
 from typing import Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 # --------------------------------------------------------------------------- #
@@ -254,8 +255,57 @@ class Shell:
 # --------------------------------------------------------------------------- #
 # Pure helpers (tested in tests/scripts/test_vm_release.py)
 # --------------------------------------------------------------------------- #
-def foreign_network_mounts(findmnt_targets: str, documents_mount: Optional[str]) -> List[str]:
-    """The network mounts a release still refuses: every one except the documents mount vm.env names.
+# Where the trip-container host script keeps its root-owned configuration (scripts/trip-container-host.py,
+# CONFIG_PATH): the release tool reads one key from it, TRIP_CONTAINER_MOUNT_ROOT, and nothing else.
+TRIP_HOST_CONF = Path("/etc/kinerary/trip-container-host.conf")
+# A trip's bind mount point is <TRIP_CONTAINER_MOUNT_ROOT>/<trip id>; the name is the host script's TRIP_ID_RE.
+TRIP_BIND_NAME = re.compile(r"trip_[0-9a-f]{8,64}")
+
+
+def trip_mount_root(conf_path: Optional[Path] = None) -> Optional[str]:
+    """TRIP_CONTAINER_MOUNT_ROOT from the host script's configuration, or None when there is none to trust.
+
+    None for a missing file, one that is not a plain file owned by root (or by the user running this tool, so a
+    dry run by a developer or in a test reads it too), or one anyone else can write, or in such a directory: the
+    answer widens what the network-mount guard tolerates, so the file is held to the host script's own rules
+    (scripts/trip-container-host.py read_config, minus its link-count check). None means "no trip binds are
+    tolerated", the guard's behaviour before trips had containers; the guard then says why when it refuses."""
+    path = str(conf_path or TRIP_HOST_CONF)
+    trusted = {0, os.geteuid()}
+    try:
+        parent = os.stat(os.path.dirname(path))
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not S_ISREG(st.st_mode) or st.st_size > 65536:
+            return None
+        for entry in (st, parent):
+            if entry.st_uid not in trusted or entry.st_mode & 0o022:
+                return None
+        text = os.read(fd, 65537).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+    found = [line.partition("=")[2] for line in text.splitlines() if line.partition("=")[0] == "TRIP_CONTAINER_MOUNT_ROOT"]
+    value = found[0] if len(found) == 1 else ""
+    if not value.startswith("/") or value != os.path.normpath(value) or value == "/":
+        return None
+    return value
+
+
+def is_trip_bind(target: str, mount_root: Optional[str]) -> bool:
+    """A trip container's store bind: exactly <mount root>/<trip id>, one level, nothing deeper."""
+    if not mount_root:
+        return False
+    parent, _, name = target.rstrip("/").rpartition("/")
+    return parent == mount_root.rstrip("/") and TRIP_BIND_NAME.fullmatch(name) is not None
+
+
+def foreign_network_mounts(findmnt_targets: str, documents_mount: Optional[str],
+                           trip_mount_root_path: Optional[str] = None) -> List[str]:
+    """The network mounts a release still refuses: every one except the documents mount vm.env names, and the
+    trip containers' binds of it.
 
     The guard exists because a snapshot's filesystem freeze could hang on a network filesystem (and on
     2026-09-13 a vzdump onto the trips' NFS share froze this VM). The document store is the one network
@@ -263,10 +313,19 @@ def foreign_network_mounts(findmnt_targets: str, documents_mount: Optional[str])
     the same export), so it is tolerated by its exact path and nothing else is: a mount below it, or any
     second share, is still refused. With no documents mount configured, every network mount is refused,
     as before. A stalled freeze is still thawed host-side by the snapshot step's own limit.
+
+    A vm-container trip adds one bind mount per trip, `<TRIP_CONTAINER_MOUNT_ROOT>/<trip id>`, of that trip's
+    directory on the same export (the host script binds an open descriptor, so the daemon never holds a store
+    path). findmnt reports each as a network mount. It is the documents mount seen through another door, not a
+    second share, so it is tolerated on the same terms: by exact shape (one level under the configured root,
+    named like a trip id), and only when vm.env names a documents mount at all. Anything else under the root,
+    deeper or differently named, is refused like any other network mount.
     """
     allowed = (documents_mount or "").rstrip("/")
     targets = [t.strip() for t in findmnt_targets.splitlines() if t.strip()]
-    return [t for t in targets if not allowed or t.rstrip("/") != allowed]
+    return [t for t in targets
+            if (not allowed or t.rstrip("/") != allowed)
+            and not (allowed and is_trip_bind(t, trip_mount_root_path))]
 
 
 def read_env_text(text: str) -> Dict[str, str]:
@@ -1616,11 +1675,18 @@ class ControlPlane:
             self.r.fail(f"{BACKUP_DIR} is on '{fstype or 'unknown'}' — backups are only written to a local filesystem")
         netfs = self.sh.text(["findmnt", "-rn", "-t", "nfs,nfs4,cifs,smb3,fuse.sshfs", "-o", "TARGET"]).strip()
         documents = self.vm_env().get("KINERARY_NFS_ROOT") if VM_ENV.exists() else None
-        foreign = foreign_network_mounts(netfs, documents)
+        mount_root = trip_mount_root()
+        foreign = foreign_network_mounts(netfs, documents, mount_root)
         if foreign:
             self.r.fail(f"this VM has network filesystems mounted ({', '.join(foreign)}) — a snapshot freeze could hang on them")
+            if mount_root is None and any(TRIP_BIND_NAME.fullmatch(t.rstrip("/").rpartition("/")[2]) for t in foreign):
+                self.r.note(f"some of these look like trip container binds, but TRIP_CONTAINER_MOUNT_ROOT could not be read from "
+                            f"{TRIP_HOST_CONF} (missing, not a plain file, not owned by root, or writable by others), "
+                            "so no bind is tolerated")
         elif netfs:
-            self.r.ok(f"only the documents mount is a network filesystem ({documents}, KINERARY_NFS_ROOT)")
+            binds = sum(1 for t in netfs.splitlines() if is_trip_bind(t.strip(), mount_root))
+            self.r.ok(f"only the documents mount is a network filesystem ({documents}, KINERARY_NFS_ROOT)"
+                      + (f", seen again through {binds} trip container bind(s) under {mount_root}" if binds else ""))
         else:
             self.r.ok("no network filesystem mounted in this VM")
         free = shutil.disk_usage("/").free

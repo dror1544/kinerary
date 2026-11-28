@@ -740,7 +740,7 @@ class ShellDeployAdapter:
         os.makedirs(trip_dir, exist_ok=True)
         with open(os.path.join(trip_dir, "trip.config.json"), "wb") as fh:
             fh.write(files["trip.config.json"])
-        self._publish_documents(slug, trip_dir, documents, fallback=False)
+        self._publish_documents(slug, trip_dir, documents, fallback=False, store=site.store)
         compute.activate_container(site)  # type: ignore[attr-defined]
         self._container_origins[f"http://{site.ip}:{site.port}"] = slug
         return self._private_url(trip_dir)
@@ -791,6 +791,7 @@ class ShellDeployAdapter:
 
     def _publish_documents(
         self, slug: str, trip_dir: str, documents: Sequence[TripDocumentFile] | None, *, fallback: bool = True,
+        store: "TripStore | None" = None,
     ) -> None:
         # The trip's source documents, under their content-addressed names.
         #
@@ -806,13 +807,29 @@ class ShellDeployAdapter:
         # or the export refuses the write (root squashing, say). A document that
         # cannot be published either way is logged and left out, never a failed
         # deploy.
+        #
+        # A vm-container trip passes its `store`: there the site runs as a fixed
+        # non-root uid that cannot read a hard link to the original (the link
+        # shares its owner and 0640 mode), and chmod on the link would change
+        # the original, so each document is COPIED into the trip's documents/
+        # through the store's directory descriptors and handed to the container's
+        # uid. The LXC path is unchanged.
         if documents:
-            nfs_documents_dir = self._trip_nfs_documents_dir(slug)
+            nfs_documents_dir = None if store is not None else self._trip_nfs_documents_dir(slug)
             documents_dir = os.path.join(trip_dir, "documents")
             published: dict[str, int] = {}
             for document in documents:
                 strategy: str | None = None
-                if nfs_documents_dir:
+                if store is not None:
+                    try:
+                        strategy = f"nfs_{store.publish_document(document.file_name, document.source_path, document.content_digest)}"
+                    except (OSError, ValueError, TripContainerError):
+                        logger.warning(
+                            "provisioner.document_nfs_publish_failed",
+                            extra={"slug": slug, "document_id": document.document_id},
+                            exc_info=True,
+                        )
+                elif nfs_documents_dir:
                     try:
                         strategy = f"nfs_{publish_document(document, nfs_documents_dir)}"
                     except (OSError, ValueError):

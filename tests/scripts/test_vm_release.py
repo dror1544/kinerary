@@ -2364,3 +2364,144 @@ class NetworkMountGuard(unittest.TestCase):
     def test_a_mount_below_the_documents_mount_is_not_the_documents_mount(self):
         self.assertEqual(vr.foreign_network_mounts("/srv/kinerary-nfs/other", "/srv/kinerary-nfs"),
                          ["/srv/kinerary-nfs/other"])
+
+
+class TripContainerBindGuard(unittest.TestCase):
+    """A vm-container trip's store is a bind of the documents mount under TRIP_CONTAINER_MOUNT_ROOT. It is the same
+    export seen through another door, so the network-mount guard tolerates it on the same terms as the documents mount
+    (found on the first full VM run, 2026-11-28: no upgrade could run while any container trip existed)."""
+
+    DOCS = "/srv/kinerary-nfs"
+    ROOT = "/run/kinerary-trip-mounts"
+    TRIP_A = "trip_0123456789abcdef0123456789abcdef"
+    TRIP_B = "trip_fedcba9876543210fedcba9876543210"
+
+    def bind(self, name: str) -> str:
+        return f"{self.ROOT}/{name}"
+
+    def test_a_trip_bind_one_level_under_the_configured_root_is_tolerated_with_the_documents_mount(self):
+        out = f"{self.DOCS}\n{self.bind(self.TRIP_A)}\n{self.bind(self.TRIP_B)}\n"
+        self.assertEqual(vr.foreign_network_mounts(out, self.DOCS, self.ROOT), [])
+
+    def test_a_trailing_slash_on_either_side_names_the_same_bind(self):
+        self.assertEqual(vr.foreign_network_mounts(self.bind(self.TRIP_A) + "/", self.DOCS, self.ROOT + "/"), [])
+
+    def test_without_the_root_configured_the_binds_are_refused_as_before(self):
+        out = f"{self.DOCS}\n{self.bind(self.TRIP_A)}\n"
+        self.assertEqual(vr.foreign_network_mounts(out, self.DOCS, None), [self.bind(self.TRIP_A)])
+
+    def test_without_a_documents_mount_configured_the_binds_are_refused_too(self):
+        self.assertEqual(vr.foreign_network_mounts(self.bind(self.TRIP_A), None, self.ROOT), [self.bind(self.TRIP_A)])
+        self.assertEqual(vr.foreign_network_mounts(self.bind(self.TRIP_A), "", self.ROOT), [self.bind(self.TRIP_A)])
+
+    def test_only_the_exact_shape_is_tolerated(self):
+        odd = [
+            f"{self.ROOT}/{self.TRIP_A}/deeper",       # a mount inside a trip's store
+            f"{self.ROOT}/backups",                    # not named like a trip id
+            f"{self.ROOT}/{self.TRIP_A}-old",          # a look-alike
+            f"{self.ROOT}",                            # the root itself is not a trip bind
+            f"/elsewhere/{self.TRIP_A}",               # another directory
+            f"{self.ROOT}x/{self.TRIP_A}",             # a sibling sharing the root's prefix
+            f"{self.ROOT}/../etc/{self.TRIP_A}",
+        ]
+        self.assertEqual(vr.foreign_network_mounts("\n".join(odd), self.DOCS, self.ROOT), odd)
+
+    def test_another_share_is_still_refused_beside_the_binds(self):
+        out = f"{self.DOCS}\n{self.bind(self.TRIP_A)}\n/mnt/backups\n"
+        self.assertEqual(vr.foreign_network_mounts(out, self.DOCS, self.ROOT), ["/mnt/backups"])
+
+
+class TripMountRootConfig(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="trip-host-conf-"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.conf = self.dir / "trip-container-host.conf"
+
+    def write(self, text: str, mode: int = 0o600) -> None:
+        self.conf.write_text(text)
+        os.chmod(self.conf, mode)
+
+    def test_it_reads_the_one_key_it_needs(self):
+        self.write("KINERARY_NFS_ROOT=/srv/x\nTRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\nTRIP_CONTAINER_UID=10001\n")
+        self.assertEqual(vr.trip_mount_root(self.conf), "/run/trip-mounts")
+
+    def test_no_file_means_no_tolerance(self):
+        self.assertIsNone(vr.trip_mount_root(self.dir / "absent.conf"))
+
+    def test_a_file_anyone_else_can_write_is_not_believed(self):
+        self.write("TRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\n", mode=0o666)
+        self.assertIsNone(vr.trip_mount_root(self.conf))
+
+    def test_a_directory_anyone_else_can_write_is_not_believed(self):
+        self.write("TRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\n")
+        os.chmod(self.dir, 0o777)
+        self.assertIsNone(vr.trip_mount_root(self.conf))
+
+    def test_a_file_owned_by_someone_else_is_not_believed(self):
+        self.write("TRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\n")
+        with mock.patch.object(vr.os, "geteuid", return_value=os.getuid() + 12345):
+            self.assertIsNone(vr.trip_mount_root(self.conf))
+
+    def test_a_link_is_not_followed(self):
+        self.write("TRIP_CONTAINER_MOUNT_ROOT=/run/trip-mounts\n")
+        link = self.dir / "link.conf"
+        os.symlink(self.conf, link)
+        self.assertIsNone(vr.trip_mount_root(link))
+
+    def test_an_unusable_value_is_not_believed(self):
+        for text in ("TRIP_CONTAINER_MOUNT_ROOT=\n", "TRIP_CONTAINER_MOUNT_ROOT=relative/path\n",
+                     "TRIP_CONTAINER_MOUNT_ROOT=/\n", "TRIP_CONTAINER_MOUNT_ROOT=/a/../b\n",
+                     "TRIP_CONTAINER_MOUNT_ROOT=/a\nTRIP_CONTAINER_MOUNT_ROOT=/b\n", "# nothing\n"):
+            with self.subTest(text=text):
+                self.write(text)
+                self.assertIsNone(vr.trip_mount_root(self.conf))
+
+
+class GuardStorageWithTripBinds(unittest.TestCase):
+    """The guard itself, end to end with a stubbed findmnt: a container trip no longer blocks `upgrade`, and a
+    foreign mount still does."""
+
+    DOCS = "/srv/kinerary-nfs"
+    ROOT = "/run/kinerary-trip-mounts"
+    TRIP = "trip_0123456789abcdef0123456789abcdef"
+
+    def run_guard(self, netfs: str, conf_text: "str | None" = None):
+        tmp = Path(tempfile.mkdtemp(prefix="guard-storage-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        vm_env = tmp / "vm.env"
+        vm_env.write_text(f"KINERARY_NFS_ROOT={self.DOCS}\n")
+        conf = tmp / "trip-container-host.conf"
+        if conf_text is not None:
+            conf.write_text(conf_text)
+            os.chmod(conf, 0o600)
+        out = io.StringIO()
+        cp = vr.ControlPlane(vr.Report(out, color=False))
+
+        class Sh:
+            def text(self, argv, **kwargs):
+                if "-t" in argv:
+                    return netfs
+                return "ext4\n"
+
+        cp.sh = Sh()
+        with mock.patch.object(vr, "VM_ENV", vm_env), mock.patch.object(vr, "TRIP_HOST_CONF", conf), \
+                mock.patch.object(vr.shutil, "disk_usage", lambda _p: mock.Mock(free=10 ** 13)):
+            cp.guard_storage()
+        return cp.r.failures, out.getvalue()
+
+    def test_a_container_trips_bind_does_not_stop_the_guard(self):
+        failures, text = self.run_guard(f"{self.DOCS}\n{self.ROOT}/{self.TRIP}\n", f"TRIP_CONTAINER_MOUNT_ROOT={self.ROOT}\n")
+        self.assertEqual(0, failures, text)
+        self.assertIn("1 trip container bind", text)
+
+    def test_without_the_host_configuration_the_bind_still_stops_it(self):
+        failures, text = self.run_guard(f"{self.DOCS}\n{self.ROOT}/{self.TRIP}\n")
+        self.assertEqual(1, failures, text)
+        self.assertIn(f"{self.ROOT}/{self.TRIP}", text)
+        self.assertIn("TRIP_CONTAINER_MOUNT_ROOT could not be read", text, "the refusal says why, not just that")
+
+    def test_a_foreign_mount_beside_the_binds_still_stops_it(self):
+        failures, text = self.run_guard(f"{self.DOCS}\n{self.ROOT}/{self.TRIP}\n/mnt/other\n", f"TRIP_CONTAINER_MOUNT_ROOT={self.ROOT}\n")
+        self.assertEqual(1, failures, text)
+        self.assertIn("/mnt/other", text)
+        self.assertNotIn(f"({self.ROOT}", text)
