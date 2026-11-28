@@ -2645,6 +2645,23 @@ def _read_anchor(raw: Mapping[str, Any]) -> dict[str, Any]:
 _NON_ITINERARY_ANCHORS = {"hotel", "car", "proposal"}
 
 
+_FLIGHT_LABEL_RE = re.compile(r"^\s*([A-Za-z0-9]{2})\s?(\d{1,4})\b(.*)$")
+_AIRPORT_CODE_RE = re.compile(r"\(\s*[A-Za-z]{3}\s*\)")
+
+
+def _flight_identity(label: str) -> tuple[str, str] | None:
+    """What makes two flight labels the same flight: its number and its route, read past the wording a
+    model varies between two tickets — the number's spacing and case, and the "(HBT)" airport codes it
+    keeps on one ticket and drops on the other (#707). The route stays in the identity because one number
+    can fly two legs of a day ("XY 12 A → B", "XY 12 B → C"). None when the label does not start with a
+    flight number: such a line is never merged."""
+    m = _FLIGHT_LABEL_RE.match(label)
+    if not m:
+        return None
+    route = _squash(_AIRPORT_CODE_RE.sub(" ", m.group(3)))
+    return (f"{m.group(1)}{m.group(2)}".upper(), route)
+
+
 def derive_days_from_anchors(
     config: Mapping[str, Any], data: Mapping[str, Any]
 ) -> dict[str, list[dict[str, Any]]]:
@@ -2693,12 +2710,25 @@ def derive_days_from_anchors(
         if not label:
             continue
         day = by_phase.setdefault(phase_id, {}).setdefault(when.isoformat(), [])
-        day.append({"time": anchor["time"], "text": {"he": label, "en": label}})
+        item = {"time": anchor["time"], "text": {"he": label, "en": label}}
+        flight = _flight_identity(label) if _ANCHOR_TYPE_MAP.get(anchor["type"]) == "flight" else None
+        twin = next((i for i in day if flight and i.get("_flight") == flight
+                     and (i["time"] is None or anchor["time"] is None or i["time"] == anchor["time"])), None)
+        if twin is None:
+            item["_flight"] = flight
+            day.append(item)
+            continue
+        # #707: one flight, a ticket per party — Reservations keeps both bookings (#549), the plan one line.
+        twin["time"] = twin["time"] or anchor["time"]
+        if len(label) > len(twin["text"]["en"]):
+            twin["text"] = item["text"]
 
     out: dict[str, list[dict[str, Any]]] = {}
     for phase_id, days in by_phase.items():
         rendered = []
         for iso, items in sorted(days.items()):
+            for i in items:
+                i.pop("_flight", None)
             # Timed items first in clock order, undated-within-the-day last —
             # "some time that day" reads correctly at the bottom, not at 00:00.
             items.sort(key=lambda i: (i["time"] is None, i["time"] or ""))
