@@ -2180,6 +2180,45 @@ class DeriveDaysFromAnchorsTests(unittest.TestCase):
         # 30 September event in the Tokyo tab would simply be wrong.
         self.assertEqual(self._days([{"type": "activity", "detail": "Something — 30 Sep 2026 at 09:00"}]), {})
 
+    # #707: two parties booked on one flight are two tickets, so two anchors, and the model words each one
+    # on its own — one with the airport codes, one without. Reservations keeps both bookings (#549); the plan
+    # is one line per flight and day.
+    def _items(self, anchors):
+        return [(i["time"], i["text"]["en"]) for i in self._days(anchors)["tokyo"][0]["items"]]
+
+    def test_one_flight_booked_twice_is_one_plan_line_with_the_fuller_wording(self) -> None:
+        self.assertEqual(self._items([
+            {"type": "flight", "name": "SL 482 HARBORTOWN → GATECITY", "date": "2026-09-20", "confirmation": "QX7P2M"},
+            {"type": "flight", "name": "SL 482 HARBORTOWN (HBT) → GATECITY (GCY)", "date": "2026-09-20",
+             "confirmation": "ZT3K9D"},
+        ]), [(None, "SL 482 HARBORTOWN (HBT) → GATECITY (GCY)")])
+
+    def test_the_flight_number_spacing_and_case_do_not_split_one_flight(self) -> None:
+        items = self._items([
+            {"type": "flight", "name": "SL482 Harbortown → Gatecity", "date": "2026-09-20", "time": "10:15"},
+            {"type": "flight", "name": "SL 482 HARBORTOWN → GATECITY", "date": "2026-09-20"},
+        ])
+        self.assertEqual([t for t, _ in items], ["10:15"])  # one line, and the time one ticket gave is kept
+
+    def test_one_number_flying_two_legs_of_a_day_stays_two_lines(self) -> None:
+        self.assertEqual(self._items([
+            {"type": "flight", "name": "XY 12 A → B", "date": "2026-09-20", "time": "08:00"},
+            {"type": "flight", "name": "XY 12 B → C", "date": "2026-09-20", "time": "11:00"},
+        ]), [("08:00", "XY 12 A → B"), ("11:00", "XY 12 B → C")])
+
+    def test_one_flight_at_two_different_times_stays_two_lines(self) -> None:
+        self.assertEqual(len(self._items([
+            {"type": "flight", "name": "XY 12 A → B", "date": "2026-09-20", "time": "08:00"},
+            {"type": "flight", "name": "XY 12 A → B", "date": "2026-09-20", "time": "20:00"},
+        ])), 2)
+
+    def test_two_activities_worded_alike_are_not_merged(self) -> None:
+        # Only a flight is one thing however many tickets it has; two "Museum" visits may be two visits.
+        self.assertEqual(len(self._items([
+            {"type": "activity", "name": "Museum", "date": "2026-09-20"},
+            {"type": "activity", "name": "Museum", "date": "2026-09-20"},
+        ])), 2)
+
     def test_extracted_days_win_over_derived_ones(self) -> None:
         # The precedence written the right way round: an uploaded document's
         # itinerary is richer than a list of bookings, so this fills empty
