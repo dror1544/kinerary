@@ -49,6 +49,25 @@ const sentenceOf = (error: unknown) => error instanceof ApiError ? sentenceFor(e
 const notConfigured = (error: unknown) => error instanceof ApiError && error.code === NOT_CONFIGURED;
 const serviceName = (connection: PhotoConnection) => connection.service === "immich" ? "Immich" : "Google Photos";
 
+type PhotoService = PhotoConnection["service"];
+
+/**
+ * The service's own mark in its own colours, as Telegram and WhatsApp get theirs (chat-service.tsx, #690). Simplified
+ * pinwheels in each service's palette, not the trademark artwork: Immich's five petals, Google Photos' four.
+ */
+function PhotoServiceMark({ service, size = 22 }: { service: PhotoService; size?: number }) {
+  const petals = service === "immich"
+    ? ["#fa2921", "#ed79b5", "#ffb400", "#1e83f7", "#18c249"]
+    : ["#ea4335", "#4285f4", "#34a853", "#fbbc04"];
+  return (
+    <svg className={`photo-mark photo-mark-${service}`} viewBox="0 0 24 24" width={size} height={size} aria-hidden="true" focusable="false">
+      {petals.map((fill, index) => (
+        <ellipse key={fill} cx="12" cy="6.2" rx="3.6" ry="5.2" fill={fill} fillOpacity="0.92" transform={`rotate(${(360 / petals.length) * index} 12 12)`} />
+      ))}
+    </svg>
+  );
+}
+
 /**
  * "Photo library" on the dashboard, for the signed-in account (#699, docs/specs/sprint-9/699-user-photo-library.md):
  * connect Immich, see each connection's state, test it, choose the default and disconnect. The account's own; a session a
@@ -108,8 +127,8 @@ export function PhotoLibrary() {
               />
             )}
             {list.isSuccess && !connections.some((connection) => connection.service === "google_photos") && (
-              <div className="photo-soon">
-                <button type="button" className="button button-small" disabled>Connect Google Photos</button>
+              <div className="photo-soon photo-service-google_photos">
+                <button type="button" className="button button-small photo-connect" disabled><PhotoServiceMark service="google_photos" size={18} />Connect Google Photos</button>
                 <small className="subtle">Google Photos is coming soon.</small>
               </div>
             )}
@@ -151,8 +170,8 @@ function ImmichForm({ reconnect, onDone, onUnavailable }: { reconnect: PhotoConn
   };
   const label = reconnect ? "Reconnect Immich" : "Connect Immich";
   return (
-    <form className="compact-form photo-library-form" onSubmit={submit} autoComplete="off">
-      <h3>{label}</h3>
+    <form className="compact-form photo-library-form photo-service-immich" onSubmit={submit} autoComplete="off">
+      <h3 className="photo-service-title"><PhotoServiceMark service="immich" size={20} />{label}</h3>
       <label>Server address
         <input type="text" inputMode="url" dir="ltr" required spellCheck={false} autoComplete="off" placeholder="https://photos.example.com"
           value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} />
@@ -169,7 +188,7 @@ function ImmichForm({ reconnect, onDone, onUnavailable }: { reconnect: PhotoConn
       <small className="subtle">Only if the family opens your Immich at a different address. Share links use it.</small>
       {problem && <p className="notice" role="alert">{problem}</p>}
       <div className="button-row">
-        <button className="button button-small" disabled={pending}>{pending ? "Checking with Immich…" : label}</button>
+        <button className="button button-small photo-connect" disabled={pending}>{pending ? "Checking with Immich…" : label}</button>
         {reconnect && <button type="button" className="text-button" onClick={onDone} disabled={pending}>Cancel</button>}
       </div>
     </form>
@@ -211,8 +230,9 @@ function ConnectionRow({ connection, many, onReconnect, onUnavailable }: {
   const needsReconnect = connection.state === "needs_reconnect";
   const busy = test.isPending || makeDefault.isPending || disconnect.isPending;
   return (
-    <li className="photo-connection">
+    <li className={`photo-connection photo-service-${connection.service}`}>
       <div className="photo-connection-head">
+        <PhotoServiceMark service={connection.service} />
         <strong>{serviceName(connection)}</strong>
         {many && connection.isDefault && <span className="status-chip">Default</span>}
       </div>
@@ -233,7 +253,7 @@ function ConnectionRow({ connection, many, onReconnect, onUnavailable }: {
           </span>
         </div>
         : <div className="button-row photo-actions">
-          {needsReconnect && connection.service === "immich" && <button type="button" className="button button-small" onClick={onReconnect}>Reconnect</button>}
+          {needsReconnect && connection.service === "immich" && <button type="button" className="button button-small photo-connect" onClick={onReconnect}>Reconnect</button>}
           {connection.service === "immich" && <button type="button" className="text-button" onClick={() => test.mutate()} disabled={busy}>Test connection</button>}
           {many && !connection.isDefault && <button type="button" className="text-button" onClick={() => makeDefault.mutate()} disabled={busy}>Make default</button>}
           <button type="button" className="text-button" onClick={() => { disconnect.reset(); setConfirming(true); }} disabled={busy}>Disconnect</button>
