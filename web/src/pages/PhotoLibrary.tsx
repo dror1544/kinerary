@@ -87,6 +87,8 @@ export function PhotoLibrary() {
   const [lostConfig, setLostConfig] = useState(false);
   // An id, looked up in the live list: a connection disconnected while its form was open takes the form with it.
   const [reconnectingId, setReconnectingId] = useState<string | null>(null);
+  // The Immich connect form is its own step: a service's button opens it, so a person is asked only what that service needs.
+  const [addingImmich, setAddingImmich] = useState(false);
   if (inMiniApp || !me.isSuccess) return null;
   const unavailable = lostConfig || notConfigured(list.error);
   if (!scoped && (list.isPending || unavailable)) return null;
@@ -94,7 +96,7 @@ export function PhotoLibrary() {
   const immich = connections.find((connection) => connection.service === "immich");
   const many = connections.length > 1;
   const reconnecting = connections.find((connection) => connection.id === reconnectingId) ?? null;
-  const showForm = list.isSuccess && (!immich || reconnecting !== null);
+  const showForm = list.isSuccess && ((addingImmich && !immich) || reconnecting !== null);
   return (
     <section className="trip-section photo-library">
       <h2>Photo library</h2>
@@ -109,8 +111,8 @@ export function PhotoLibrary() {
             </p>
             {/* A load that failed by itself is a status, not an alert: the alert is kept for an answer to something the person did. */}
             {list.isError && <div className="notice" role="status">We could not load your photo libraries. Please retry.</div>}
-            {list.isSuccess && connections.length === 0 && <p className="subtle">No photo library is connected yet.</p>}
-            {connections.length > 0 && (
+            {!showForm && list.isSuccess && connections.length === 0 && <p className="subtle">No photo library is connected yet.</p>}
+            {!showForm && connections.length > 0 && (
               <ul className="photo-connections">
                 {connections.map((connection) => (
                   <ConnectionRow
@@ -123,13 +125,25 @@ export function PhotoLibrary() {
             {showForm && (
               <ImmichForm
                 key={reconnecting?.id ?? "new"} reconnect={reconnecting}
-                onDone={() => setReconnectingId(null)} onUnavailable={() => setLostConfig(true)}
+                onDone={() => { setReconnectingId(null); setAddingImmich(false); }} onUnavailable={() => setLostConfig(true)}
               />
             )}
-            {list.isSuccess && !connections.some((connection) => connection.service === "google_photos") && (
-              <div className="photo-soon photo-service-google_photos">
-                <button type="button" className="button button-small photo-connect" disabled><PhotoServiceMark service="google_photos" size={18} />Connect Google Photos</button>
-                <small className="subtle">Google Photos is coming soon.</small>
+            {!showForm && list.isSuccess && (
+              <div className="photo-services">
+                {!immich && (
+                  <div className="photo-service-tile photo-service-immich">
+                    <PhotoServiceMark service="immich" size={28} />
+                    <div><strong>Immich</strong><small>Your own Immich server. You paste its address and a key you make in Immich.</small></div>
+                    <button type="button" className="button button-small photo-connect" onClick={() => setAddingImmich(true)}>Connect Immich</button>
+                  </div>
+                )}
+                {!connections.some((connection) => connection.service === "google_photos") && (
+                  <div className="photo-service-tile photo-service-google_photos">
+                    <PhotoServiceMark service="google_photos" size={28} />
+                    <div><strong>Google Photos</strong><small>Coming soon: you will sign in on Google's own page and choose to let Kinerary add photos.</small></div>
+                    <button type="button" className="button button-small photo-connect" disabled>Connect Google Photos</button>
+                  </div>
+                )}
               </div>
             )}
           </>}
@@ -172,15 +186,21 @@ function ImmichForm({ reconnect, onDone, onUnavailable }: { reconnect: PhotoConn
   return (
     <form className="compact-form photo-library-form photo-service-immich" onSubmit={submit} autoComplete="off">
       <h3 className="photo-service-title"><PhotoServiceMark service="immich" size={20} />{label}</h3>
+      <div className="photo-explain">
+        <p>Kinerary needs two things from your Immich:</p>
+        <ol>
+          <li><strong>The address</strong> you open Immich at in your browser, starting with https://. It has to be reachable from the internet, not only from your home network.</li>
+          <li><strong>An API key.</strong> In Immich open Account Settings, then API Keys, choose New API Key, name it Kinerary, allow the album permissions, and copy the key.</li>
+        </ol>
+        <p>Kinerary keeps the key encrypted, never shows it again, and only adds photos and albums: it never deletes anything.</p>
+      </div>
       <label>Server address
         <input type="text" inputMode="url" dir="ltr" required spellCheck={false} autoComplete="off" placeholder="https://photos.example.com"
           value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} />
       </label>
-      <small className="subtle">The address you open Immich at.</small>
       <label>API key
         <input ref={keyField} type="password" dir="ltr" required spellCheck={false} autoComplete="off" defaultValue="" />
       </label>
-      <small className="subtle">In Immich, open Account Settings, then API Keys, and make a new key for Kinerary. It is not shown again after you send it.</small>
       <label>Public address (optional)
         <input type="text" inputMode="url" dir="ltr" spellCheck={false} autoComplete="off" placeholder="https://share.example.com"
           value={publicUrl} onChange={(event) => setPublicUrl(event.target.value)} />
@@ -189,7 +209,7 @@ function ImmichForm({ reconnect, onDone, onUnavailable }: { reconnect: PhotoConn
       {problem && <p className="notice" role="alert">{problem}</p>}
       <div className="button-row">
         <button className="button button-small photo-connect" disabled={pending}>{pending ? "Checking with Immich…" : label}</button>
-        {reconnect && <button type="button" className="text-button" onClick={onDone} disabled={pending}>Cancel</button>}
+        <button type="button" className="text-button" onClick={onDone} disabled={pending}>{reconnect ? "Cancel" : "Back"}</button>
       </div>
     </form>
   );

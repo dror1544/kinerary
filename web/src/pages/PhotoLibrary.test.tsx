@@ -67,7 +67,12 @@ const section = async () => {
   return heading.closest("section") as HTMLElement;
 };
 const keyInput = () => screen.getByLabelText("API key") as HTMLInputElement;
+/** A service's own button opens its form: the Immich form is not on the page until it is pressed. */
+const openImmichForm = async () => {
+  if (!screen.queryByLabelText("Server address")) fireEvent.click(await screen.findByRole("button", { name: "Connect Immich" }));
+};
 const fill = async (server: string, key: string, publicUrl?: string) => {
+  await openImmichForm();
   fireEvent.change(await screen.findByLabelText("Server address"), { target: { value: server } });
   fireEvent.change(keyInput(), { target: { value: key } });
   if (publicUrl !== undefined) fireEvent.change(screen.getByLabelText("Public address (optional)"), { target: { value: publicUrl } });
@@ -89,14 +94,23 @@ describe("Photo library section (#699 S1b)", () => {
   it("1. with no connection, says in plain words what connecting does and offers the Immich form", async () => {
     const { calls } = mount();
     const box = await section();
+    // Each service is a button; the form (and its explanation) opens only when Immich's is pressed.
+    await within(box).findByRole("button", { name: "Connect Immich" });
+    expect(within(box).queryByLabelText("Server address")).toBeNull();
+    fireEvent.click(within(box).getByRole("button", { name: "Connect Immich" }));
     expect(await within(box).findByLabelText("Server address")).toHaveAttribute("placeholder", SERVER);
+    expect(within(box).getByText(/Account Settings, then API Keys/)).toBeInTheDocument();
+    fireEvent.click(within(box).getByRole("button", { name: "Back" }));
+    expect(within(box).queryByLabelText("Server address")).toBeNull();
     const text = box.textContent ?? "";
     expect(text).toMatch(/adds .*photos to an album/i);
     expect(text).toMatch(/story/i);
     expect(text).toMatch(/never deletes anything in your library/i);
     expect(text).toMatch(/share link/i);
     expect(text).toMatch(/No photo library is connected yet/);
+    fireEvent.click(within(box).getByRole("button", { name: "Connect Immich" }));
     const key = keyInput();
+    fireEvent.click(within(box).getByRole("button", { name: "Back" }));
     expect(key).toHaveAttribute("type", "password");
     expect(key).toHaveAttribute("autocomplete", "off");
     // Google Photos is a row that says it is coming, and a disabled control that asks nothing of the server.
@@ -363,26 +377,20 @@ describe("Photo library section (#699 S1b)", () => {
     fireEvent.click(within(within(box).getByRole("group", { name: "Confirm disconnect" })).getByRole("button", { name: "Confirm disconnect" }));
     await waitFor(() => expect(within(box).queryByText(SERVER)).toBeNull());
     expect(calls.filter((c) => c.call.startsWith("DELETE")).map((c) => c.call)).toEqual(["DELETE /v1/photo-connections/phc_aaaaaaaaaaaaaaaa"]);
-    expect(await within(box).findByLabelText("Server address")).toBeInTheDocument();
+    // With nothing connected, Immich is offered as a button again; its form opens only when pressed.
+    expect(await within(box).findByRole("button", { name: "Connect Immich" })).toBeInTheDocument();
+    expect(within(box).queryByLabelText("Server address")).toBeNull();
   });
 
-  it("7b. a connection disconnected while its reconnect form is open takes the form with it", async () => {
-    const { state } = mount({
-      list: [immich({ state: "needs_reconnect" })],
-      handle: (call) => {
-        if (call.call !== "DELETE /v1/photo-connections/phc_aaaaaaaaaaaaaaaa") return undefined;
-        state.list = [];
-        return json({ disconnected: true, connections: [] });
-      },
-    });
+  it("7b. the reconnect form stands alone: the row's buttons are out of the way, and Cancel brings the row back", async () => {
+    mount({ list: [immich({ state: "needs_reconnect" })] });
     const box = await section();
     fireEvent.click(await within(box).findByRole("button", { name: "Reconnect" }));
     expect(within(box).getByRole("button", { name: "Reconnect Immich" })).toBeInTheDocument();
-    fireEvent.click(within(box).getByRole("button", { name: "Disconnect" }));
-    fireEvent.click(within(within(box).getByRole("group", { name: "Confirm disconnect" })).getByRole("button", { name: "Confirm disconnect" }));
-    expect(await within(box).findByRole("button", { name: "Connect Immich" })).toBeInTheDocument();
-    expect(within(box).queryByRole("button", { name: "Reconnect Immich" })).toBeNull();
-    expect((within(box).getByLabelText("Server address") as HTMLInputElement).value).toBe("");
+    expect(within(box).queryByRole("button", { name: "Disconnect" })).toBeNull();
+    fireEvent.click(within(box).getByRole("button", { name: "Cancel" }));
+    expect(within(box).queryByLabelText("Server address")).toBeNull();
+    expect(within(box).getByRole("button", { name: "Disconnect" })).toBeInTheDocument();
   });
 
   it("8. every change goes through the api client with the CSRF header, and the key is in no URL", async () => {
