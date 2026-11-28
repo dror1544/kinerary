@@ -1,6 +1,6 @@
 import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies, type OperatorDependencies, type AdminDependencies, type AssistantEventsIngestDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
-import { loadArchitectureProfile, validateBeforeProvider, whatsappPortalSettings } from "./config.js";
+import { loadArchitectureProfile, photoLibraryPortalSettings, validateBeforeProvider, whatsappPortalSettings } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
 import { startPlanChangePoller } from "./plan-change-poller.js";
@@ -213,6 +213,7 @@ if (profile.web) {
 // the profile has no such block (or no `web` block, and so no portal), and then every WhatsApp route answers 404 and no trip
 // page shows a section.
 if (portal) portal.whatsapp = whatsappPortalSettings(profile);
+if (portal) portal.photoLibrary = photoLibraryPortalSettings(profile);
 
 // The interviewer agent's chat-addressed interview routes, which the MCP
 // sidecar forwards `get_interview_for_chat` / `submit_answer_for_chat` to.

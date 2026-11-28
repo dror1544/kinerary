@@ -21,6 +21,10 @@ import { groupAddUrl } from "./companion-intro.js";
 import { leaveClosedTelegramGroup, listTelegramGroups, ownerHasLiveTelegramLink, removeTelegramGroup } from "./telegram-group-codes.js";
 import { structuredLog } from "./redaction.js";
 import {
+  NOT_CONFIGURED as PHOTO_NOT_CONFIGURED, connectImmich, disconnectConnection, listConnections, setDefaultConnection, testConnection,
+  type PhotoLibrarySettings,
+} from "./photo-library.js";
+import {
   TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
   recordLinkSignIn, resolveMiniAppLaunch, telegramLinksByTrip, unlinkTelegramLink, unlinkedTelegramLinksByTrip,
   type LabelVisibility, type TelegramMiniAppConfig,
@@ -356,6 +360,12 @@ export interface PortalDependencies {
    * Absent (a deployment whose outbox is not the real adapter): Unlink still closes the binding and logs that the bot stayed.
    */
   telegramGroups?: { leaveChat(chatId: string): Promise<void> };
+  /**
+   * A photo library per user (#699): `photo_library` from the profile (`photoLibraryPortalSettings`, config.ts). ABSENT
+   * (no `photo_library.credential_key_secret_ref`) means every `/v1/photo-connections` route answers 503
+   * `photo_library_not_configured` and stores nothing.
+   */
+  photoLibrary?: PhotoLibrarySettings;
   /**
    * Carries the verification and password-reset messages. ABSENT means email is
    * not configured: `POST /v1/auth/sign-up` and `/v1/auth/password/forgot` answer
@@ -1407,6 +1417,54 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (name === null) return reply.code(400).send({ error: "INVALID_NAME" });
     await deps.db.query("UPDATE control_plane.users SET given_name = $2, given_name_asked_at = now() WHERE id = $1", [user.id, name]);
     return { ok: true };
+  });
+
+  // A photo library per user (#699, docs/specs/sprint-9/699-user-photo-library.md, S1a). Account level (portal-scope.ts
+  // "account"): a Telegram-minted session cannot attach a library to the account it borrowed. Every query is scoped by the
+  // session's user (photo-library.ts), so another account's connection id is the same 404 as an unknown one (AC-19), and
+  // a response never carries the credential (AC-3). No `photo_library.credential_key_secret_ref` in the profile: 503.
+  app.get("/v1/photo-connections", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireUser(request, reply, deps);
+    if (!user) return;
+    if (!deps.photoLibrary) return reply.code(PHOTO_NOT_CONFIGURED.status).send(PHOTO_NOT_CONFIGURED.body);
+    return { connections: await listConnections(deps.db, user.id) };
+  });
+
+  app.post("/v1/photo-connections/immich", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    if (!deps.photoLibrary) return reply.code(PHOTO_NOT_CONFIGURED.status).send(PHOTO_NOT_CONFIGURED.body);
+    const out = await connectImmich(deps.db, deps.photoLibrary, user.id, request.body);
+    return reply.code(out.status).send(out.body);
+  });
+
+  app.post("/v1/photo-connections/:id/test", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    if (!deps.photoLibrary) return reply.code(PHOTO_NOT_CONFIGURED.status).send(PHOTO_NOT_CONFIGURED.body);
+    const out = await testConnection(deps.db, deps.photoLibrary, user.id, (request.params as { id: string }).id);
+    return reply.code(out.status).send(out.body);
+  });
+
+  app.put("/v1/photo-connections/:id/default", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    if (!deps.photoLibrary) return reply.code(PHOTO_NOT_CONFIGURED.status).send(PHOTO_NOT_CONFIGURED.body);
+    const out = await setDefaultConnection(deps.db, user.id, (request.params as { id: string }).id);
+    return reply.code(out.status).send(out.body);
+  });
+
+  app.delete("/v1/photo-connections/:id", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    if (!deps.photoLibrary) return reply.code(PHOTO_NOT_CONFIGURED.status).send(PHOTO_NOT_CONFIGURED.body);
+    const out = await disconnectConnection(deps.db, user.id, (request.params as { id: string }).id);
+    return reply.code(out.status).send(out.body);
   });
 
   app.post("/v1/logout", async (request, reply) => {

@@ -108,6 +108,13 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   // borrows: a password or Google sign-in only (#438).
   "POST /v1/account/name": "account",
   "POST /v1/site-invites/redeem": "account",
+  // A photo library per user (#699, spec 699): connecting one attaches a third party's credential to the ACCOUNT, and the
+  // list, test, default and disconnect are the account's own. A password or Google sign-in only.
+  "GET /v1/photo-connections": "account",
+  "POST /v1/photo-connections/immich": "account",
+  "POST /v1/photo-connections/:id/test": "account",
+  "PUT /v1/photo-connections/:id/default": "account",
+  "DELETE /v1/photo-connections/:id": "account",
 
   "DELETE /v1/account/telegram-links/:linkId": "link",
   // Restoring an Unlinked Telegram account without Telegram MINTS a way into the account, exactly like the
