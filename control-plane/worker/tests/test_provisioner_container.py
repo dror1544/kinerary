@@ -134,7 +134,10 @@ class VmContainerDeployTests(ContainerDeployCase):
         )
         self.deploy(documents=[document])
         published = self.trip / "documents" / document.file_name
-        self.assertEqual(os.stat(published).st_ino, os.stat(source).st_ino, "one physical copy")
+        self.assertEqual(body, published.read_bytes())
+        self.assertNotEqual(os.stat(published).st_ino, os.stat(source).st_ino,
+                            "a copy, not a link: a link would carry the original's owner and mode to a uid that cannot read it")
+        self.assertEqual(1, os.stat(source).st_nlink, "the inbound original is not linked to")
         self.assertFalse((pathlib.Path(self.root) / "trips" / "alsace-2026" / "documents").exists(),
                          "no fallback copy beside the config: a container mounts its own directory only")
 

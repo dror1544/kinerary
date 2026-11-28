@@ -7,6 +7,7 @@ the real script, so a drift between the two goes red there.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -336,6 +337,114 @@ class TripStoreWriteTests(StoreCase):
         os.symlink(secret, self.trip / "trip" / "trip.config.json")
         with self.assertRaisesRegex(TripStoreError, "not a plain file"):
             self.store.read_trip_file("trip.config.json")
+
+
+class TripStoreDocumentTests(StoreCase):
+    """A document is published as a copy the container's uid can read, and the inbound original is never touched."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.inbound = self.work / "inbound"
+        self.inbound.mkdir()
+        self.body = b"Hotel Artemide - confirmation HTL-99117"
+        sha = hashlib.sha256(self.body).hexdigest()
+        self.name = f"{sha}.jpg"
+        self.digest = f"sha256:{sha}"
+        self.source = self.inbound / self.name
+        self.source.write_bytes(self.body)
+        os.chmod(self.source, 0o640)
+
+    def publish(self) -> str:
+        return self.store.publish_document(self.name, str(self.source), self.digest)
+
+    def test_it_is_a_copy_owned_by_the_owner_of_trip_and_readable_by_it(self) -> None:
+        before = os.stat(self.source)
+        self.assertEqual("copy", self.publish())
+        out = self.trip / "documents" / self.name
+        self.assertEqual(self.body, out.read_bytes())
+        now, owner = os.stat(out), os.stat(self.trip / "trip")
+        self.assertNotEqual(before.st_ino, now.st_ino)
+        self.assertEqual(1, now.st_nlink)
+        self.assertEqual((owner.st_uid, owner.st_gid), (now.st_uid, now.st_gid))
+        self.assertEqual(0o640, stat.S_IMODE(now.st_mode))
+        self.assertEqual([], [p.name for p in (self.trip / "documents").iterdir() if p.name.startswith(".")], "no temp left")
+
+    def test_the_inbound_original_keeps_its_inode_owner_mode_and_link_count(self) -> None:
+        before = os.stat(self.source)
+        self.publish()
+        after = os.stat(self.source)
+        self.assertEqual((before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_nlink),
+                         (after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_nlink))
+
+    def test_the_hand_over_is_to_the_owner_of_trip_not_to_the_workers_user(self) -> None:
+        owner = os.stat(self.trip / "trip")
+        calls = []
+        real = os.fchown
+        with mock.patch("os.fchown", side_effect=lambda fd, uid, gid: (calls.append((uid, gid)), real(fd, uid, gid))[1]):
+            self.publish()
+        self.assertEqual([(owner.st_uid, owner.st_gid)], calls)
+
+    def test_a_failed_hand_over_leaves_nothing_and_says_why(self) -> None:
+        with mock.patch("os.fchown", side_effect=PermissionError()), self.assertRaisesRegex(TripStoreError, "could not hand"):
+            self.publish()
+        self.assertEqual([], list((self.trip / "documents").iterdir()))
+
+    def test_a_second_publish_finds_it_and_changes_nothing(self) -> None:
+        self.publish()
+        ino = os.stat(self.trip / "documents" / self.name).st_ino
+        self.assertEqual("existing", self.publish())
+        self.assertEqual(ino, os.stat(self.trip / "documents" / self.name).st_ino)
+
+    def test_an_earlier_hard_link_is_replaced_by_a_copy_and_the_original_is_not_chmodded(self) -> None:
+        os.link(self.source, self.trip / "documents" / self.name)
+        self.assertEqual("copy", self.publish())
+        out = os.stat(self.trip / "documents" / self.name)
+        self.assertNotEqual(os.stat(self.source).st_ino, out.st_ino)
+        self.assertEqual(1, os.stat(self.source).st_nlink)
+        self.assertEqual(0o640, stat.S_IMODE(os.stat(self.source).st_mode))
+
+    def test_other_bytes_under_the_name_are_refused_and_left(self) -> None:
+        (self.trip / "documents" / self.name).write_bytes(b"something else")
+        with self.assertRaisesRegex(ValueError, "different content"):
+            self.publish()
+        self.assertEqual(b"something else", (self.trip / "documents" / self.name).read_bytes())
+
+    def test_an_original_that_does_not_match_its_digest_publishes_nothing(self) -> None:
+        self.source.write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "does not match its digest"):
+            self.publish()
+        self.assertEqual([], list((self.trip / "documents").iterdir()))
+
+    def test_a_link_where_the_original_should_be_is_not_followed(self) -> None:
+        secret = self.work / "secret"
+        secret.write_bytes(self.body)
+        self.source.unlink()
+        os.symlink(secret, self.source)
+        with self.assertRaisesRegex(TripStoreError, "could not be opened"):
+            self.publish()
+        self.assertEqual([], list((self.trip / "documents").iterdir()))
+
+    def test_a_link_where_the_published_file_goes_is_refused_not_followed(self) -> None:
+        victim = self.work / "victim"
+        victim.write_text("not mine")
+        os.symlink(victim, self.trip / "documents" / self.name)
+        with self.assertRaisesRegex(TripStoreError, "not a plain file"):
+            self.publish()
+        self.assertEqual("not mine", victim.read_text())
+
+    def test_a_documents_directory_swapped_for_a_link_is_refused(self) -> None:
+        victim = self.work / "victim"
+        victim.mkdir()
+        shutil.rmtree(self.trip / "documents")
+        os.symlink(victim, self.trip / "documents")
+        with self.assertRaisesRegex(TripStoreError, "not a real directory"):
+            self.publish()
+        self.assertEqual([], list(victim.iterdir()))
+
+    def test_a_name_that_is_not_content_addressed_is_refused(self) -> None:
+        for name in ("../x.pdf", "a/b.pdf", "x.pdf", f"{'a' * 64}"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "content-addressed"):
+                self.store.publish_document(name, str(self.source), self.digest)
 
 
 class TripStoreResetTests(StoreCase):
