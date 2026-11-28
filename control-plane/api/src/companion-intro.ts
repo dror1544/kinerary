@@ -141,7 +141,9 @@ function loginLines(facts: CompanionIntroFacts, options: { ownMessage?: boolean 
  * `&admin=` is the part that matters. Pinning the arrival message and reading
  * an invite link both require admin, and this is the one moment the organizer
  * is already in a permissions dialog. Ask here or the bot lands with no rights
- * and pinning silently fails.
+ * and pinning silently fails. `change_info` (owner, 2026-11-27): without it the
+ * dashboard showed the group as "unnamed" until the owner granted it by hand,
+ * and the trip's group photo (`trip_group_photo`) needs it too.
  */
 export function groupAddUrl(botUsername: string | null | undefined, payload: string): string | null {
   const handle = (botUsername ?? "").trim().replace(/^@/, "");
@@ -155,7 +157,7 @@ export function groupAddUrl(botUsername: string | null | undefined, payload: str
   // confidently wrong binding is not.
   const raw = payload ?? "";
   const safe = /^[A-Za-z0-9_-]*$/.test(raw) ? raw : "";
-  return `https://t.me/${handle}?startgroup=${safe}&admin=pin_messages+invite_users`;
+  return `https://t.me/${handle}?startgroup=${safe}&admin=change_info+pin_messages+invite_users`;
 }
 
 /**

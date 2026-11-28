@@ -2203,7 +2203,7 @@ describe("/group hands over the full add-to-group link, the same one the greetin
       if (decision.kind !== "group_intro") return;
       const token = tokenIn(decision.followUp);
       const url = groupAddUrl(BOT.username, token);
-      assert.equal(url, `https://t.me/Kinerary_bot?startgroup=${token}&admin=pin_messages+invite_users`);
+      assert.equal(url, `https://t.me/Kinerary_bot?startgroup=${token}&admin=change_info+pin_messages+invite_users`);
       assert.ok(url && decision.text.includes(url), "the reply contains the full link");
       // The existing instructions are untouched, and the link is added after them.
       assert.ok(decision.text.startsWith(DEFAULT_STRINGS.groupTokenIssued(token)));
