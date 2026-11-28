@@ -53,6 +53,9 @@ const serviceName = (connection: PhotoConnection) => connection.service === "imm
  * "Photo library" on the dashboard, for the signed-in account (#699, docs/specs/sprint-9/699-user-photo-library.md):
  * connect Immich, see each connection's state, test it, choose the default and disconnect. The account's own; a session a
  * Telegram link minted is told to sign in with its password and asks the server nothing, and the Mini App does not show it.
+ * A deployment with no photo library set up (503 `photo_library_not_configured`, from the list or a connect) shows nothing
+ * at all, as the WhatsApp section does when the deployment has no number (Dror, 2026-11-27, regression plan decision 1).
+ * Nothing is drawn until the list has answered, so such a deployment never shows the heading for a moment either.
  *
  * The Immich key is read from its field at the moment of sending and the field emptied at once, whatever the answer. It is
  * never kept in React state, a query cache, a mutation's variables, storage or a URL, and no answer carries it back.
@@ -67,17 +70,17 @@ export function PhotoLibrary() {
   const [reconnectingId, setReconnectingId] = useState<string | null>(null);
   if (inMiniApp || !me.isSuccess) return null;
   const unavailable = lostConfig || notConfigured(list.error);
+  if (!scoped && (list.isPending || unavailable)) return null;
   const connections = list.data ?? [];
   const immich = connections.find((connection) => connection.service === "immich");
   const many = connections.length > 1;
   const reconnecting = connections.find((connection) => connection.id === reconnectingId) ?? null;
-  const showForm = list.isSuccess && !unavailable && (!immich || reconnecting !== null);
+  const showForm = list.isSuccess && (!immich || reconnecting !== null);
   return (
     <section className="trip-section photo-library">
       <h2>Photo library</h2>
       <div className="workflow-card photo-library-card">
         {scoped ? <p>Signed in with Telegram: to connect a photo library, sign in with your password.</p>
-          : unavailable ? <p>Connecting a photo library is not available on this deployment of Kinerary yet.</p>
           : <>
             <p>
               Connect your own photo library and Kinerary adds your trips' photos to an album in it, with each photo's story
@@ -85,7 +88,6 @@ export function PhotoLibrary() {
               anything in your library, not even a photo later removed from a trip, and it can create a share link for an album
               so the family can open it.
             </p>
-            {list.isPending && <p className="subtle">Loading your photo libraries…</p>}
             {/* A load that failed by itself is a status, not an alert: the alert is kept for an answer to something the person did. */}
             {list.isError && <div className="notice" role="status">We could not load your photo libraries. Please retry.</div>}
             {list.isSuccess && connections.length === 0 && <p className="subtle">No photo library is connected yet.</p>}

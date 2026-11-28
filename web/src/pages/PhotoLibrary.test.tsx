@@ -225,24 +225,32 @@ describe("Photo library section (#699 S1b)", () => {
     expect((await screen.findByRole("alert")).textContent).toMatch(/^Enter the public address in full/);
   });
 
-  it("3d. 503 photo_library_not_configured: 'not available on this deployment', and no form", async () => {
+  it("3d. 503 photo_library_not_configured on the list: the section is not drawn at all, and nothing more is asked", async () => {
     const { calls } = mount({ getStatus: 503 });
-    const box = await section();
-    expect(await within(box).findByText(/not available on this deployment/)).toBeInTheDocument();
-    expect(within(box).queryByLabelText("API key")).toBeNull();
-    expect(within(box).queryByRole("button", { name: "Connect Immich" })).toBeNull();
+    expect(await screen.findByRole("heading", { name: "My trips" })).toBeInTheDocument();
+    await waitFor(() => expect(calls.filter((c) => c.call === "GET /v1/photo-connections")).toHaveLength(1));
+    // Let the 503 land and the page settle: a card drawn from it would be on screen by now.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByRole("heading", { name: "Photo library" })).toBeNull();
+    expect(screen.queryByLabelText("API key")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Immich|Google Photos/ })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/photo librar|not available/i);
     expect(document.body.textContent).not.toContain(RAW);
-    expect(calls.filter((c) => c.call.startsWith("POST"))).toEqual([]);
+    expect(calls.filter((c) => c.path.startsWith("/v1/photo-connections")).map((c) => c.call)).toEqual(["GET /v1/photo-connections"]);
   });
 
-  it("3e. 503 on the connect itself also turns the section into 'not available', and clears the key", async () => {
-    mount({ handle: (call) => call.call === "POST /v1/photo-connections/immich" ? json({ error: "photo_library_not_configured", message: RAW }, 503) : undefined });
+  it("3e. 503 on the connect itself: the key is cleared, the section goes, and nothing more is asked", async () => {
+    const { calls } = mount({ handle: (call) => call.call === "POST /v1/photo-connections/immich" ? json({ error: "photo_library_not_configured", message: RAW }, 503) : undefined });
     await section();
     await fill(SERVER, KEY);
     submit();
-    expect(await screen.findByText(/not available on this deployment/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Photo library" })).toBeNull());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByRole("heading", { name: "Photo library" })).toBeNull();
     expect(screen.queryByLabelText("API key")).toBeNull();
+    expect(document.body.textContent).not.toContain(RAW);
     expectKeyGone();
+    expect(calls.filter((c) => c.path.startsWith("/v1/photo-connections")).map((c) => c.call)).toEqual(["GET /v1/photo-connections", "POST /v1/photo-connections/immich"]);
   });
 
   it("4. needs_reconnect: a clear Reconnect that reopens the form for that address; a 200 replace-in-place makes it active", async () => {
